@@ -1,0 +1,52 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-dev",
+      "displayName": "Windows development",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "windows-release",
+      "displayName": "Windows release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "core-dev",
+      "displayName": "Headless core development",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/core-dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "XUYANFORGE_BUILD_UI": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-dev", "configurePreset": "windows-dev" },
+    { "name": "windows-release", "configurePreset": "windows-release" },
+    { "name": "core-dev", "configurePreset": "core-dev" }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-dev",
+      "configurePreset": "windows-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "core-dev",
+      "configurePreset": "core-dev",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
+

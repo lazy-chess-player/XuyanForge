@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xuyanforge.local/contracts/intent.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "turn_id", "actor_id", "input_commit_id", "speech", "actions", "brief_rationale", "ends_scene"],
+  "properties": {
+    "protocol_version": { "const": "0.1.0" },
+    "turn_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "actor_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "input_commit_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "speech": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "audience"],
+        "properties": {
+          "text": { "type": "string", "minLength": 1, "maxLength": 8192 },
+          "audience": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "recipient_ids"],
+            "properties": {
+              "kind": { "enum": ["scene", "actor_private"] },
+              "recipient_ids": { "type": "array", "maxItems": 16, "items": { "type": "string", "minLength": 1, "maxLength": 128 } }
+            }
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "target_id", "holder_consented"],
+        "properties": {
+          "type": { "enum": ["inspect_seal", "reveal_gate_secret", "reveal_seal_forgery", "transfer_seal"] },
+          "target_id": { "type": "string", "maxLength": 128 },
+          "holder_consented": { "type": "boolean" }
+        }
+      }
+    },
+    "brief_rationale": { "type": "string", "maxLength": 1000 },
+    "ends_scene": { "type": "boolean" }
+  }
+}

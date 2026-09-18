@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xuyanforge.local/contracts/world-time.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["calendar_id", "kind", "display_text", "precision", "narrative_order"],
+  "properties": {
+    "calendar_id": { "type": "string" },
+    "kind": { "enum": ["exact", "interval", "relative", "unknown"] },
+    "start_tick": { "type": ["integer", "null"] },
+    "end_tick": { "type": ["integer", "null"] },
+    "display_text": { "type": "string" },
+    "precision": { "enum": ["exact", "approximate", "unknown"] },
+    "relative_to_event_id": { "type": ["string", "null"] },
+    "narrative_order": { "type": "integer" }
+  }
+}
+

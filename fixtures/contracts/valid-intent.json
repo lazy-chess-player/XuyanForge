@@ -1,0 +1,17 @@
+{
+  "protocol_version": "0.1.0",
+  "turn_id": "turn-0003",
+  "actor_id": "actor-shentang",
+  "input_commit_id": "commit-0002",
+  "speech": [
+    {
+      "text": "许代表，印章可能被人动过。",
+      "audience": { "kind": "actor_private", "recipient_ids": ["actor-xucheng"] }
+    }
+  ],
+  "actions": [
+    { "type": "reveal_seal_forgery", "target_id": "actor-xucheng", "holder_consented": false }
+  ],
+  "brief_rationale": "只向指定接收者传播本人已知的观察。",
+  "ends_scene": true
+}

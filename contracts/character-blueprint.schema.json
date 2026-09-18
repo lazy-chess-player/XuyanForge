@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xuyanforge.local/contracts/character-blueprint.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "id", "version", "name", "core", "adaptable", "private_notes", "extensions"],
+  "properties": {
+    "schema_version": { "const": "0.1.0" },
+    "kind": { "const": "character_blueprint" },
+    "id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "core": { "type": "object" },
+    "adaptable": { "type": "object" },
+    "private_notes": { "type": "array" },
+    "extensions": { "type": "object" }
+  }
+}
+

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xuyanforge.local/contracts/package-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "format_version", "kind", "package_id", "title", "author", "content_version", "required_features", "optional_features", "base_world_version_id", "contains_source_text", "contains_private_notes", "files", "extensions"],
+  "properties": {
+    "format": { "const": "xuyanforge-package" },
+    "format_version": { "const": "0.1.0" },
+    "kind": { "enum": ["world", "character"] },
+    "package_id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "author": { "type": "string" },
+    "content_version": { "type": "string", "minLength": 1 },
+    "required_features": { "type": "array", "maxItems": 128, "items": { "type": "string" } },
+    "optional_features": { "type": "array", "maxItems": 128, "items": { "type": "string" } },
+    "base_world_version_id": { "type": ["string", "null"] },
+    "contains_source_text": { "type": "boolean" },
+    "contains_private_notes": { "type": "boolean" },
+    "files": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "bytes"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+          "bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "extensions": { "type": "object" }
+  }
+}

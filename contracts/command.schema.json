@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xuyanforge.local/contracts/command.schema.json",
+  "title": "XuyanForge command envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "command_id", "workspace_id", "name", "expected_revision", "payload"],
+  "properties": {
+    "protocol_version": { "const": "0.1.0" },
+    "command_id": { "type": "string", "minLength": 1 },
+    "workspace_id": { "type": "string", "minLength": 1 },
+    "name": { "enum": ["simulation.start", "simulation.step", "simulation.pause", "simulation.cancel", "branch.create"] },
+    "expected_revision": { "type": "integer", "minimum": 0 },
+    "payload": { "type": "object" }
+  }
+}
+

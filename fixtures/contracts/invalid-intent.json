@@ -1,0 +1,12 @@
+{
+  "protocol_version": "0.1.0",
+  "turn_id": "turn-0003",
+  "actor_id": "actor-shentang",
+  "input_commit_id": "commit-0002",
+  "speech": [],
+  "actions": [
+    { "type": "execute_sql", "target_id": "workspace", "holder_consented": true }
+  ],
+  "brief_rationale": "尝试越过领域命令白名单。",
+  "ends_scene": false
+}

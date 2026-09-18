@@ -1,0 +1,9 @@
+{
+  "protocol_version": "9.9.9",
+  "command_id": "",
+  "workspace_id": "workspace-grey-harbor",
+  "name": "database.execute-sql",
+  "expected_revision": -1,
+  "payload": {}
+}
+

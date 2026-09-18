@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xuyanforge.local/contracts/extraction-candidates.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "prompt_version", "candidates"],
+  "properties": {
+    "schema_version": {"const": "candidate-v1"},
+    "prompt_version": {"const": "extract-v1"},
+    "candidates": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "name", "fields", "start_codepoint", "end_codepoint", "quote", "provenance_type"],
+        "properties": {
+          "type": {"enum": ["entity", "event", "relation", "rule"]},
+          "name": {"type": "string", "minLength": 1, "maxLength": 512},
+          "fields": {"type": "object"},
+          "start_codepoint": {"type": "integer", "minimum": 0},
+          "end_codepoint": {"type": "integer", "minimum": 1},
+          "quote": {"type": "string", "minLength": 1, "maxLength": 20000},
+          "provenance_type": {"enum": ["original_fact", "in_text_claim", "model_inference", "author_setting"]}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "protocol_version": "0.1.0",
+  "command_id": "command-demo-1",
+  "workspace_id": "workspace-grey-harbor",
+  "name": "simulation.step",
+  "expected_revision": 0,
+  "payload": { "session_id": "session-grey-harbor" }
+}
+
