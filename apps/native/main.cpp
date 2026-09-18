@@ -9,6 +9,7 @@
 #include "candidate_review_view_model.h"
 #include "world_views_view_model.h"
 #include "xuyan/application/simulation_service.h"
+#include "xuyan/application/demo_world_service.h"
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -33,6 +34,11 @@ int main(int argc, char* argv[]) {
         ? QFileInfo(arguments.at(workspaceArgument + 1)).absoluteFilePath()
         : dataRoot + QStringLiteral("/grey-harbor.sqlite");
     const auto databasePath = databaseText.toStdWString();
+    if (arguments.contains(QStringLiteral("--install-demo"))) {
+        xuyan::application::DemoWorldService demo(databasePath);
+        auto installed = demo.install();
+        if (!installed.ok() || !installed.value->ready) return 3;
+    }
     if (arguments.contains(QStringLiteral("--production-demo"))) {
         xuyan::application::SimulationService seed(databasePath);
         auto root = seed.open();
@@ -58,6 +64,16 @@ int main(int argc, char* argv[]) {
                      [&workspaceCatalog](const QString& path) { workspaceCatalog.openWorkspace(QUrl::fromLocalFile(path)); });
     QObject::connect(&candidateReview, &CandidateReviewViewModel::candidateAccepted,
                      &workspace, [&workspace] { workspace.refresh(); });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
+                     &workspace, [&workspace] { workspace.refresh(); });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
+                     &sources, [&sources] { sources.refresh(); });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
+                     &characters, [&characters] { characters.refresh(); });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
+                     &worldViews, [&worldViews] { worldViews.refresh(); });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
+                     &simulation, [&simulation] { simulation.reload(); });
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("simulation"), &simulation);

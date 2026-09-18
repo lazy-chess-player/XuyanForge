@@ -170,6 +170,7 @@ public:
         const std::string& memory_json);
     xuyan::domain::Result<xuyan::domain::BranchRootBinding> bindBranchRoot(
         const std::string& command_id, xuyan::domain::BranchRootBinding binding);
+    xuyan::domain::Result<xuyan::domain::BranchRootBinding> loadBranchRootBinding(const std::string& branch_id);
     xuyan::domain::Result<xuyan::domain::SimulationSession> createSimulationSession(
         const std::string& command_id, xuyan::domain::SimulationSession session);
     xuyan::domain::Result<xuyan::domain::SimulationSession> loadSimulationSession(const std::string& session_id);

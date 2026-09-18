@@ -4,6 +4,7 @@
 
 #include <map>
 #include <string>
+#include <string_view>
 
 namespace xuyan::providers {
 
@@ -40,5 +41,6 @@ xuyan::domain::Result<ProviderHttpRequest> buildProviderRequest(
 xuyan::domain::Result<ProviderGenerationResult> parseProviderResponse(
     ProviderProtocol protocol, std::string_view response_json);
 ProviderGenerationResult classifyProviderFailure(int http_status, bool timed_out, bool cancelled);
+xuyan::domain::Result<ProviderProtocol> protocolForProviderKind(std::string_view kind);
 
 } // namespace xuyan::providers

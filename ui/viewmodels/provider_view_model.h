@@ -25,6 +25,7 @@ public:
                                     bool enabled, QString api_key);
     Q_INVOKABLE void removeConnection(QString id, int revision);
     Q_INVOKABLE void probeConnection(QString id);
+    Q_INVOKABLE void testStructuredGeneration(QString id);
 
 signals:
     void changed();

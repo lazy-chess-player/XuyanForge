@@ -73,6 +73,7 @@ target_link_libraries(xuyan_storage_sqlite PUBLIC xuyan_domain SQLite::SQLite3)
 
 add_library(xuyan_application STATIC
     libs/application/src/branch_outcome_service.cpp
+    libs/application/src/demo_world_service.cpp
     libs/application/src/simulation_service.cpp
     libs/application/src/backup_service.cpp
     libs/application/src/evidence_service.cpp
@@ -83,6 +84,7 @@ add_library(xuyan_application STATIC
     libs/application/src/character_instance_service.cpp
     libs/application/src/package_service.cpp
     libs/application/src/provider_connection_service.cpp
+    libs/application/src/provider_generation_service.cpp
     libs/application/src/retrieval_service.cpp
     libs/application/src/source_import_service.cpp
     libs/application/src/source_text_decoder.cpp
@@ -91,7 +93,7 @@ add_library(xuyan_application STATIC
     libs/application/src/world_graph_service.cpp
 )
 target_include_directories(xuyan_application PUBLIC libs/application/include)
-target_link_libraries(xuyan_application PUBLIC xuyan_domain xuyan_engine xuyan_package xuyan_storage_sqlite)
+target_link_libraries(xuyan_application PUBLIC xuyan_domain xuyan_engine xuyan_package xuyan_providers xuyan_storage_sqlite)
 
 if(WIN32)
     add_library(xuyan_platform_credentials STATIC
@@ -113,6 +115,12 @@ if(XUYANFORGE_BUILD_UI)
     find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2)
     qt_standard_project_setup(REQUIRES 6.5)
     qt_policy(SET QTP0004 NEW)
+
+    add_library(xuyan_providers_qt STATIC
+        libs/providers_qt/src/qt_provider_transport.cpp
+    )
+    target_include_directories(xuyan_providers_qt PUBLIC libs/providers_qt/include)
+    target_link_libraries(xuyan_providers_qt PUBLIC xuyan_application Qt6::Core Qt6::Network)
 
     qt_add_executable(xuyanforge_app
         apps/native/main.cpp
@@ -139,7 +147,12 @@ if(XUYANFORGE_BUILD_UI)
     )
     target_include_directories(xuyanforge_app PRIVATE ui/viewmodels)
     target_link_libraries(xuyanforge_app PRIVATE
-        xuyan_application xuyan_platform_credentials Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2
+        xuyan_application xuyan_platform_credentials xuyan_providers_qt Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2
+    )
+
+    add_executable(xuyanforge_provider_cli tools/provider_cli.cpp)
+    target_link_libraries(xuyanforge_provider_cli PRIVATE
+        xuyan_application xuyan_platform_credentials xuyan_providers_qt Qt6::Core Qt6::Network
     )
     qt_add_qml_module(xuyanforge_app
         URI XuyanForge

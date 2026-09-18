@@ -4,12 +4,14 @@
 #include "xuyan/application/character_service.h"
 #include "xuyan/application/backup_service.h"
 #include "xuyan/application/branch_outcome_service.h"
+#include "xuyan/application/demo_world_service.h"
 #include "xuyan/application/candidate_service.h"
 #include "xuyan/application/evidence_service.h"
 #include "xuyan/application/extraction_job_service.h"
 #include "xuyan/application/mock_extraction_processor.h"
 #include "xuyan/application/package_service.h"
 #include "xuyan/application/provider_connection_service.h"
+#include "xuyan/application/provider_generation_service.h"
 #include "xuyan/application/retrieval_service.h"
 #include "xuyan/application/workspace_service.h"
 #include "xuyan/application/world_version_service.h"
@@ -111,6 +113,12 @@ void testJsonAndSafeZipPrimitives() {
             && parsed.value->find("name")->string() == "灰港🙂", "JSON must round-trip UTF-8 and structured values");
     require(!xuyan::package::parseJson("{\"a\":1,\"a\":2}").ok(), "duplicate JSON keys must be rejected");
     require(!xuyan::package::parseJson("[[[[0]]]]", 2).ok(), "JSON depth limit must be enforced");
+    auto provider_numbers = xuyan::package::parseJson(R"({"temperature":0.7,"score":-1.25e-3})");
+    require(provider_numbers.ok() && provider_numbers.value->find("temperature")->isReal()
+                && xuyan::package::parseJson(xuyan::package::writeJson(*provider_numbers.value)).ok(),
+            "JSON parser must round-trip finite fractional and exponent numbers from provider responses");
+    require(!xuyan::package::parseJson("1.").ok() && !xuyan::package::parseJson("1e+").ok(),
+            "malformed JSON fractional and exponent forms must remain rejected");
 
     const auto directory = std::filesystem::temp_directory_path() / "xuyanforge-zip-tests";
     const auto archive = directory / "safe.zip";
@@ -289,6 +297,58 @@ void testNativeProviderProtocolAdapters() {
     require(rate_limited.retryable && rate_limited.failure_kind == "transient_http"
                 && !timed_out.retryable && timed_out.failure_kind == "timeout_unknown",
             "transport failures must separate retryable rejection from an unknown in-flight timeout");
+    auto deepseek_protocol = xuyan::providers::protocolForProviderKind("deepseek");
+    require(deepseek_protocol.ok() && *deepseek_protocol.value == ProviderProtocol::openai_responses,
+            "DeepSeek must use its current Responses API for native JSON Schema output");
+}
+
+void testProviderGenerationGatewayAndCredentialIsolation() {
+    class FakeTransport final : public xuyan::application::IProviderTransport {
+    public:
+        xuyan::domain::Result<xuyan::application::ProviderTransportResponse> send(
+            const xuyan::providers::ProviderHttpRequest& request,
+            const std::string& credential, int timeout_ms) override {
+            called = true;
+            require(request.url == "https://api.deepseek.com/responses",
+                    "DeepSeek gateway must target the Responses endpoint");
+            require(request.body.find("deepseek-flash") != std::string::npos
+                        && request.body.find("json_schema") != std::string::npos,
+                    "gateway must send the selected model and JSON Schema contract");
+            require(request.body.find("unit-test-secret") == std::string::npos
+                        && request.headers.find("Authorization") == request.headers.end(),
+                    "credentials must never enter request DTO bodies or persisted header maps");
+            require(credential == "unit-test-secret" && timeout_ms == 30000,
+                    "credential must reach only the transport boundary with the configured timeout");
+            return xuyan::domain::Result<xuyan::application::ProviderTransportResponse>::success({
+                200, false, false,
+                R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"ok\":true,\"provider\":\"deepseek\"}"}]}],"usage":{"input_tokens":31,"output_tokens":12}})"});
+        }
+        bool called{false};
+    };
+
+    const auto path = temporaryDatabase().parent_path() / "provider-generation.sqlite";
+    removeDatabase(path);
+    xuyan::application::InMemoryCredentialStore credentials;
+    xuyan::application::ProviderConnectionService connections(path, credentials);
+    xuyan::domain::ProviderConnection deepseek;
+    deepseek.id = "provider-deepseek"; deepseek.name = "DeepSeek"; deepseek.kind = "deepseek";
+    deepseek.endpoint = "https://api.deepseek.com"; deepseek.default_model = "deepseek-flash";
+    deepseek.data_policy = "remote_allowed";
+    auto saved = connections.save("save-deepseek-test", deepseek, 0, std::string{"unit-test-secret"});
+    require(saved.ok(), "DeepSeek connection must validate and store its key outside SQLite");
+
+    FakeTransport transport;
+    xuyan::application::ProviderGenerationService gateway(path, credentials, transport);
+    auto report = gateway.testStructuredGeneration("provider-deepseek");
+    require(report.ok() && transport.called && report.value->status == "completed"
+                && report.value->json_valid && report.value->input_tokens == 31
+                && report.value->output_tokens == 12,
+            "provider gateway must parse and validate a real-shaped structured response with usage");
+    std::ifstream database(path, std::ios::binary);
+    const std::string bytes{std::istreambuf_iterator<char>(database), std::istreambuf_iterator<char>()};
+    require(bytes.find("unit-test-secret") == std::string::npos,
+            "provider credential must not leak into the workspace database");
+    removeDatabase(path);
 }
 
 void testEntityCrudSearchAndOptimisticLocking() {
@@ -1381,6 +1441,54 @@ void testConcurrentWorkspaceWritersAreSerialized() {
     removeDatabase(path);
 }
 
+void testCompleteDemoWorldInstallationAndReplay() {
+    const auto path = temporaryDatabase().parent_path() / "complete-demo-world.sqlite";
+    removeDatabase(path);
+    xuyan::application::DemoWorldService demo(path);
+    auto initial = demo.inspect();
+    require(initial.ok() && !initial.value->ready,
+            "a fresh workspace must report that the complete guided demo is not installed");
+
+    auto installed = demo.install();
+    require(installed.ok(), "demo installation failed: "
+            + (installed.ok() ? std::string{} : installed.error->message));
+    require(installed.value->ready && installed.value->completed == 6,
+            "demo installation must complete source, world, graph, version, character and branch stages; completed="
+            + std::to_string(installed.value->completed));
+    require(!installed.value->source_id.empty() && !installed.value->world_version_id.empty()
+                && !installed.value->snapshot_id.empty() && !installed.value->character_instance_id.empty(),
+            "guided demo must expose stable artifacts for every navigation stage");
+
+    xuyan::application::WorkspaceService workspace(path);
+    auto entries = workspace.search({}, {}, 0, 100);
+    require(entries.ok() && entries.value->total == 14,
+            "complete grey-harbor demo must contain all documented people, locations, rules and events");
+    xuyan::application::SourceImportService sources(path);
+    auto text = sources.loadNormalizedText(installed.value->source_id);
+    require(text.ok() && text.value->find("原著候选走向是翌日谈判破裂") != std::string::npos,
+            "demo source must remain locally readable for evidence review");
+    xuyan::application::EvidenceService evidence(path);
+    auto evidence_items = evidence.listForSource(installed.value->source_id);
+    require(evidence_items.ok() && evidence_items.value->size() == 10,
+            "demo claims must link back to ten exact source ranges");
+    xuyan::application::WorldGraphService graph(path);
+    auto map = graph.loadMap("world-grey-harbor");
+    require(map.ok() && map.value->locations.size() == 4 && map.value->routes.size() == 1
+                && map.value->routes.front().travel_minutes == 30,
+            "demo map must retain four locations and the documented half-hour ferry route");
+
+    auto replayed = demo.install();
+    require(replayed.ok() && replayed.value->ready
+                && replayed.value->world_version_id == installed.value->world_version_id,
+            "replaying demo installation must be idempotent and keep the immutable v1 identifiers");
+    auto entries_after_replay = workspace.search({}, {}, 0, 100);
+    auto evidence_after_replay = evidence.listForSource(installed.value->source_id);
+    require(entries_after_replay.ok() && entries_after_replay.value->total == 14
+                && evidence_after_replay.ok() && evidence_after_replay.value->size() == 10,
+            "replay must not duplicate world entries or evidence");
+    removeDatabase(path);
+}
+
 } // namespace
 
 int main() {
@@ -1392,6 +1500,7 @@ int main() {
         testPersistenceRecoveryDedupAndBranchIsolation();
         testIncrementalSseParsing();
         testNativeProviderProtocolAdapters();
+        testProviderGenerationGatewayAndCredentialIsolation();
         testEntityCrudSearchAndOptimisticLocking();
         testSourceImportAndCodepointEvidence();
         testPersistentExtractionQueue();
@@ -1406,6 +1515,7 @@ int main() {
         testBranchComparisonExportDiagnosticsAndAdoption();
         testNativeCredentialStoreRoundTrip();
         testConcurrentWorkspaceWritersAreSerialized();
+        testCompleteDemoWorldInstallationAndReplay();
         std::cout << "All XuyanForge core tests passed.\n";
         return 0;
     } catch (const std::exception& exception) {

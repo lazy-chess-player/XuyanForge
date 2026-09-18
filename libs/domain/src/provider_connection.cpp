@@ -8,7 +8,8 @@ namespace xuyan::domain {
 Result<ProviderConnection> validateProviderConnection(ProviderConnection connection) {
     constexpr std::array kinds{
         std::string_view{"openai"}, std::string_view{"openai-compatible"},
-        std::string_view{"anthropic"}, std::string_view{"gemini"}, std::string_view{"local"},
+        std::string_view{"anthropic"}, std::string_view{"gemini"}, std::string_view{"deepseek"},
+        std::string_view{"local"},
     };
     if (connection.name.empty() || connection.name.size() > 256) return Result<ProviderConnection>::failure(
         {ErrorCode::validation_failed, "连接名称不能为空或过长", false, "修改连接名称"});

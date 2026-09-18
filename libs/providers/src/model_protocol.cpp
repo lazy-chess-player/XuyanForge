@@ -222,4 +222,16 @@ ProviderGenerationResult classifyProviderFailure(int http_status, bool timed_out
     return result;
 }
 
+xuyan::domain::Result<ProviderProtocol> protocolForProviderKind(std::string_view kind) {
+    if (kind == "openai" || kind == "deepseek")
+        return xuyan::domain::Result<ProviderProtocol>::success(ProviderProtocol::openai_responses);
+    if (kind == "openai-compatible" || kind == "local")
+        return xuyan::domain::Result<ProviderProtocol>::success(ProviderProtocol::openai_compatible);
+    if (kind == "anthropic")
+        return xuyan::domain::Result<ProviderProtocol>::success(ProviderProtocol::anthropic_messages);
+    if (kind == "gemini")
+        return xuyan::domain::Result<ProviderProtocol>::success(ProviderProtocol::gemini_generate_content);
+    return xuyan::domain::Result<ProviderProtocol>::failure(protocolError("提供商类型没有可用的请求协议映射"));
+}
+
 } // namespace xuyan::providers

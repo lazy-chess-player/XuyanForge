@@ -1,7 +1,9 @@
 #include "provider_view_model.h"
 
 #include "xuyan/application/provider_connection_service.h"
+#include "xuyan/application/provider_generation_service.h"
 #include "xuyan/platform/credential_store.h"
+#include "xuyan/providers/qt_provider_transport.h"
 #include "xuyan/storage/workspace_repository.h"
 
 #include <QMetaObject>
@@ -159,6 +161,37 @@ void ProviderViewModel::probeConnection(QString id) {
             error = QString::fromUtf8(exception.what());
         }
         secret.assign(secret.size(), '\0');
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, status, error] {
+            if (!self) return;
+            self->busy_ = false; self->status_text_ = status; self->error_text_ = error; emit self->changed();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ProviderViewModel::testStructuredGeneration(QString id) {
+    if (busy_ || id.isEmpty()) return;
+    busy_ = true; error_text_.clear(); status_text_ = QStringLiteral("正在执行真实结构化生成自检…"); emit changed();
+    const auto database = database_path_; QPointer<ProviderViewModel> self(this);
+    QThreadPool::globalInstance()->start([self, database, id] {
+        QString status; QString error;
+        try {
+            xuyan::platform::SystemCredentialStore credentials;
+            xuyan::providers::QtProviderTransport transport;
+            xuyan::application::ProviderGenerationService service(database, credentials, transport);
+            auto report = service.testStructuredGeneration(id.toStdString(), 45000);
+            if (!report.ok()) error = QString::fromStdString(report.error->message);
+            else if (report.value->status != "completed" || !report.value->json_valid) {
+                error = QStringLiteral("结构化生成失败：%1；未推进任何推演分支")
+                    .arg(QString::fromStdString(report.value->failure_kind));
+            } else {
+                status = QStringLiteral("真实生成成功 · %1 · JSON 已验证 · %2/%3 tokens · %4 ms")
+                    .arg(QString::fromStdString(report.value->model_id))
+                    .arg(report.value->input_tokens).arg(report.value->output_tokens).arg(report.value->elapsed_ms);
+            }
+        } catch (const std::exception& exception) {
+            error = QString::fromUtf8(exception.what());
+        }
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, status, error] {
             if (!self) return;

@@ -13,6 +13,7 @@ ApplicationWindow {
     title: "叙演工坊 · 灰港议和"
     color: "#0d131b"
     property int activePage: 0
+    Component.onCompleted: if (workspaceCatalog.onboardingVisible) activePage = 6
 
     readonly property color ink: "#e8edf1"
     readonly property color muted: "#8e9ba7"
@@ -1205,6 +1206,16 @@ ApplicationWindow {
                                 providerPolicy.currentIndex = 0; providerEnabled.checked = true; providerKey.text = ""
                             }
                         }
+                        ActionButton {
+                            text: "DeepSeek 预设"
+                            onClicked: {
+                                providersPage.editId = ""; providersPage.editRevision = 0
+                                providerName.text = "DeepSeek"; providerKind.currentIndex = providerKind.find("deepseek")
+                                providerEndpoint.text = "https://api.deepseek.com"; providerModel.text = "deepseek-flash"
+                                providerPolicy.currentIndex = providerPolicy.find("remote_allowed")
+                                providerEnabled.checked = true; providerKey.text = ""
+                            }
+                        }
                     }
                     ListView {
                         Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 8
@@ -1251,7 +1262,7 @@ ApplicationWindow {
                         ColumnLayout {
                             Layout.fillWidth: true
                             Label { text: "提供商协议"; color: root.muted }
-                            ComboBox { id: providerKind; Layout.fillWidth: true; model: ["openai", "openai-compatible", "anthropic", "gemini", "local"] }
+                            ComboBox { id: providerKind; Layout.fillWidth: true; model: ["openai", "openai-compatible", "deepseek", "anthropic", "gemini", "local"] }
                         }
                         ColumnLayout {
                             Layout.fillWidth: true
@@ -1279,6 +1290,10 @@ ApplicationWindow {
                         ActionButton {
                             text: "测试连接"; visible: providersPage.editId.length > 0; enabled: !providers.busy
                             onClicked: providers.probeConnection(providersPage.editId)
+                        }
+                        ActionButton {
+                            text: "测试结构化生成"; visible: providersPage.editId.length > 0; enabled: !providers.busy
+                            onClicked: providers.testStructuredGeneration(providersPage.editId)
                         }
                         ActionButton {
                             text: "删除"; visible: providersPage.editId.length > 0; enabled: !providers.busy
@@ -1330,6 +1345,81 @@ ApplicationWindow {
             }
         }
         Label { visible: workspaceCatalog.errorText.length > 0; text: workspaceCatalog.errorText; color: root.red; Layout.fillWidth: true; wrapMode: Text.Wrap }
+        Card {
+            Layout.fillWidth: true
+            implicitHeight: 246
+            ColumnLayout {
+                anchors.fill: parent; anchors.margins: 16; spacing: 10
+                RowLayout {
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                        spacing: 2
+                        Label { text: "首次使用 · 灰港议和完整向导"; color: root.ink; font.pixelSize: 19; font.bold: true }
+                        Label {
+                            text: workspaceCatalog.demoReady
+                                  ? "演示基线已就绪。接下来运行 5 回合、创建 A/B 分支并导出选定结果。"
+                                  : "一键安装完全自创的短文、证据、世界 v1、历史快照、林舟实例与固定分支根。"
+                            color: workspaceCatalog.demoReady ? root.teal : root.muted; font.pixelSize: 11
+                        }
+                    }
+                    Item { Layout.fillWidth: true }
+                    Label {
+                        text: workspaceCatalog.demoCompleted + " / " + workspaceCatalog.demoTotal
+                        color: workspaceCatalog.demoReady ? root.teal : root.amber; font.pixelSize: 16; font.bold: true
+                    }
+                    ActionButton {
+                        text: workspaceCatalog.demoReady ? "重新检查" : "安装完整演示"
+                        highlighted: !workspaceCatalog.demoReady
+                        enabled: !workspaceCatalog.demoBusy
+                        onClicked: workspaceCatalog.demoReady ? workspaceCatalog.refreshDemo() : workspaceCatalog.installDemoWorld()
+                    }
+                    ActionButton {
+                        text: "以后再说"; visible: workspaceCatalog.onboardingVisible
+                        enabled: !workspaceCatalog.demoBusy; onClicked: workspaceCatalog.dismissOnboarding()
+                    }
+                }
+                Rectangle {
+                    Layout.fillWidth: true; implicitHeight: 6; radius: 3; color: "#0d151d"
+                    Rectangle {
+                        height: parent.height; radius: 3; color: root.teal
+                        width: parent.width * (workspaceCatalog.demoTotal > 0
+                                               ? workspaceCatalog.demoCompleted / workspaceCatalog.demoTotal : 0)
+                        Behavior on width { NumberAnimation { duration: 180 } }
+                    }
+                }
+                ListView {
+                    Layout.fillWidth: true; Layout.preferredHeight: 82; orientation: ListView.Horizontal
+                    spacing: 8; clip: true; model: workspaceCatalog.demoStages
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: 230; height: 78; radius: 8
+                        color: modelData.ready ? "#12302f" : "#18232d"
+                        border.color: modelData.ready ? root.teal : root.line
+                        RowLayout {
+                            anchors.fill: parent; anchors.margins: 10; spacing: 9
+                            Rectangle {
+                                width: 24; height: 24; radius: 12
+                                color: modelData.ready ? root.teal : "#263746"
+                                Label { anchors.centerIn: parent; text: modelData.ready ? "✓" : "·"; color: modelData.ready ? "#071413" : root.muted; font.bold: true }
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true; spacing: 3
+                                Label { text: modelData.title; color: root.ink; font.pixelSize: 12; font.bold: true }
+                                Label { Layout.fillWidth: true; text: modelData.detail; color: root.muted; font.pixelSize: 9; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight }
+                            }
+                        }
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    Label { text: workspaceCatalog.demoBusy ? "正在写入可恢复阶段…" : workspaceCatalog.statusText; color: workspaceCatalog.demoBusy ? root.amber : root.teal; Layout.fillWidth: true; elide: Text.ElideRight }
+                    ActionButton { text: "1 查看来源证据"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 2 }
+                    ActionButton { text: "2 核对世界与入场"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 9 }
+                    ActionButton { text: "3 运行 5 回合"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 0 }
+                    ActionButton { text: "4 比较并导出"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 4 }
+                }
+            }
+        }
         RowLayout {
             Layout.fillWidth: true; Layout.fillHeight: true; spacing: 14
             Card {

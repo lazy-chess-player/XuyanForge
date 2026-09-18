@@ -1,8 +1,10 @@
 #include "workspace_catalog_view_model.h"
 
 #include "xuyan/application/workspace_service.h"
+#include "xuyan/application/demo_world_service.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
@@ -18,6 +20,8 @@ WorkspaceCatalogViewModel::WorkspaceCatalogViewModel(std::filesystem::path datab
     : QObject(parent), database_path_(std::move(database_path)) {
     loadRecent();
     registerRecent(QString::fromStdWString(database_path_.stem().wstring()), currentPath());
+    onboarding_dismissed_ = QSettings().value(onboardingSettingsKey(), false).toBool();
+    refreshDemo();
 }
 
 QString WorkspaceCatalogViewModel::currentPath() const { return QDir::toNativeSeparators(QString::fromStdWString(database_path_.wstring())); }
@@ -112,4 +116,73 @@ void WorkspaceCatalogViewModel::switchToRecent(int index) {
 void WorkspaceCatalogViewModel::forgetRecent(int index) {
     if (index < 0 || index >= recent_.size()) return;
     recent_.removeAt(index); saveRecent(); emit changed();
+}
+
+QString WorkspaceCatalogViewModel::onboardingSettingsKey() const {
+    const auto digest = QCryptographicHash::hash(currentPath().toUtf8(), QCryptographicHash::Sha256).toHex();
+    return QStringLiteral("onboardingDismissed/%1").arg(QString::fromLatin1(digest));
+}
+
+void WorkspaceCatalogViewModel::refreshDemo() {
+    if (demo_busy_) return;
+    demo_busy_ = true; emit changed();
+    QPointer<WorkspaceCatalogViewModel> self(this); const auto path = database_path_;
+    QThreadPool::globalInstance()->start([self, path] {
+        xuyan::application::DemoWorldService service(path);
+        auto result = service.inspect();
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, result = std::move(result)]() mutable {
+            if (!self) return;
+            self->demo_busy_ = false;
+            if (!result.ok()) {
+                self->error_text_ = QString::fromStdString(result.error->message);
+                emit self->changed(); return;
+            }
+            QVariantList stages;
+            for (const auto& stage : result.value->stages) stages.push_back(QVariantMap{
+                {"id", QString::fromStdString(stage.id)}, {"title", QString::fromStdString(stage.title)},
+                {"detail", QString::fromStdString(stage.detail)}, {"ready", stage.ready}});
+            self->demo_stages_ = std::move(stages); self->demo_completed_ = result.value->completed;
+            self->demo_ready_ = result.value->ready;
+            self->demo_version_id_ = QString::fromStdString(result.value->world_version_id);
+            emit self->changed();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void WorkspaceCatalogViewModel::installDemoWorld() {
+    if (demo_busy_) return;
+    demo_busy_ = true; error_text_.clear(); status_text_ = QStringLiteral("正在安装完整灰港演示…"); emit changed();
+    QPointer<WorkspaceCatalogViewModel> self(this); const auto path = database_path_;
+    QThreadPool::globalInstance()->start([self, path] {
+        xuyan::application::DemoWorldService service(path);
+        auto result = service.install();
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, result = std::move(result)]() mutable {
+            if (!self) return;
+            self->demo_busy_ = false;
+            if (!result.ok()) {
+                self->error_text_ = QString::fromStdString(result.error->message);
+                self->status_text_ = QStringLiteral("演示安装未完成，可修正后安全重试");
+                emit self->changed(); return;
+            }
+            QVariantList stages;
+            for (const auto& stage : result.value->stages) stages.push_back(QVariantMap{
+                {"id", QString::fromStdString(stage.id)}, {"title", QString::fromStdString(stage.title)},
+                {"detail", QString::fromStdString(stage.detail)}, {"ready", stage.ready}});
+            self->demo_stages_ = std::move(stages); self->demo_completed_ = result.value->completed;
+            self->demo_ready_ = result.value->ready;
+            self->demo_version_id_ = QString::fromStdString(result.value->world_version_id);
+            self->status_text_ = self->demo_ready_ ? QStringLiteral("完整灰港演示已就绪，可按向导开始 5 回合推演")
+                                                   : QStringLiteral("演示安装完成，但仍有步骤需要处理");
+            emit self->changed();
+            if (self->demo_ready_) emit self->demoInstalled();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void WorkspaceCatalogViewModel::dismissOnboarding() {
+    onboarding_dismissed_ = true;
+    QSettings settings; settings.setValue(onboardingSettingsKey(), true); settings.sync();
+    emit changed();
 }

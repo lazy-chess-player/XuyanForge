@@ -3,6 +3,7 @@
 
 #include <charconv>
 #include <cctype>
+#include <cmath>
 #include <limits>
 #include <sstream>
 
@@ -68,7 +69,7 @@ private:
         if (input_.substr(position_, 4) == "true") { position_ += 4; return xuyan::domain::Result<JsonValue>::success(JsonValue(true)); }
         if (input_.substr(position_, 5) == "false") { position_ += 5; return xuyan::domain::Result<JsonValue>::success(JsonValue(false)); }
         if (input_.substr(position_, 4) == "null") { position_ += 4; return xuyan::domain::Result<JsonValue>::success(JsonValue(nullptr)); }
-        if (token == '-' || std::isdigit(static_cast<unsigned char>(token))) return integer();
+        if (token == '-' || std::isdigit(static_cast<unsigned char>(token))) return number();
         return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 包含无效值"));
     }
 
@@ -124,15 +125,35 @@ private:
         return xuyan::domain::Result<std::uint32_t>::success(result);
     }
 
-    xuyan::domain::Result<JsonValue> integer() {
+    xuyan::domain::Result<JsonValue> number() {
         const auto begin = position_;
         if (input_[position_] == '-') ++position_;
         if (position_ >= input_.size() || !std::isdigit(static_cast<unsigned char>(input_[position_])))
             return xuyan::domain::Result<JsonValue>::failure(jsonError("无效 JSON 数字"));
         if (input_[position_] == '0') ++position_;
         else while (position_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[position_]))) ++position_;
-        if (position_ < input_.size() && (input_[position_] == '.' || input_[position_] == 'e' || input_[position_] == 'E'))
-            return xuyan::domain::Result<JsonValue>::failure(jsonError("协议字段不接受浮点数"));
+        bool is_real = false;
+        if (position_ < input_.size() && input_[position_] == '.') {
+            is_real = true; ++position_;
+            const auto fraction_begin = position_;
+            while (position_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[position_]))) ++position_;
+            if (position_ == fraction_begin) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 小数点后缺少数字"));
+        }
+        if (position_ < input_.size() && (input_[position_] == 'e' || input_[position_] == 'E')) {
+            is_real = true; ++position_;
+            if (position_ < input_.size() && (input_[position_] == '+' || input_[position_] == '-')) ++position_;
+            const auto exponent_begin = position_;
+            while (position_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[position_]))) ++position_;
+            if (position_ == exponent_begin) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 指数缺少数字"));
+        }
+        if (is_real) {
+            double parsed = 0;
+            const auto result = std::from_chars(input_.data() + begin, input_.data() + position_, parsed,
+                                                std::chars_format::general);
+            if (result.ec != std::errc{} || result.ptr != input_.data() + position_ || !std::isfinite(parsed))
+                return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 浮点数超出范围"));
+            return xuyan::domain::Result<JsonValue>::success(JsonValue(parsed));
+        }
         std::int64_t parsed = 0;
         const auto result = std::from_chars(input_.data() + begin, input_.data() + position_, parsed);
         if (result.ec != std::errc{}) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 整数超出范围"));
@@ -193,6 +214,13 @@ void writeValue(const JsonValue& value, std::string& output) {
     if (value.isNull()) output += "null";
     else if (value.isBool()) output += value.boolean() ? "true" : "false";
     else if (value.isInteger()) output += std::to_string(value.integer());
+    else if (value.isReal()) {
+        char buffer[64];
+        const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value.real(),
+                                          std::chars_format::general, std::numeric_limits<double>::max_digits10);
+        if (result.ec != std::errc{}) throw std::runtime_error("无法序列化 JSON 浮点数");
+        output.append(buffer, result.ptr);
+    }
     else if (value.isString()) output += jsonEscape(value.string());
     else if (value.isArray()) {
         output.push_back('[');

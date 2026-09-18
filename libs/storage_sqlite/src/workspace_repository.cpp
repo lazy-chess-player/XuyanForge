@@ -3062,6 +3062,13 @@ Result<xuyan::domain::BranchRootBinding> WorkspaceRepository::bindBranchRoot(
     } catch (const std::exception& exception) { return Result<xuyan::domain::BranchRootBinding>::failure(storageError(exception)); }
 }
 
+Result<xuyan::domain::BranchRootBinding> WorkspaceRepository::loadBranchRootBinding(const std::string& branch_id) {
+    try { return Result<xuyan::domain::BranchRootBinding>::success(readBranchRootBinding(database_, branch_id)); }
+    catch (const std::exception& exception) {
+        return Result<xuyan::domain::BranchRootBinding>::failure(storageError(exception));
+    }
+}
+
 Result<xuyan::domain::SimulationSession> WorkspaceRepository::createSimulationSession(
     const std::string& command_id, xuyan::domain::SimulationSession session) {
     auto valid = xuyan::domain::validateSimulationSession(std::move(session));
