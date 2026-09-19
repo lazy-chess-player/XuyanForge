@@ -60,7 +60,7 @@ void PackageViewModel::exportWorld(const QUrl& destination) {
     const auto target = destination.toLocalFile().toStdWString();
     run([target](const auto& database, QString& status, QString& error) {
         xuyan::application::PackageService service(database);
-        auto result = service.exportWorld(std::filesystem::path(target), "灰港议和", "本地作者");
+        auto result = service.exportWorld(std::filesystem::path(target), "我的世界", "本地作者");
         if (!result.ok()) error = QString::fromStdString(result.error->message);
         else status = QStringLiteral("世界包已导出：%1 个条目").arg(result.value->entity_count);
     });

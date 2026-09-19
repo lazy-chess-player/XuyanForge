@@ -14,7 +14,7 @@ public:
 
     xuyan::domain::Result<xuyan::domain::SourceDocument> importTextFile(
         const std::string& command_id, const std::filesystem::path& source_path,
-        const std::string& edition = "1");
+        const std::string& edition = "1", const std::string& world_id = {});
     xuyan::domain::Result<std::vector<xuyan::domain::SourceDocument>> list();
     xuyan::domain::Result<std::string> loadNormalizedText(const std::string& source_id);
     xuyan::domain::Result<std::string> evidenceText(const std::string& source_id,

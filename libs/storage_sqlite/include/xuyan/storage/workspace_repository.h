@@ -24,6 +24,12 @@ struct sqlite3;
 
 namespace xuyan::storage {
 
+struct WorldTemplate {
+    std::string id;
+    std::string name;
+    std::string source_id;
+};
+
 class WorkspaceRepository {
 public:
     explicit WorkspaceRepository(const std::filesystem::path& database_path);
@@ -77,6 +83,10 @@ public:
 
     xuyan::domain::Result<xuyan::domain::SourceDocument> saveSource(
         const std::string& command_id, const xuyan::domain::SourceDocument& document);
+    xuyan::domain::Result<WorldTemplate> createWorldTemplate(const std::string& id, const std::string& name);
+    xuyan::domain::Result<std::vector<WorldTemplate>> listWorldTemplates();
+    xuyan::domain::Result<WorldTemplate> attachWorldSource(const std::string& world_id,
+                                                            const std::string& source_id);
     xuyan::domain::Result<std::vector<xuyan::domain::SourceDocument>> listSources();
     xuyan::domain::Result<xuyan::domain::SourceDocument> loadSource(const std::string& source_id);
     xuyan::domain::Result<xuyan::domain::SourceDocument> replaceSourceChapters(

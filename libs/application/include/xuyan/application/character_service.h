@@ -13,6 +13,7 @@ public:
     explicit CharacterService(std::filesystem::path database_path);
 
     xuyan::domain::Result<std::vector<xuyan::domain::CharacterBlueprint>> openAndList();
+    xuyan::domain::Result<bool> installTestFixture();
     xuyan::domain::Result<xuyan::domain::CharacterBlueprint> create(
         const std::string& command_id, xuyan::domain::CharacterBlueprint blueprint);
     xuyan::domain::Result<xuyan::domain::CharacterBlueprint> save(
@@ -22,9 +23,7 @@ public:
     xuyan::domain::Result<std::vector<xuyan::domain::CharacterBlueprint>> list();
 
 private:
-    xuyan::domain::Result<bool> ensureSample();
     std::filesystem::path database_path_;
 };
 
 } // namespace xuyan::application
-

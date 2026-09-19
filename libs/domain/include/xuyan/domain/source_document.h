@@ -21,7 +21,7 @@ struct SourceChapter {
 
 struct SourceDocument {
     std::string id;
-    std::string world_id{"world-grey-harbor"};
+    std::string world_id;
     std::string name;
     std::string sha256;
     std::string original_asset_ref;

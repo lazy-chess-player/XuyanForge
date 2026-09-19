@@ -127,7 +127,7 @@ Result<DemoWorldProgress> DemoWorldService::inspect() {
     try {
         DemoWorldProgress progress;
         const auto text = sourceText();
-        progress.source_id = "source-" + xuyan::domain::sha256(text).substr(0, 24);
+        progress.source_id = "source-" + xuyan::domain::sha256(std::string(kWorldId) + "|" + xuyan::domain::sha256(text)).substr(0, 24);
         progress.world_version_id = derivedId("world-version-", kVersionCommand);
         progress.snapshot_id = derivedId("snapshot-", kSnapshotCommand);
         progress.character_instance_id = derivedId("character-instance-", kInstanceCommand);
@@ -210,7 +210,7 @@ Result<DemoWorldProgress> DemoWorldService::install() {
             if (!output) return Result<DemoWorldProgress>::failure(installError("无法写入演示短文临时文件"));
         }
         SourceImportService sources(database_path_);
-        auto source = sources.importTextFile("demo-grey-harbor-source-v1", temporary, "演示世界 v1");
+        auto source = sources.importTextFile("demo-grey-harbor-source-v1", temporary, "演示世界 v1", kWorldId);
         std::error_code cleanup_error;
         std::filesystem::remove(temporary, cleanup_error);
         if (!source.ok()) return Result<DemoWorldProgress>::failure(*source.error);
@@ -239,25 +239,25 @@ Result<DemoWorldProgress> DemoWorldService::install() {
 
         WorldGraphService graph(database_path_);
         xuyan::domain::TimelineEvent entry;
-        entry.id = "timeline-council-entry"; entry.name = "议事厅外入场"; entry.story_time = 0;
+        entry.id = "timeline-council-entry"; entry.world_id = kWorldId; entry.name = "议事厅外入场"; entry.story_time = 0;
         entry.narrative_order = 1; entry.truth_status = "fact"; entry.results = {"timeline-negotiation-breaks"};
         auto saved_entry = graph.saveTimelineEvent("demo-grey-harbor-timeline-entry", entry, 0);
         if (!saved_entry.ok()) return Result<DemoWorldProgress>::failure(*saved_entry.error);
         xuyan::domain::TimelineEvent negotiation;
-        negotiation.id = "timeline-negotiation-breaks"; negotiation.name = "翌日谈判破裂"; negotiation.story_time = 100;
+        negotiation.id = "timeline-negotiation-breaks"; negotiation.world_id = kWorldId; negotiation.name = "翌日谈判破裂"; negotiation.story_time = 100;
         negotiation.narrative_order = 2; negotiation.truth_status = "future_candidate";
         negotiation.prerequisites = {entry.id}; negotiation.causes = {entry.id};
         auto saved_negotiation = graph.saveTimelineEvent("demo-grey-harbor-timeline-negotiation", negotiation, 0);
         if (!saved_negotiation.ok()) return Result<DemoWorldProgress>::failure(*saved_negotiation.error);
 
         xuyan::domain::DirectedRelation xu_to_shen;
-        xu_to_shen.id = "relation-xucheng-shentang-trust"; xu_to_shen.from_entity_id = "entity-xucheng";
+        xu_to_shen.id = "relation-xucheng-shentang-trust"; xu_to_shen.world_id = kWorldId; xu_to_shen.from_entity_id = "entity-xucheng";
         xu_to_shen.to_entity_id = "entity-shentang"; xu_to_shen.dimension = "trust"; xu_to_shen.strength = 15;
         xu_to_shen.valid_from = 0; xu_to_shen.evidence_status = "evidence";
         auto relation_one = graph.saveRelation("demo-grey-harbor-relation-xu-shen", xu_to_shen, 0);
         if (!relation_one.ok()) return Result<DemoWorldProgress>::failure(*relation_one.error);
         xuyan::domain::DirectedRelation shen_to_xu;
-        shen_to_xu.id = "relation-shentang-xucheng-doubt"; shen_to_xu.from_entity_id = "entity-shentang";
+        shen_to_xu.id = "relation-shentang-xucheng-doubt"; shen_to_xu.world_id = kWorldId; shen_to_xu.from_entity_id = "entity-shentang";
         shen_to_xu.to_entity_id = "entity-xucheng"; shen_to_xu.dimension = "doubt"; shen_to_xu.strength = 10;
         shen_to_xu.valid_from = 0; shen_to_xu.visibility = "restricted"; shen_to_xu.actor_grants = {"actor-shentang"};
         shen_to_xu.evidence_status = "assumption";
@@ -279,6 +279,8 @@ Result<DemoWorldProgress> DemoWorldService::install() {
         if (!saved_route.ok()) return Result<DemoWorldProgress>::failure(*saved_route.error);
 
         CharacterService cards(database_path_);
+        auto card_seeded = cards.installTestFixture();
+        if (!card_seeded.ok()) return Result<DemoWorldProgress>::failure(*card_seeded.error);
         auto card_list = cards.openAndList();
         if (!card_list.ok()) return Result<DemoWorldProgress>::failure(*card_list.error);
 
@@ -304,7 +306,7 @@ Result<DemoWorldProgress> DemoWorldService::install() {
             "{\"echo\":\"消耗 1 点专注读取物品残响\",\"铜制指针\":\"普通调查工具\",\"focus\":3}", "strict");
         if (!instance.ok()) return Result<DemoWorldProgress>::failure(*instance.error);
         SimulationService simulation(database_path_);
-        auto root = simulation.open();
+        auto root = simulation.installDemoBranch();
         if (!root.ok()) return Result<DemoWorldProgress>::failure(*root.error);
         auto binding = instances.bindBranchRoot(kBindingCommand, "branch-main", version.id, snapshot.value->id,
                                                 "branching", {instance.value->id});

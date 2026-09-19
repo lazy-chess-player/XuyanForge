@@ -53,6 +53,7 @@ public:
     QString statusText() const { return status_text_; }
 
     Q_INVOKABLE void refresh(QString query = {}, QString kind = {});
+    void setWorldId(QString world_id) { world_id_ = std::move(world_id); }
     Q_INVOKABLE void selectEntity(int index);
     Q_INVOKABLE void createEntity(QString name, QString kind, QString description,
                                   QString aliases, QString tags, QString attributes);
@@ -95,6 +96,7 @@ private:
     QString status_text_;
     QString last_query_;
     QString last_kind_;
+    QString world_id_;
     int total_{0};
     int offset_{0};
     int page_size_{25};

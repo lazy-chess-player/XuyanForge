@@ -10,19 +10,43 @@ ApplicationWindow {
     minimumWidth: 1080
     minimumHeight: 700
     visible: true
-    title: "叙演工坊 · 灰港议和"
-    color: "#0d131b"
-    property int activePage: 0
-    Component.onCompleted: if (workspaceCatalog.onboardingVisible) activePage = 6
+    title: "叙演工坊"
+    color: root.theme.background
+    property int activePage: 10
+    property url novelFile: ""
+    property int wizardStep: 0
+    readonly property int sidebarWidth: 252
+    // New themes only need a palette entry and an ID in the settings registry.
+    readonly property var themePalettes: ({
+        dark: {
+            background: "#0d131b", sidebar: "#101821", ink: "#e8edf1", muted: "#8e9ba7",
+            panel: "#141d27", panelRaised: "#192531", line: "#2a3946", amber: "#dfa94f",
+            amberPressed: "#b98535", teal: "#58b7a7", red: "#e0746a", onAccent: "#14181c",
+            fieldSurface: "#101922", itemSurface: "#17232d", editorSurface: "#111a23",
+            buttonSurface: "#22313d", quietButton: "#253744", selectedSurface: "#213442",
+            successSurface: "#18352f", statusSurface: "#121d25", dangerSurface: "#392226",
+            deepSurface: "#18191f", warningSurface: "#3b3020", warningBorder: "#55472e"
+        },
+        light: {
+            background: "#f5f7fa", sidebar: "#e9eef3", ink: "#1b2733", muted: "#5b6d7e",
+            panel: "#ffffff", panelRaised: "#ffffff", line: "#cbd5df", amber: "#ba781f",
+            amberPressed: "#995f13", teal: "#137b6c", red: "#b7433d", onAccent: "#ffffff",
+            fieldSurface: "#ffffff", itemSurface: "#eef3f7", editorSurface: "#ffffff",
+            buttonSurface: "#e1e9f0", quietButton: "#e1e9f0", selectedSurface: "#d7eee7",
+            successSurface: "#dff3e9", statusSurface: "#eaf1f6", dangerSurface: "#fbe7e5",
+            deepSurface: "#f0f3f7", warningSurface: "#fff0d7", warningBorder: "#d9a64f"
+        }
+    })
+    readonly property var theme: themePalettes[workspaceCatalog.themeId] || themePalettes.dark
 
-    readonly property color ink: "#e8edf1"
-    readonly property color muted: "#8e9ba7"
-    readonly property color panel: "#141d27"
-    readonly property color panelRaised: "#192531"
-    readonly property color line: "#2a3946"
-    readonly property color amber: "#dfa94f"
-    readonly property color teal: "#58b7a7"
-    readonly property color red: "#e0746a"
+    readonly property color ink: root.theme.ink
+    readonly property color muted: root.theme.muted
+    readonly property color panel: root.theme.panel
+    readonly property color panelRaised: root.theme.panelRaised
+    readonly property color line: root.theme.line
+    readonly property color amber: root.theme.amber
+    readonly property color teal: root.theme.teal
+    readonly property color red: root.theme.red
 
     component SectionLabel: Label {
         font.pixelSize: 11
@@ -47,13 +71,13 @@ ApplicationWindow {
         rightPadding: 14
         background: Rectangle {
             radius: 7
-            color: control.down ? "#b98535" : control.highlighted ? root.amber : "#22313d"
+            color: control.down ? root.theme.amberPressed : control.highlighted ? root.amber : root.theme.buttonSurface
             border.color: control.highlighted ? root.amber : root.line
         }
         contentItem: Text {
             text: control.text
             font: control.font
-            color: control.highlighted ? "#14181c" : root.ink
+            color: control.highlighted ? root.theme.onAccent : root.ink
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
         }
@@ -62,113 +86,108 @@ ApplicationWindow {
     component InputField: TextField {
         color: root.ink
         selectionColor: root.teal
-        selectedTextColor: "#0d131b"
+        selectedTextColor: root.theme.background
         placeholderTextColor: root.muted
-        background: Rectangle { radius: 7; color: "#101922"; border.color: parent.activeFocus ? root.teal : root.line }
+        background: Rectangle { radius: 7; color: root.theme.fieldSurface; border.color: parent.activeFocus ? root.teal : root.line }
     }
 
-    header: Rectangle {
-        implicitHeight: 72
-        color: "#101821"
+    Rectangle {
+        id: sidebar
+        z: 20
+        width: root.sidebarWidth
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        color: root.theme.sidebar
         border.color: root.line
 
-        RowLayout {
+        ColumnLayout {
             anchors.fill: parent
-            anchors.leftMargin: 26
-            anchors.rightMargin: 26
-            spacing: 18
-
-            Rectangle {
-                Layout.minimumWidth: 38; Layout.preferredWidth: 38; height: 38; radius: 9
-                color: root.amber
-                Label {
-                    anchors.centerIn: parent
-                    text: "叙"
-                    color: "#111820"
-                    font.pixelSize: 20
-                    font.bold: true
+            anchors.margins: 16
+            spacing: 10
+            RowLayout {
+                Layout.fillWidth: true; Layout.preferredHeight: 52
+                Rectangle {
+                    width: 34; height: 34; radius: 8; color: root.amber
+                    Label { anchors.centerIn: parent; text: "叙"; color: root.theme.onAccent; font.pixelSize: 19; font.bold: true }
+                }
+                ColumnLayout {
+                    Label { text: "叙演工坊"; color: root.ink; font.pixelSize: 16; font.bold: true }
+                    Label { text: "XUYAN FORGE"; color: root.muted; font.pixelSize: 9; font.letterSpacing: 1.3 }
                 }
             }
-            ColumnLayout {
-                Layout.minimumWidth: 185
-                spacing: 1
-                Label { text: "叙演工坊"; color: root.ink; font.pixelSize: 18; font.bold: true }
-                Label { text: "XUYAN FORGE  ·  灰港议和"; color: root.muted; font.pixelSize: 9; font.letterSpacing: 1.7 }
+            Rectangle { Layout.fillWidth: true; height: 1; color: root.line }
+            SectionLabel { text: "项目"; Layout.topMargin: 8 }
+            ActionButton {
+                Layout.fillWidth: true; text: "+  新建世界"; highlighted: root.activePage === 10
+                onClicked: root.activePage = 10
+            }
+            Label { visible: workspaceCatalog.worlds.length === 0; text: "还没有世界"; color: root.muted; font.pixelSize: 12; Layout.leftMargin: 10 }
+            ListView {
+                id: sidebarWorlds
+                Layout.fillWidth: true; Layout.preferredHeight: Math.min(210, contentHeight)
+                clip: true; spacing: 4; model: workspaceCatalog.worlds
+                delegate: Rectangle {
+                    required property var modelData
+                    required property int index
+                    width: sidebarWorlds.width; height: 46; radius: 7
+                    color: workspaceCatalog.activeWorldId === modelData.id ? root.theme.selectedSurface : "transparent"
+                    RowLayout {
+                        anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 8
+                        Label { text: "◧"; color: root.teal; font.pixelSize: 15 }
+                        Label { text: modelData.name; color: root.ink; Layout.fillWidth: true; elide: Text.ElideRight; font.pixelSize: 12 }
+                    }
+                    MouseArea { anchors.fill: parent; onClicked: { workspaceCatalog.selectWorld(index); root.activePage = 10 } }
+                }
+            }
+            SectionLabel { text: "工作区"; Layout.topMargin: 12 }
+            ListView {
+                id: sidebarProjects
+                Layout.fillWidth: true; Layout.preferredHeight: Math.min(150, contentHeight)
+                clip: true; spacing: 4; model: workspaceCatalog.recentWorkspaces
+                delegate: Rectangle {
+                    required property var modelData
+                    required property int index
+                    width: sidebarProjects.width; height: 40; radius: 7; color: "transparent"
+                    Label { anchors.fill: parent; anchors.leftMargin: 10; verticalAlignment: Text.AlignVCenter
+                            text: modelData.name; color: root.muted; elide: Text.ElideRight; font.pixelSize: 11 }
+                    MouseArea { anchors.fill: parent; onClicked: workspaceCatalog.switchToRecent(index) }
+                }
+            }
+            ActionButton { Layout.fillWidth: true; text: "打开工作区…"; onClicked: workspaceOpenDialog.open() }
+            Item { Layout.fillHeight: true }
+            Rectangle { Layout.fillWidth: true; height: 1; color: root.line }
+            ActionButton { Layout.fillWidth: true; text: "小说与章节"; highlighted: root.activePage === 2; onClicked: root.activePage = 2 }
+            ActionButton { Layout.fillWidth: true; text: "解析任务"; highlighted: root.activePage === 7; onClicked: root.activePage = 7 }
+            ActionButton { Layout.fillWidth: true; text: "校对中心"; highlighted: root.activePage === 8; onClicked: root.activePage = 8 }
+            ActionButton { Layout.fillWidth: true; text: "推演室"; highlighted: root.activePage === 0; onClicked: root.activePage = 0 }
+            ActionButton { Layout.fillWidth: true; text: "更多功能"; onClicked: advancedMenu.open() }
+            Menu {
+                id: advancedMenu
+                MenuItem { text: "世界资料"; onTriggered: root.activePage = 1 }
+                MenuItem { text: "人物卡"; onTriggered: root.activePage = 3 }
+                MenuItem { text: "世界视图"; onTriggered: root.activePage = 9 }
+                MenuItem { text: "模型连接"; onTriggered: root.activePage = 5 }
+                MenuItem { text: "包与备份"; onTriggered: root.activePage = 4 }
+                MenuItem { text: "工作区管理"; onTriggered: root.activePage = 6 }
             }
             RowLayout {
-                spacing: 4
-                ActionButton {
-                    text: "世界资料"
-                    highlighted: root.activePage === 1
-                    onClicked: root.activePage = 1
-                }
-                ActionButton {
-                    text: "来源与章节"
-                    highlighted: root.activePage === 2
-                    onClicked: root.activePage = 2
-                }
-                ActionButton {
-                    text: "人物卡"
-                    highlighted: root.activePage === 3
-                    onClicked: root.activePage = 3
-                }
-                ActionButton {
-                    text: "包与备份"
-                    highlighted: root.activePage === 4
-                    onClicked: root.activePage = 4
-                }
-                ActionButton {
-                    text: "模型连接"
-                    highlighted: root.activePage === 5
-                    onClicked: root.activePage = 5
-                }
-                ActionButton {
-                    text: "工作区"
-                    highlighted: root.activePage === 6
-                    onClicked: root.activePage = 6
-                }
-                ActionButton {
-                    text: "任务中心"
-                    highlighted: root.activePage === 7
-                    onClicked: root.activePage = 7
-                }
-                ActionButton {
-                    text: "校对中心"
-                    highlighted: root.activePage === 8
-                    onClicked: root.activePage = 8
-                }
-                ActionButton {
-                    text: "世界视图"
-                    highlighted: root.activePage === 9
-                    onClicked: root.activePage = 9
-                }
-                ActionButton {
-                    text: "推演室"
-                    highlighted: root.activePage === 0
-                    onClicked: root.activePage = 0
-                }
-            }
-            Item { Layout.fillWidth: true }
-            Rectangle {
-                width: 9; height: 9; radius: 5
-                color: simulation.busy ? root.amber : simulation.completed ? root.teal : "#6d8292"
-                visible: root.activePage === 0
-            }
-            Label { text: simulation.statusText; color: root.muted; font.pixelSize: 12; visible: root.activePage === 0 }
-            ComboBox {
-                id: branchPicker
-                implicitWidth: 190
-                model: simulation.branchNames
-                currentIndex: simulation.activeBranchIndex
-                visible: root.activePage === 0
-                onActivated: simulation.selectBranch(currentIndex)
-                background: Rectangle { radius: 7; color: root.panel; border.color: root.line }
-                contentItem: Text {
-                    leftPadding: 12
-                    text: branchPicker.displayText
-                    color: root.ink
-                    verticalAlignment: Text.AlignVCenter
-                    elide: Text.ElideRight
+                Layout.fillWidth: true
+                Label { text: "主题"; color: root.muted; font.pixelSize: 11 }
+                Item { Layout.fillWidth: true }
+                ComboBox {
+                    id: themePicker
+                    Layout.preferredWidth: 112
+                    model: workspaceCatalog.availableThemes
+                    textRole: "name"
+                    valueRole: "id"
+                    currentIndex: workspaceCatalog.themeId === "light" ? 1 : 0
+                    onActivated: workspaceCatalog.setThemeId(currentValue)
+                    background: Rectangle { radius: 6; color: root.theme.fieldSurface; border.color: root.line }
+                    contentItem: Text {
+                        text: themePicker.displayText; color: root.ink
+                        leftPadding: 10; verticalAlignment: Text.AlignVCenter
+                    }
                 }
             }
         }
@@ -178,6 +197,7 @@ ApplicationWindow {
         id: simulationPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 0
 
@@ -185,7 +205,7 @@ ApplicationWindow {
             Layout.fillWidth: true
             implicitHeight: 48
             radius: 9
-            color: simulation.errorText.length ? "#392226" : "#121d25"
+            color: simulation.errorText.length ? root.theme.dangerSurface : root.theme.statusSurface
             border.color: simulation.errorText.length ? root.red : root.line
 
             RowLayout {
@@ -229,7 +249,7 @@ ApplicationWindow {
 
                     Card {
                         Layout.fillWidth: true; implicitHeight: 126
-                        color: "#17232d"
+                        color: root.theme.itemSurface
                         ColumnLayout {
                             anchors.fill: parent; anchors.margins: 14; spacing: 5
                             RowLayout {
@@ -245,7 +265,7 @@ ApplicationWindow {
 
                     Card {
                         Layout.fillWidth: true; implicitHeight: 126
-                        color: "#17232d"
+                        color: root.theme.itemSurface
                         ColumnLayout {
                             anchors.fill: parent; anchors.margins: 14; spacing: 5
                             RowLayout {
@@ -270,7 +290,7 @@ ApplicationWindow {
             Card {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                color: "#111a23"
+                color: root.theme.editorSurface
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 22
@@ -311,11 +331,11 @@ ApplicationWindow {
                             Card {
                                 Layout.fillWidth: true
                                 implicitHeight: Math.max(112, opening.implicitHeight + 42)
-                                color: "#18232d"
+                                color: root.theme.itemSurface
                                 ColumnLayout {
                                     anchors.fill: parent; anchors.margins: 18; spacing: 8
                                     Label { text: "场景基线"; color: root.amber; font.pixelSize: 11; font.bold: true }
-                                    Label { id: opening; Layout.fillWidth: true; text: "谈判前一天傍晚，暴雨笼罩灰港。城卫署与盐运商会将在翌日午后谈判，一枚唯一的议和印章由沈棠保管。"; color: root.ink; wrapMode: Text.Wrap; lineHeight: 1.35 }
+                                    Label { id: opening; Layout.fillWidth: true; text: "请先创建世界并导入小说，再建立推演起点。"; color: root.ink; wrapMode: Text.Wrap; lineHeight: 1.35 }
                                 }
                             }
 
@@ -330,7 +350,7 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     visible: simulation.turn >= modelData.turn
                                     implicitHeight: visible ? content.implicitHeight + 36 : 0
-                                    color: "#17232d"
+                                    color: root.theme.itemSurface
                                     ColumnLayout {
                                         id: content
                                         anchors.fill: parent; anchors.margins: 16; spacing: 7
@@ -350,7 +370,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 implicitHeight: 82
                                 visible: simulation.turn === 0
-                                color: "#141e27"
+                                color: root.theme.panel
                                 Label { anchors.centerIn: parent; text: "运行下一回合，查看角色在知识边界内行动"; color: root.muted }
                             }
                         }
@@ -371,7 +391,7 @@ ApplicationWindow {
                     SectionLabel { text: "状态差异" }
                     Card {
                         Layout.fillWidth: true; implicitHeight: 92
-                        color: "#17232d"
+                        color: root.theme.itemSurface
                         ColumnLayout {
                             anchors.fill: parent; anchors.margins: 13; spacing: 6
                             Label { text: "议和印章"; color: root.ink; font.bold: true }
@@ -380,7 +400,7 @@ ApplicationWindow {
                     }
                     Card {
                         Layout.fillWidth: true; implicitHeight: 74
-                        color: "#17232d"
+                        color: root.theme.itemSurface
                         RowLayout {
                             anchors.fill: parent; anchors.margins: 13
                             ColumnLayout {
@@ -396,7 +416,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         implicitHeight: sessionDetails.implicitHeight + 24
                         visible: simulation.hasProductionSession
-                        color: "#17232d"
+                        color: root.theme.itemSurface
                         ColumnLayout {
                             id: sessionDetails
                             anchors.fill: parent; anchors.margins: 12; spacing: 5
@@ -465,6 +485,7 @@ ApplicationWindow {
         id: workspacePage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 1
 
@@ -514,7 +535,7 @@ ApplicationWindow {
                         { text: "物品", value: "item" }, { text: "规则", value: "rule" },
                         { text: "事件", value: "event" }, { text: "其他", value: "other" }
                     ]
-                    background: Rectangle { radius: 7; color: "#101922"; border.color: root.line }
+                    background: Rectangle { radius: 7; color: root.theme.fieldSurface; border.color: root.line }
                     contentItem: Text { leftPadding: 12; text: filterKind.displayText; color: root.ink; verticalAlignment: Text.AlignVCenter }
                 }
                 ActionButton { text: "筛选"; onClicked: workspace.refresh(searchField.text, filterKind.currentValue); enabled: !workspace.busy }
@@ -550,7 +571,7 @@ ApplicationWindow {
                     anchors.fill: parent
                     anchors.margins: 14
                     spacing: 10
-                    SectionLabel { text: "世界条目 · 灰港议和" }
+                    SectionLabel { text: "世界条目" }
                     ListView {
                         id: entityList
                         Layout.fillWidth: true
@@ -564,7 +585,7 @@ ApplicationWindow {
                             width: entityList.width
                             height: 78
                             radius: 8
-                            color: workspace.selectedIndex === index ? "#213442" : "#17232d"
+                            color: workspace.selectedIndex === index ? root.theme.selectedSurface : root.theme.itemSurface
                             border.color: workspace.selectedIndex === index ? root.teal : root.line
                             MouseArea { anchors.fill: parent; onClicked: workspace.selectEntity(index) }
                             ColumnLayout {
@@ -596,7 +617,7 @@ ApplicationWindow {
             Card {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                color: "#111a23"
+                color: root.theme.editorSurface
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 20
@@ -631,7 +652,7 @@ ApplicationWindow {
                             id: kindPicker
                             Layout.fillWidth: true
                             model: ["character", "faction", "location", "item", "rule", "event", "culture", "technology", "other"]
-                            background: Rectangle { radius: 7; color: "#101922"; border.color: root.line }
+                            background: Rectangle { radius: 7; color: root.theme.fieldSurface; border.color: root.line }
                             contentItem: Text { leftPadding: 12; text: kindPicker.displayText; color: root.ink; verticalAlignment: Text.AlignVCenter }
                             onCurrentTextChanged: workspaceDraftTimer.restart()
                         }
@@ -644,7 +665,7 @@ ApplicationWindow {
                     Label { text: "说明"; color: root.muted }
                     Rectangle {
                         Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 150
-                        radius: 7; color: "#101922"; border.color: entityDescription.activeFocus ? root.teal : root.line
+                        radius: 7; color: root.theme.fieldSurface; border.color: entityDescription.activeFocus ? root.teal : root.line
                         TextArea {
                             id: entityDescription
                             anchors.fill: parent; anchors.margins: 7
@@ -692,6 +713,7 @@ ApplicationWindow {
         id: sourcesPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 2
 
@@ -700,7 +722,7 @@ ApplicationWindow {
             title: "选择 TXT 或 Markdown 来源"
             nameFilters: ["文本来源 (*.txt *.md *.markdown)"]
             fileMode: FileDialog.OpenFile
-            onAccepted: sources.importFile(selectedFile)
+            onAccepted: sources.importFile(selectedFile, workspaceCatalog.activeWorldId)
         }
 
         Rectangle {
@@ -742,7 +764,7 @@ ApplicationWindow {
                             required property var modelData
                             required property int index
                             width: sourceList.width; height: 72; radius: 8
-                            color: sources.selectedIndex === index ? "#213442" : "#17232d"
+                            color: sources.selectedIndex === index ? root.theme.selectedSurface : root.theme.itemSurface
                             border.color: sources.selectedIndex === index ? root.teal : root.line
                             MouseArea { anchors.fill: parent; onClicked: sources.selectSource(index) }
                             ColumnLayout {
@@ -781,7 +803,7 @@ ApplicationWindow {
                             required property var modelData
                             required property int index
                             width: chapterList.width; height: 64; radius: 7
-                            color: sources.selectedChapterIndex === index ? "#213442" : "#17232d"
+                            color: sources.selectedChapterIndex === index ? root.theme.selectedSurface : root.theme.itemSurface
                             border.color: sources.selectedChapterIndex === index ? root.teal : root.line
                             ColumnLayout {
                                 anchors.fill: parent; anchors.margins: 9; spacing: 3
@@ -809,7 +831,7 @@ ApplicationWindow {
                         delegate: Rectangle {
                             required property var modelData
                             required property int index
-                            width: evidenceList.width; height: 76; radius: 7; color: "#17232d"; border.color: root.line
+                            width: evidenceList.width; height: 76; radius: 7; color: root.theme.itemSurface; border.color: root.line
                             ColumnLayout {
                                 anchors.fill: parent; anchors.margins: 8; spacing: 2
                                 Label { text: modelData.entityId + "." + modelData.field; color: root.teal; font.bold: true; font.pixelSize: 11 }
@@ -833,7 +855,7 @@ ApplicationWindow {
             Card {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                color: "#111a23"
+                color: root.theme.editorSurface
                 ColumnLayout {
                     anchors.fill: parent; anchors.margins: 16; spacing: 9
                     RowLayout {
@@ -865,7 +887,7 @@ ApplicationWindow {
                             wrapMode: TextEdit.Wrap
                             color: root.ink
                             selectionColor: root.teal
-                            selectedTextColor: "#0d131b"
+                            selectedTextColor: root.theme.background
                             font.pixelSize: 13
                             background: null
                         }
@@ -879,6 +901,7 @@ ApplicationWindow {
         id: charactersPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 3
 
@@ -932,7 +955,7 @@ ApplicationWindow {
                             required property var modelData
                             required property int index
                             width: cardList.width; height: 82; radius: 8
-                            color: characters.selectedIndex === index ? "#213442" : "#17232d"
+                            color: characters.selectedIndex === index ? root.theme.selectedSurface : root.theme.itemSurface
                             border.color: characters.selectedIndex === index ? root.teal : root.line
                             MouseArea { anchors.fill: parent; onClicked: characters.selectCard(index) }
                             ColumnLayout {
@@ -950,7 +973,7 @@ ApplicationWindow {
             }
 
             Card {
-                Layout.fillWidth: true; Layout.fillHeight: true; color: "#111a23"
+                Layout.fillWidth: true; Layout.fillHeight: true; color: root.theme.editorSurface
                 ColumnLayout {
                     anchors.fill: parent; anchors.margins: 18; spacing: 10
                     RowLayout {
@@ -990,12 +1013,12 @@ ApplicationWindow {
                             InputField { id: cardAbilities; Layout.fillWidth: true; text: "[]"; font.family: "Consolas" }
                             Label { text: "关键经历"; color: root.muted }
                             Rectangle {
-                                Layout.fillWidth: true; implicitHeight: 90; radius: 7; color: "#101922"; border.color: root.line
+                                Layout.fillWidth: true; implicitHeight: 90; radius: 7; color: root.theme.fieldSurface; border.color: root.line
                                 TextArea { id: cardBackground; anchors.fill: parent; anchors.margins: 6; color: root.ink; wrapMode: TextEdit.Wrap; background: null }
                             }
                             Label { text: "作者私密说明"; color: root.amber }
                             Rectangle {
-                                Layout.fillWidth: true; implicitHeight: 90; radius: 7; color: "#18191f"; border.color: "#55472e"
+                                Layout.fillWidth: true; implicitHeight: 90; radius: 7; color: root.theme.deepSurface; border.color: root.theme.warningBorder
                                 TextArea { id: cardPrivate; anchors.fill: parent; anchors.margins: 6; color: root.ink; wrapMode: TextEdit.Wrap; background: null }
                             }
                         }
@@ -1022,6 +1045,7 @@ ApplicationWindow {
         id: packagesPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 4
         onVisibleChanged: if (visible) packages.reloadBranches()
@@ -1089,9 +1113,9 @@ ApplicationWindow {
                         checked: true
                         indicator: Rectangle {
                             implicitWidth: 22; implicitHeight: 22; radius: 4
-                            color: includePrivate.checked ? root.amber : "#101922"
+                            color: includePrivate.checked ? root.amber : root.theme.fieldSurface
                             border.color: includePrivate.checked ? root.amber : root.line
-                            Text { anchors.centerIn: parent; text: includePrivate.checked ? "✓" : ""; color: "#111820"; font.bold: true }
+                            Text { anchors.centerIn: parent; text: includePrivate.checked ? "✓" : ""; color: root.theme.onAccent; font.bold: true }
                         }
                         contentItem: Text {
                             leftPadding: includePrivate.indicator.width + 9
@@ -1137,16 +1161,16 @@ ApplicationWindow {
                     ComboBox { id: outcomeBranch; Layout.fillWidth: true; model: packages.branchNames }
                     RowLayout {
                         Layout.fillWidth: true
-                        InputField { id: adoptionWorld; Layout.fillWidth: true; text: "world-grey-harbor"; placeholderText: "目标世界 ID" }
+                        InputField { id: adoptionWorld; Layout.fillWidth: true; placeholderText: "目标世界 ID" }
                         InputField { id: adoptionTitle; Layout.fillWidth: true; text: "推演候选结果"; placeholderText: "素材标题" }
                     }
                     CheckBox {
                         id: includeTechnical; text: "导出包含技术提交标识"; checked: false
                         indicator: Rectangle {
                             implicitWidth: 22; implicitHeight: 22; radius: 4
-                            color: includeTechnical.checked ? root.amber : "#101922"
+                            color: includeTechnical.checked ? root.amber : root.theme.fieldSurface
                             border.color: includeTechnical.checked ? root.amber : root.line
-                            Text { anchors.centerIn: parent; text: includeTechnical.checked ? "✓" : ""; color: "#111820"; font.bold: true }
+                            Text { anchors.centerIn: parent; text: includeTechnical.checked ? "✓" : ""; color: root.theme.onAccent; font.bold: true }
                         }
                         contentItem: Text {
                             leftPadding: includeTechnical.indicator.width + 9
@@ -1169,6 +1193,7 @@ ApplicationWindow {
         id: providersPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 5
         property string editId: ""
@@ -1223,7 +1248,7 @@ ApplicationWindow {
                         delegate: Rectangle {
                             required property var modelData
                             width: ListView.view.width; height: 92; radius: 8
-                            color: providersPage.editId === modelData.id ? "#253744" : "#101922"
+                            color: providersPage.editId === modelData.id ? root.theme.quietButton : root.theme.fieldSurface
                             border.color: providersPage.editId === modelData.id ? root.teal : root.line
                             Column {
                                 anchors.fill: parent; anchors.margins: 12; spacing: 5
@@ -1322,6 +1347,7 @@ ApplicationWindow {
         id: workspacesPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 6
 
@@ -1345,81 +1371,6 @@ ApplicationWindow {
             }
         }
         Label { visible: workspaceCatalog.errorText.length > 0; text: workspaceCatalog.errorText; color: root.red; Layout.fillWidth: true; wrapMode: Text.Wrap }
-        Card {
-            Layout.fillWidth: true
-            implicitHeight: 246
-            ColumnLayout {
-                anchors.fill: parent; anchors.margins: 16; spacing: 10
-                RowLayout {
-                    Layout.fillWidth: true
-                    ColumnLayout {
-                        spacing: 2
-                        Label { text: "首次使用 · 灰港议和完整向导"; color: root.ink; font.pixelSize: 19; font.bold: true }
-                        Label {
-                            text: workspaceCatalog.demoReady
-                                  ? "演示基线已就绪。接下来运行 5 回合、创建 A/B 分支并导出选定结果。"
-                                  : "一键安装完全自创的短文、证据、世界 v1、历史快照、林舟实例与固定分支根。"
-                            color: workspaceCatalog.demoReady ? root.teal : root.muted; font.pixelSize: 11
-                        }
-                    }
-                    Item { Layout.fillWidth: true }
-                    Label {
-                        text: workspaceCatalog.demoCompleted + " / " + workspaceCatalog.demoTotal
-                        color: workspaceCatalog.demoReady ? root.teal : root.amber; font.pixelSize: 16; font.bold: true
-                    }
-                    ActionButton {
-                        text: workspaceCatalog.demoReady ? "重新检查" : "安装完整演示"
-                        highlighted: !workspaceCatalog.demoReady
-                        enabled: !workspaceCatalog.demoBusy
-                        onClicked: workspaceCatalog.demoReady ? workspaceCatalog.refreshDemo() : workspaceCatalog.installDemoWorld()
-                    }
-                    ActionButton {
-                        text: "以后再说"; visible: workspaceCatalog.onboardingVisible
-                        enabled: !workspaceCatalog.demoBusy; onClicked: workspaceCatalog.dismissOnboarding()
-                    }
-                }
-                Rectangle {
-                    Layout.fillWidth: true; implicitHeight: 6; radius: 3; color: "#0d151d"
-                    Rectangle {
-                        height: parent.height; radius: 3; color: root.teal
-                        width: parent.width * (workspaceCatalog.demoTotal > 0
-                                               ? workspaceCatalog.demoCompleted / workspaceCatalog.demoTotal : 0)
-                        Behavior on width { NumberAnimation { duration: 180 } }
-                    }
-                }
-                ListView {
-                    Layout.fillWidth: true; Layout.preferredHeight: 82; orientation: ListView.Horizontal
-                    spacing: 8; clip: true; model: workspaceCatalog.demoStages
-                    delegate: Rectangle {
-                        required property var modelData
-                        width: 230; height: 78; radius: 8
-                        color: modelData.ready ? "#12302f" : "#18232d"
-                        border.color: modelData.ready ? root.teal : root.line
-                        RowLayout {
-                            anchors.fill: parent; anchors.margins: 10; spacing: 9
-                            Rectangle {
-                                width: 24; height: 24; radius: 12
-                                color: modelData.ready ? root.teal : "#263746"
-                                Label { anchors.centerIn: parent; text: modelData.ready ? "✓" : "·"; color: modelData.ready ? "#071413" : root.muted; font.bold: true }
-                            }
-                            ColumnLayout {
-                                Layout.fillWidth: true; spacing: 3
-                                Label { text: modelData.title; color: root.ink; font.pixelSize: 12; font.bold: true }
-                                Label { Layout.fillWidth: true; text: modelData.detail; color: root.muted; font.pixelSize: 9; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight }
-                            }
-                        }
-                    }
-                }
-                RowLayout {
-                    Layout.fillWidth: true; spacing: 8
-                    Label { text: workspaceCatalog.demoBusy ? "正在写入可恢复阶段…" : workspaceCatalog.statusText; color: workspaceCatalog.demoBusy ? root.amber : root.teal; Layout.fillWidth: true; elide: Text.ElideRight }
-                    ActionButton { text: "1 查看来源证据"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 2 }
-                    ActionButton { text: "2 核对世界与入场"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 9 }
-                    ActionButton { text: "3 运行 5 回合"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 0 }
-                    ActionButton { text: "4 比较并导出"; enabled: workspaceCatalog.demoReady; onClicked: root.activePage = 4 }
-                }
-            }
-        }
         RowLayout {
             Layout.fillWidth: true; Layout.fillHeight: true; spacing: 14
             Card {
@@ -1429,7 +1380,7 @@ ApplicationWindow {
                     Label { text: "创建工作区"; color: root.ink; font.pixelSize: 20; font.bold: true }
                     Label { text: "每个工作区使用独立 SQLite、资产目录、提交链和分支；API Key 始终留在系统凭据库。"; color: root.muted; Layout.fillWidth: true; wrapMode: Text.Wrap; lineHeight: 1.3 }
                     Label { text: "名称"; color: root.muted }
-                    InputField { id: newWorkspaceName; Layout.fillWidth: true; placeholderText: "例如：灰港续篇" }
+                    InputField { id: newWorkspaceName; Layout.fillWidth: true; placeholderText: "例如：我的长篇项目" }
                     ActionButton {
                         text: "创建并打开"; highlighted: true; enabled: !workspaceCatalog.busy
                         onClicked: workspaceCatalog.createWorkspace(newWorkspaceName.text)
@@ -1451,7 +1402,7 @@ ApplicationWindow {
                         delegate: Rectangle {
                             required property var modelData
                             required property int index
-                            width: ListView.view.width; height: 82; radius: 8; color: "#101922"; border.color: root.line
+                            width: ListView.view.width; height: 82; radius: 8; color: root.theme.fieldSurface; border.color: root.line
                             RowLayout {
                                 anchors.fill: parent; anchors.margins: 12
                                 ColumnLayout {
@@ -1474,13 +1425,16 @@ ApplicationWindow {
         id: tasksPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 7
 
         Rectangle {
-            Layout.fillWidth: true; implicitHeight: 72; radius: 10; color: root.panel; border.color: root.line
-            RowLayout {
-                anchors.fill: parent; anchors.margins: 12; spacing: 10
+            Layout.fillWidth: true; implicitHeight: 112; radius: 10; color: root.panel; border.color: root.line
+            ColumnLayout {
+                anchors.fill: parent; anchors.margins: 12; spacing: 6
+              RowLayout {
+                Layout.fillWidth: true; spacing: 10
                 ColumnLayout {
                     Layout.maximumWidth: 365
                     Label { text: "提取任务中心"; color: root.ink; font.pixelSize: 17; font.bold: true }
@@ -1510,9 +1464,21 @@ ApplicationWindow {
                 }
                 ActionButton {
                     text: "创建分块任务"; highlighted: true; enabled: !extractionJobs.busy && taskSourceId.text.length > 0
-                    onClicked: extractionJobs.createJob(taskSourceId.text, Number(taskChunkSize.text), Number(taskOverlap.text), Number(taskMaxRequests.text), Number(taskOutputTokens.text))
+                    onClicked: extractionJobs.createJob(taskSourceId.text, Number(taskChunkSize.text), Number(taskOverlap.text), Number(taskMaxRequests.text), Number(taskOutputTokens.text), taskProvider.currentValue || "")
                 }
                 ActionButton { text: "刷新"; enabled: !extractionJobs.busy; onClicked: extractionJobs.refresh() }
+              }
+              RowLayout {
+                Layout.fillWidth: true; spacing: 8
+                Label { text: "执行方式"; color: root.muted }
+                ComboBox {
+                    id: taskProvider; Layout.preferredWidth: 260; textRole: "name"; valueRole: "id"
+                    model: [{"id": "", "name": "离线（不发送小说）"}].concat(
+                        providers.connections.filter(function(item) { return item.enabled && item.dataPolicy === "remote_allowed" && item.credentialConfigured })
+                        .map(function(item) { return {"id": item.id, "name": item.name + " · " + item.model} }))
+                }
+                Label { text: "创建任务不调用模型；只有点击“真实模型抽样 1 步”才发送当前片段并消耗一次额度。"; color: root.muted; font.pixelSize: 10; Layout.fillWidth: true; wrapMode: Text.Wrap }
+              }
             }
         }
         Label { visible: extractionJobs.errorText.length > 0; text: extractionJobs.errorText; color: root.red; Layout.fillWidth: true; wrapMode: Text.Wrap }
@@ -1539,7 +1505,7 @@ ApplicationWindow {
                             }
                         }
                         Label { text: modelData.sourceId; color: root.muted; elide: Text.ElideMiddle; Layout.fillWidth: true }
-                        Label { text: modelData.promptVersion + " · " + modelData.schemaVersion + " · 修订 " + modelData.revision; color: root.muted; font.pixelSize: 10 }
+                        Label { text: (modelData.modelId || "离线") + " · " + modelData.promptVersion + " · " + modelData.schemaVersion + " · 修订 " + modelData.revision; color: root.muted; font.pixelSize: 10 }
                         Label { text: "估算输入 ≤ " + modelData.estimatedTokens + " token · 输出/次 ≤ " + modelData.outputTokenLimit + " · 调用 " + modelData.consumedRequests + "/" + modelData.maxRequests + " · " + (modelData.priceKnown ? "已配置价格" : "费用未知"); color: modelData.priceKnown ? root.muted : root.amber; font.pixelSize: 9 }
                         ProgressBar { Layout.fillWidth: true; from: 0; to: Math.max(1, modelData.total); value: modelData.completed }
                         Label { text: modelData.completed + " / " + modelData.total + " 步已提交"; color: root.muted; font.pixelSize: 10 }
@@ -1552,8 +1518,8 @@ ApplicationWindow {
                             delegate: Rectangle {
                                 required property var modelData
                                 width: 94; height: 42; radius: 6
-                                color: modelData.status === "completed" ? "#18352f"
-                                     : modelData.status === "unknown" || modelData.status === "failed" ? "#3a2528" : "#17232d"
+                                color: modelData.status === "completed" ? root.theme.successSurface
+                                     : modelData.status === "unknown" || modelData.status === "failed" ? root.theme.dangerSurface : root.theme.itemSurface
                                 border.color: modelData.status === "completed" ? root.teal
                                             : modelData.status === "unknown" || modelData.status === "failed" ? root.red : root.line
                                 Column {
@@ -1573,9 +1539,17 @@ ApplicationWindow {
                         }
                         ActionButton {
                             text: "离线 Mock 执行"
-                            visible: modelData.status === "queued"
+                            visible: modelData.status === "queued" && !modelData.providerConnectionId
                             enabled: !extractionJobs.busy
                             onClicked: extractionJobs.runMock(modelData.id)
+                        }
+                        ActionButton {
+                            text: "真实模型抽样 1 步"
+                            visible: modelData.status === "queued" && !!modelData.providerConnectionId
+                            enabled: !extractionJobs.busy
+                            ToolTip.visible: hovered
+                            ToolTip.text: "点击才发送下一文本块至所选模型；按连接方计费，费用未知"
+                            onClicked: extractionJobs.runRemoteSample(modelData.id)
                         }
                         ActionButton {
                             text: "重试问题步骤"; visible: modelData.problemOrdinal > 0; enabled: !extractionJobs.busy
@@ -1598,6 +1572,7 @@ ApplicationWindow {
         id: reviewPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 14
         visible: root.activePage === 8
 
@@ -1657,7 +1632,7 @@ ApplicationWindow {
                             required property var modelData
                             required property int index
                             width: candidateList.width; height: 112; radius: 8
-                            color: candidateReview.selectedIndex === index ? "#253744" : "#101922"
+                            color: candidateReview.selectedIndex === index ? root.theme.quietButton : root.theme.fieldSurface
                             border.color: candidateReview.selectedIndex === index ? root.teal : root.line
                             ColumnLayout {
                                 anchors.fill: parent; anchors.margins: 11; spacing: 4
@@ -1713,12 +1688,12 @@ ApplicationWindow {
                         TextArea {
                             id: reviewFields; color: root.ink; font.family: "Consolas"; font.pixelSize: 12
                             wrapMode: TextEdit.Wrap; enabled: candidateReview.selectedId.length > 0 && !candidateReview.busy
-                            background: Rectangle { radius: 7; color: "#101922"; border.color: reviewFields.activeFocus ? root.teal : root.line }
+                            background: Rectangle { radius: 7; color: root.theme.fieldSurface; border.color: reviewFields.activeFocus ? root.teal : root.line }
                         }
                     }
                     Label { text: "不可编辑的来源引文"; color: root.muted }
                     Rectangle {
-                        Layout.fillWidth: true; Layout.fillHeight: true; radius: 8; color: "#101922"; border.color: root.line
+                        Layout.fillWidth: true; Layout.fillHeight: true; radius: 8; color: root.theme.fieldSurface; border.color: root.line
                         ScrollView {
                             anchors.fill: parent; anchors.margins: 10
                             Label { width: parent.width; text: candidateReview.selectedQuote.length ? "“" + candidateReview.selectedQuote + "”" : "尚未选择候选"; color: root.ink; wrapMode: Text.Wrap; lineHeight: 1.35 }
@@ -1755,6 +1730,7 @@ ApplicationWindow {
         id: worldViewsPage
         anchors.fill: parent
         anchors.margins: 18
+        anchors.leftMargin: root.sidebarWidth + 18
         spacing: 10
         visible: root.activePage === 9
 
@@ -1793,7 +1769,7 @@ ApplicationWindow {
                             Layout.fillWidth: true; Layout.fillHeight: true; model: worldViews.versions; clip: true; spacing: 7
                             delegate: Rectangle {
                                 required property var modelData
-                                width: ListView.view.width; height: 82; radius: 7; color: "#101922"; border.color: root.line
+                                width: ListView.view.width; height: 82; radius: 7; color: root.theme.fieldSurface; border.color: root.line
                                 Column { anchors.fill: parent; anchors.margins: 10; spacing: 4
                                     Label { text: modelData.id; color: root.ink; font.bold: true }
                                     Label { text: modelData.members + " 个固定成员 · " + modelData.hash.substring(0, 12); color: root.teal; font.pixelSize: 10 }
@@ -1826,7 +1802,7 @@ ApplicationWindow {
                         InputField { id: instanceWorldVersion; Layout.fillWidth: true; placeholderText: "世界版本 ID" }
                         InputField { id: instanceSnapshot; Layout.fillWidth: true; placeholderText: "历史快照 ID"; text: worldViews.latestSnapshotId }
                         ScrollView { Layout.fillWidth: true; Layout.preferredHeight: 86
-                            TextArea { id: instanceAdaptation; text: "{\"echo\":\"消耗专注的残响\",\"铜制指针\":\"普通调查工具\"}"; color: root.ink; wrapMode: TextEdit.Wrap; background: Rectangle { color: "#101922"; border.color: root.line; radius: 7 } }
+                            TextArea { id: instanceAdaptation; text: "{\"echo\":\"消耗专注的残响\",\"铜制指针\":\"普通调查工具\"}"; color: root.ink; wrapMode: TextEdit.Wrap; background: Rectangle { color: root.theme.fieldSurface; border.color: root.line; radius: 7 } }
                         }
                         ActionButton { text: "创建世界人物实例"; highlighted: true; enabled: !worldViews.busy; onClicked: worldViews.instantiateCharacter(instanceCard.text, Number(instanceCardVersion.text), instanceWorldVersion.text, instanceSnapshot.text, instanceAdaptation.text, instancePolicy.currentText) }
                         Repeater { model: worldViews.instances; delegate: Label { required property var modelData; Layout.fillWidth: true; text: modelData.name + " · " + modelData.id + " · " + modelData.policy + " · " + modelData.status + (modelData.conflicts ? "（冲突 " + modelData.conflicts + "）" : ""); color: modelData.status === "ready" ? root.teal : root.amber; elide: Text.ElideMiddle } }
@@ -1848,7 +1824,7 @@ ApplicationWindow {
                     ColumnLayout { anchors.fill: parent; anchors.margins: 14
                         Label { text: "故事时间顺序（未知时间保留）"; color: root.ink; font.pixelSize: 18; font.bold: true }
                         ListView { Layout.fillWidth: true; Layout.fillHeight: true; model: worldViews.timeline; spacing: 6; clip: true
-                            delegate: Rectangle { required property var modelData; width: ListView.view.width; height: 66; radius: 7; color: "#101922"; border.color: modelData.truthStatus === "fact" ? root.line : root.amber
+                            delegate: Rectangle { required property var modelData; width: ListView.view.width; height: 66; radius: 7; color: root.theme.fieldSurface; border.color: modelData.truthStatus === "fact" ? root.line : root.amber
                                 RowLayout { anchors.fill: parent; anchors.margins: 10
                                     Label { text: modelData.storyTime; color: modelData.storyTime === "未知" ? root.amber : root.teal; Layout.preferredWidth: 70 }
                                     ColumnLayout {
@@ -1882,7 +1858,7 @@ ApplicationWindow {
                     ColumnLayout { anchors.fill: parent; anchors.margins: 14
                         Label { text: "A→B 与 B→A 独立"; color: root.ink; font.pixelSize: 18; font.bold: true }
                         ListView { Layout.fillWidth: true; Layout.fillHeight: true; model: worldViews.relations; spacing: 6; clip: true
-                            delegate: Rectangle { required property var modelData; width: ListView.view.width; height: 60; radius: 7; color: "#101922"; border.color: modelData.evidenceStatus === "evidence" ? root.line : root.amber
+                            delegate: Rectangle { required property var modelData; width: ListView.view.width; height: 60; radius: 7; color: root.theme.fieldSurface; border.color: modelData.evidenceStatus === "evidence" ? root.line : root.amber
                                 RowLayout {
                                     anchors.fill: parent; anchors.margins: 10
                                     Label { text: modelData.from; color: root.ink; Layout.fillWidth: true; elide: Text.ElideMiddle }
@@ -1914,9 +1890,9 @@ ApplicationWindow {
                 Card { Layout.fillWidth: true; Layout.fillHeight: true
                     ColumnLayout { anchors.fill: parent; anchors.margins: 14
                         Label { text: "地点层级与底图标点"; color: root.ink; font.pixelSize: 18; font.bold: true }
-                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 280; radius: 8; color: "#101922"; border.color: root.line; clip: true
+                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 280; radius: 8; color: root.theme.fieldSurface; border.color: root.line; clip: true
                             Repeater { model: worldViews.locations
-                                delegate: Rectangle { required property var modelData; required property int index; width: 118; height: 46; radius: 8; x: modelData.x === "未知" ? 20 + (index % 5) * 128 : Math.min(parent.width - width - 10, Number(modelData.x)); y: modelData.y === "未知" ? 18 + Math.floor(index / 5) * 58 : Math.min(parent.height - height - 10, Number(modelData.y)); color: modelData.evidenceStatus === "evidence" ? "#18352f" : "#3b3020"; border.color: modelData.evidenceStatus === "evidence" ? root.teal : root.amber
+                                delegate: Rectangle { required property var modelData; required property int index; width: 118; height: 46; radius: 8; x: modelData.x === "未知" ? 20 + (index % 5) * 128 : Math.min(parent.width - width - 10, Number(modelData.x)); y: modelData.y === "未知" ? 18 + Math.floor(index / 5) * 58 : Math.min(parent.height - height - 10, Number(modelData.y)); color: modelData.evidenceStatus === "evidence" ? root.theme.successSurface : root.theme.warningSurface; border.color: modelData.evidenceStatus === "evidence" ? root.teal : root.amber
                                     Column {
                                         anchors.centerIn: parent
                                         Label { text: modelData.id; width: 105; elide: Text.ElideMiddle; color: root.ink; font.pixelSize: 9 }
@@ -1953,5 +1929,61 @@ ApplicationWindow {
                 }
             }
         }
+    }
+    ColumnLayout {
+        id: homePage
+        anchors.fill: parent
+        anchors.margins: 28
+        anchors.leftMargin: root.sidebarWidth + 28
+        spacing: 18
+        visible: root.activePage === 10
+
+        FileDialog {
+            id: novelDialog
+            title: "选择本机小说文本"
+            fileMode: FileDialog.OpenFile
+            nameFilters: ["小说文本 (*.txt *.md *.markdown)"]
+            onAccepted: root.novelFile = selectedFile
+        }
+
+        Label { text: "工作区"; color: root.ink; font.pixelSize: 27; font.bold: true }
+        Card {
+            Layout.fillWidth: true; Layout.preferredHeight: 300
+            ColumnLayout {
+                anchors.fill: parent; anchors.margins: 24; spacing: 14
+                Label { text: "新建世界模板"; color: root.ink; font.pixelSize: 21; font.bold: true }
+                Label { text: "世界名称"; color: root.muted }
+                InputField { id: worldName; Layout.fillWidth: true; placeholderText: "例如：我的小说世界" }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 12
+                    ActionButton { text: "选择小说 TXT / Markdown"; onClicked: novelDialog.open() }
+                    Label {
+                        Layout.fillWidth: true; elide: Text.ElideMiddle; color: root.muted
+                        text: root.novelFile.toString().length > 0 ? root.novelFile.toString() : "可先建立空白世界，之后再导入"
+                    }
+                }
+                ActionButton {
+                    text: workspaceCatalog.busy ? "正在导入并切分章节…" : "创建世界并导入"
+                    highlighted: true; enabled: !workspaceCatalog.busy && worldName.text.trim().length > 0
+                    onClicked: { root.wizardStep = 0; workspaceCatalog.createWorld(worldName.text, root.novelFile) }
+                }
+                Label { visible: workspaceCatalog.errorText.length > 0; text: workspaceCatalog.errorText; color: root.red; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                Label { visible: workspaceCatalog.createdSourceId.length > 0; text: workspaceCatalog.statusText; color: root.teal; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                RowLayout {
+                    visible: workspaceCatalog.createdSourceId.length > 0; spacing: 8
+                    ActionButton { text: "校对章节"; onClicked: { root.wizardStep = 1; sources.selectSourceId(workspaceCatalog.createdSourceId); root.activePage = 2 } }
+                    ActionButton {
+                        text: "创建主干提取任务"
+                        onClicked: {
+                            root.wizardStep = 2
+                            extractionJobs.createJob(workspaceCatalog.createdSourceId, 6000, 200, 0, 1200, "")
+                            root.activePage = 7
+                        }
+                    }
+                    ActionButton { text: "查看校对中心"; onClicked: { root.wizardStep = 3; root.activePage = 8 } }
+                }
+            }
+        }
+        Item { Layout.fillHeight: true }
     }
 }

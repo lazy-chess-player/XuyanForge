@@ -73,13 +73,13 @@ target_link_libraries(xuyan_storage_sqlite PUBLIC xuyan_domain SQLite::SQLite3)
 
 add_library(xuyan_application STATIC
     libs/application/src/branch_outcome_service.cpp
-    libs/application/src/demo_world_service.cpp
     libs/application/src/simulation_service.cpp
     libs/application/src/backup_service.cpp
     libs/application/src/evidence_service.cpp
     libs/application/src/candidate_service.cpp
     libs/application/src/extraction_job_service.cpp
     libs/application/src/mock_extraction_processor.cpp
+    libs/application/src/remote_extraction_processor.cpp
     libs/application/src/character_service.cpp
     libs/application/src/character_instance_service.cpp
     libs/application/src/package_service.cpp
@@ -168,7 +168,7 @@ endif()
 
 if(XUYANFORGE_BUILD_TESTS)
     enable_testing()
-    add_executable(core_tests tests/core_tests.cpp)
+    add_executable(core_tests tests/core_tests.cpp tests/legacy_fixture.cpp libs/application/src/demo_world_service.cpp)
     target_link_libraries(core_tests PRIVATE xuyan_application xuyan_platform_credentials xuyan_providers)
     add_test(NAME core_tests COMMAND core_tests)
     add_executable(stress_tests tests/stress_tests.cpp)

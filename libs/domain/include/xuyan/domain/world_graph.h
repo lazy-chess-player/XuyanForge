@@ -11,7 +11,7 @@ namespace xuyan::domain {
 
 struct TimelineEvent {
     std::string id;
-    std::string world_id{"world-grey-harbor"};
+    std::string world_id;
     std::string name;
     std::optional<std::int64_t> story_time;
     int narrative_order{0};
@@ -25,7 +25,7 @@ struct TimelineEvent {
 
 struct DirectedRelation {
     std::string id;
-    std::string world_id{"world-grey-harbor"};
+    std::string world_id;
     std::string from_entity_id;
     std::string to_entity_id;
     std::string dimension;

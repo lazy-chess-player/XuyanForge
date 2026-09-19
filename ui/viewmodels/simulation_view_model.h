@@ -100,7 +100,7 @@ private:
     xuyan::domain::CommitView state_;
     bool busy_{false};
     QString error_text_;
-    QString status_text_{QStringLiteral("正在打开灰港工作区…")};
+    QString status_text_{QStringLiteral("正在打开工作区…")};
     QStringList branch_names_;
     QStringList branch_ids_;
     int active_branch_index_{-1};

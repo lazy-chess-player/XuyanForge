@@ -6,6 +6,7 @@
 #include "xuyan/storage/workspace_repository.h"
 
 #include <algorithm>
+#include <cstdint>
 
 namespace xuyan::application {
 namespace {
@@ -29,7 +30,8 @@ ExtractionJobService::ExtractionJobService(std::filesystem::path database_path) 
 xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create(
     const std::string& command_id, const std::string& source_id,
     std::size_t maximum_codepoints, std::size_t overlap_codepoints,
-    int max_requests, int output_token_limit_per_request) {
+    int max_requests, int output_token_limit_per_request,
+    const std::string& provider_connection_id) {
     if (maximum_codepoints < 500 || maximum_codepoints > 50000 || overlap_codepoints >= maximum_codepoints / 2
         || max_requests < 0 || output_token_limit_per_request < 1 || output_token_limit_per_request > 1000000)
         return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
@@ -41,12 +43,46 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     if (total == 0) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
         {xuyan::domain::ErrorCode::validation_failed, "空来源不能创建提取任务", false, "选择包含正文的来源"});
     const auto boundaries = paragraphBoundaries(*text.value);
+    // Normalize once: repeated codepointSlice() rescans the complete novel for every step.
+    std::vector<std::uint32_t> byte_offsets;
+    byte_offsets.reserve(total + 1);
+    for (std::size_t byte = 0; byte < text.value->size();) {
+        byte_offsets.push_back(static_cast<std::uint32_t>(byte));
+        const auto lead = static_cast<unsigned char>((*text.value)[byte]);
+        byte += lead < 0x80 ? 1U : lead < 0xe0 ? 2U : lead < 0xf0 ? 3U : 4U;
+    }
+    byte_offsets.push_back(static_cast<std::uint32_t>(text.value->size()));
+    xuyan::storage::WorkspaceRepository repository(database_path_);
+    auto source = repository.loadSource(source_id);
+    if (!source.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*source.error);
+    std::vector<std::pair<std::size_t, std::size_t>> segments;
+    std::size_t covered = 0;
+    for (const auto& chapter : source.value->chapters) {
+        if (chapter.start_codepoint > covered) segments.emplace_back(covered, chapter.start_codepoint);
+        if (chapter.end_codepoint > chapter.start_codepoint)
+            segments.emplace_back(chapter.start_codepoint, chapter.end_codepoint);
+        covered = std::max(covered, chapter.end_codepoint);
+    }
+    if (covered < total) segments.emplace_back(covered, total);
+    if (segments.empty()) segments.emplace_back(0, total);
     xuyan::domain::ExtractionJob job;
     job.id = "job-" + xuyan::domain::sha256(command_id).substr(0, 24); job.source_id = source_id;
-    std::size_t start = 0; int ordinal = 1;
-    while (start < total) {
-        auto end = std::min(total, start + maximum_codepoints);
-        if (end < total) {
+    if (!provider_connection_id.empty()) {
+        auto connection = repository.loadProviderConnection(provider_connection_id);
+        if (!connection.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*connection.error);
+        if (!connection.value->enabled || connection.value->default_model.empty())
+            return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
+                {xuyan::domain::ErrorCode::validation_failed, "所选模型连接未启用或缺少模型", false,
+                 "先在模型连接页完成配置"});
+        job.provider_connection_id = provider_connection_id;
+        job.model_id = connection.value->default_model;
+    }
+    int ordinal = 1;
+    for (const auto& [segment_start, segment_end] : segments) {
+      std::size_t start = segment_start;
+      while (start < segment_end) {
+        auto end = std::min(segment_end, start + maximum_codepoints);
+        if (end < segment_end) {
             const auto minimum = start + maximum_codepoints / 2;
             const auto candidate = std::upper_bound(boundaries.begin(), boundaries.end(), end);
             if (candidate != boundaries.begin()) {
@@ -54,16 +90,16 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
                 if (boundary >= minimum) end = boundary;
             }
         }
-        auto chunk = xuyan::domain::codepointSlice(*text.value, start, end);
-        if (!chunk.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*chunk.error);
+        const auto chunk = std::string_view(*text.value).substr(byte_offsets[start], byte_offsets[end] - byte_offsets[start]);
         xuyan::domain::ExtractionStep step;
         step.job_id = job.id; step.ordinal = ordinal;
         step.id = job.id + "-step-" + std::to_string(ordinal++);
-        step.start_codepoint = start; step.end_codepoint = end; step.chunk_hash = xuyan::domain::sha256(*chunk.value);
+        step.start_codepoint = start; step.end_codepoint = end; step.chunk_hash = xuyan::domain::sha256(chunk);
         job.budget.estimated_input_tokens += (end - start) * 3 / 2 + 1;
         job.steps.push_back(std::move(step));
-        if (end == total) break;
+        if (end == segment_end) break;
         start = std::max(start + 1, end - overlap_codepoints);
+      }
     }
     job.budget.max_requests = max_requests > 0 ? max_requests
         : static_cast<int>(job.steps.size()) + std::max(1, static_cast<int>(job.steps.size() / 10));
@@ -71,7 +107,7 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     job.budget.sample_steps = std::min(3, static_cast<int>(job.steps.size()));
     auto valid = xuyan::domain::validateExtractionJob(std::move(job));
     if (!valid.ok()) return valid;
-    try { return xuyan::storage::WorkspaceRepository(database_path_).createExtractionJob(command_id, std::move(*valid.value)); }
+    try { return repository.createExtractionJob(command_id, std::move(*valid.value)); }
     catch (const std::exception& exception) { return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
         {xuyan::domain::ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }

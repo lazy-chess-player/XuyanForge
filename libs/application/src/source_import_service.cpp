@@ -77,7 +77,10 @@ xuyan::domain::Result<std::string> SourceImportService::storeAsset(const std::st
 }
 
 xuyan::domain::Result<xuyan::domain::SourceDocument> SourceImportService::importTextFile(
-    const std::string& command_id, const std::filesystem::path& source_path, const std::string& edition) {
+    const std::string& command_id, const std::filesystem::path& source_path, const std::string& edition,
+    const std::string& world_id) {
+    if (world_id.empty()) return xuyan::domain::Result<xuyan::domain::SourceDocument>::failure(
+        fileError("导入前必须选择世界", "先创建或选择世界模板"));
     auto extension = source_path.extension().string();
     std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
         return static_cast<char>(std::tolower(value));
@@ -99,7 +102,8 @@ xuyan::domain::Result<xuyan::domain::SourceDocument> SourceImportService::import
     if (!normalized_ref.ok()) return xuyan::domain::Result<xuyan::domain::SourceDocument>::failure(*normalized_ref.error);
 
     xuyan::domain::SourceDocument document;
-    document.id = "source-" + original_hash.substr(0, 24);
+    document.id = "source-" + xuyan::domain::sha256(world_id + "|" + original_hash).substr(0, 24);
+    document.world_id = world_id;
     const auto filename = source_path.filename().u8string();
     document.name = filename.empty()
         ? "未命名来源"

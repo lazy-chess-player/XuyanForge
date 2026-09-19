@@ -13,7 +13,8 @@ public:
     xuyan::domain::Result<xuyan::domain::ExtractionJob> create(
         const std::string& command_id, const std::string& source_id,
         std::size_t maximum_codepoints = 6000, std::size_t overlap_codepoints = 200,
-        int max_requests = 0, int output_token_limit_per_request = 1200);
+        int max_requests = 0, int output_token_limit_per_request = 1200,
+        const std::string& provider_connection_id = {});
     xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>> list();
     xuyan::domain::Result<xuyan::domain::ExtractionJob> load(const std::string& job_id);
     xuyan::domain::Result<xuyan::domain::ExtractionJob> cancel(

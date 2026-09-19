@@ -53,6 +53,9 @@ Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
             return Result<xuyan::domain::ExtractionJob>::failure(
                 {ErrorCode::revision_conflict, "候选对应的步骤尝试已过期", false, "刷新任务后重试"});
         SourceImportService sources(database_path_);
+        auto step_text = sources.evidenceText(job.value->source_id,
+                                              step->start_codepoint, step->end_codepoint);
+        if (!step_text.ok()) return Result<xuyan::domain::ExtractionJob>::failure(*step_text.error);
         std::vector<xuyan::domain::ExtractionCandidate> candidates;
         candidates.reserve(items->array().size());
         for (std::size_t index = 0; index < items->array().size(); ++index) {
@@ -70,7 +73,8 @@ Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
             const auto end_cp = static_cast<std::size_t>(end->integer());
             if (start_cp < step->start_codepoint || end_cp > step->end_codepoint)
                 return protocolError("候选证据范围超出当前文本块");
-            auto original = sources.evidenceText(job.value->source_id, start_cp, end_cp);
+            auto original = xuyan::domain::codepointSlice(*step_text.value,
+                start_cp - step->start_codepoint, end_cp - step->start_codepoint);
             if (!original.ok() || *original.value != quote->string())
                 return protocolError("候选引文与来源码点区间不一致");
             xuyan::domain::ExtractionCandidate candidate;
@@ -113,7 +117,10 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
         candidate.provenance_type = provenance_type; candidate.review_status = review_status;
         std::optional<xuyan::domain::WorldEntity> entity;
         if (review_status == "accepted") {
+            auto source = repository.loadSource(candidate.source_id);
+            if (!source.ok()) return Result<xuyan::domain::ExtractionCandidate>::failure(*source.error);
             xuyan::domain::WorldEntity value;
+            value.world_id = source.value->world_id;
             value.id = "entity-from-" + candidate.id; value.name = candidate.name;
             value.kind = candidate.candidate_type == "event" ? "event"
                 : candidate.candidate_type == "rule" ? "rule" : "other";

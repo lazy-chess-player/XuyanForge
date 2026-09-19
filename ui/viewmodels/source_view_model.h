@@ -43,8 +43,9 @@ public:
     QString selectedSourceId() const { return selected_index_ >= 0 ? QString::fromStdString(documents_[selected_index_].id) : QString{}; }
 
     Q_INVOKABLE void refresh();
-    Q_INVOKABLE void importFile(const QUrl& file_url);
+    Q_INVOKABLE void importFile(const QUrl& file_url, QString world_id);
     Q_INVOKABLE void selectSource(int index);
+    Q_INVOKABLE void selectSourceId(QString source_id);
     Q_INVOKABLE void createEvidence(QString entity_id, QString field_path, int selection_start,
                                     int selection_end, QString provenance_type);
     Q_INVOKABLE void selectEvidence(int index);
@@ -53,11 +54,12 @@ public:
 
 signals:
     void changed();
+    void sourceImported();
 
 private:
     void applyDocuments(xuyan::domain::Result<std::vector<xuyan::domain::SourceDocument>> result,
                         QString keep_id = {});
-    void loadPreview(const std::string& source_id);
+    void loadPreview(const std::string& source_id, std::size_t start_codepoint, std::size_t end_codepoint);
 
     std::filesystem::path database_path_;
     std::vector<xuyan::domain::SourceDocument> documents_;
@@ -73,4 +75,7 @@ private:
     int highlight_start_{0};
     int highlight_end_{0};
     int selected_chapter_index_{-1};
+    std::size_t preview_start_codepoint_{0};
+    std::size_t preview_end_codepoint_{0};
+    bool preview_loading_{false};
 };

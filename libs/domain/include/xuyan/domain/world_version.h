@@ -16,7 +16,7 @@ struct WorldVersionMember {
 
 struct WorldVersion {
     std::string id;
-    std::string world_id{"world-grey-harbor"};
+    std::string world_id;
     std::string parent_id;
     std::string status{"published"};
     std::string content_hash;

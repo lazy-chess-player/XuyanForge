@@ -34,6 +34,7 @@ public:
     QString statusText() const { return status_text_; }
 
     Q_INVOKABLE void refresh();
+    void setWorldId(QString world_id);
     Q_INVOKABLE void publishVersion(QString parent_id);
     Q_INVOKABLE void prepareSnapshot(QString version_id, QString story_time);
     Q_INVOKABLE void addTimelineEvent(QString name, QString story_time, int narrative_order,
@@ -57,4 +58,5 @@ private:
     bool busy_{false};
     QString error_text_;
     QString status_text_{QStringLiteral("世界版本、时间、关系与地图已就绪")};
+    QString world_id_;
 };

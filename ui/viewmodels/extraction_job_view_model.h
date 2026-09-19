@@ -20,10 +20,12 @@ public:
     QString errorText() const { return error_text_; }
     QString statusText() const { return status_text_; }
     Q_INVOKABLE void refresh();
-    Q_INVOKABLE void createJob(QString source_id, int chunk_size, int overlap, int max_requests, int output_token_limit);
+    Q_INVOKABLE void createJob(QString source_id, int chunk_size, int overlap, int max_requests,
+                              int output_token_limit, QString provider_connection_id);
     Q_INVOKABLE void cancelJob(QString job_id, int revision);
     Q_INVOKABLE void retryStep(QString job_id, int ordinal, int attempt);
     Q_INVOKABLE void runMock(QString job_id);
+    Q_INVOKABLE void runRemoteSample(QString job_id);
     Q_INVOKABLE void auditJob(QString job_id);
 signals:
     void changed();

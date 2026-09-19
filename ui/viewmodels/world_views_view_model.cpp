@@ -3,6 +3,7 @@
 #include "xuyan/application/character_instance_service.h"
 #include "xuyan/application/world_graph_service.h"
 #include "xuyan/application/world_version_service.h"
+#include "xuyan/storage/workspace_repository.h"
 
 #include <QMetaObject>
 #include <QPointer>
@@ -12,6 +13,10 @@
 namespace {
 QString q(const std::string& value) { return QString::fromStdString(value); }
 std::string command() { return QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString(); }
+std::string firstWorld(const std::filesystem::path& path) {
+    auto worlds = xuyan::storage::WorkspaceRepository(path).listWorldTemplates();
+    return worlds.ok() && !worlds.value->empty() ? worlds.value->front().id : std::string{};
+}
 std::optional<std::int64_t> optionalNumber(const QString& value) {
     if (value.trimmed().isEmpty()) return std::nullopt;
     bool ok = false; const auto number = value.toLongLong(&ok); return ok ? std::optional<std::int64_t>{number} : std::nullopt;
@@ -21,15 +26,23 @@ std::optional<std::int64_t> optionalNumber(const QString& value) {
 WorldViewsViewModel::WorldViewsViewModel(std::filesystem::path database_path, QObject* parent)
     : QObject(parent), database_path_(std::move(database_path)) { refresh(); }
 
+void WorldViewsViewModel::setWorldId(QString world_id) {
+    if (world_id_ == world_id) return;
+    world_id_ = std::move(world_id);
+    if (!busy_) refresh();
+}
+
 void WorldViewsViewModel::refresh() {
     if (busy_) return;
     busy_ = true; error_text_.clear(); emit changed();
     QPointer<WorldViewsViewModel> self(this); const auto path = database_path_; const auto latest_snapshot = latest_snapshot_id_;
-    QThreadPool::globalInstance()->start([self, path, latest_snapshot] {
+    const auto selected_world = world_id_.toStdString();
+    QThreadPool::globalInstance()->start([self, path, latest_snapshot, selected_world] {
         xuyan::application::WorldVersionService version_service(path);
         xuyan::application::WorldGraphService graph(path);
-        auto versions = version_service.list("world-grey-harbor"); auto timeline = graph.listTimeline("world-grey-harbor", false);
-        auto relations = graph.listRelations("world-grey-harbor", {}, std::nullopt, {}, true); auto map = graph.loadMap("world-grey-harbor");
+        const auto world_id = selected_world.empty() ? firstWorld(path) : selected_world;
+        auto versions = version_service.list(world_id); auto timeline = graph.listTimeline(world_id, false);
+        auto relations = graph.listRelations(world_id, {}, std::nullopt, {}, true); auto map = graph.loadMap(world_id);
         QVariantList version_items, timeline_items, relation_items, location_items, route_items, instance_items; QString error;
         if (!versions.ok()) error = q(versions.error->message);
         else for (const auto& value : *versions.value) version_items.push_back(QVariantMap{{"id", q(value.id)}, {"parent", q(value.parent_id)}, {"hash", q(value.content_hash)}, {"members", static_cast<int>(value.members.size())}, {"publishedAt", q(value.published_at)}});
@@ -73,7 +86,7 @@ void WorldViewsViewModel::run(std::function<StringResult(const std::filesystem::
     });
 }
 
-void WorldViewsViewModel::publishVersion(QString parent_id) { const auto id = command(); run([parent_id, id](const auto& path) { xuyan::application::WorldVersionService s(path); auto r = s.publish(id, "world-grey-harbor", parent_id.toStdString()); if (!r.ok()) return StringResult::failure(*r.error); return StringResult::success("已发布不可变世界版本 " + r.value->id); }); }
+void WorldViewsViewModel::publishVersion(QString parent_id) { const auto id = command(); const auto world = world_id_.toStdString(); run([parent_id, id, world](const auto& path) { xuyan::application::WorldVersionService s(path); auto r = s.publish(id, world.empty() ? firstWorld(path) : world, parent_id.toStdString()); if (!r.ok()) return StringResult::failure(*r.error); return StringResult::success("已发布不可变世界版本 " + r.value->id); }); }
 void WorldViewsViewModel::prepareSnapshot(QString version_id, QString story_time) {
     bool valid_time = false; const auto time = story_time.toLongLong(&valid_time);
     if (!valid_time || busy_) { if (!valid_time) { error_text_ = QStringLiteral("故事时间必须是整数"); emit changed(); } return; }
@@ -92,8 +105,8 @@ void WorldViewsViewModel::prepareSnapshot(QString version_id, QString story_time
         }, Qt::QueuedConnection);
     });
 }
-void WorldViewsViewModel::addTimelineEvent(QString name, QString story_time, int order, QString relative, QString truth) { const auto id=command(); run([=](const auto& path){ xuyan::domain::TimelineEvent v; v.id="timeline-"+id.substr(0,24); v.name=name.toStdString(); v.story_time=optionalNumber(story_time); v.narrative_order=order; v.relative_time=relative.toStdString(); v.truth_status=truth.toStdString(); xuyan::application::WorldGraphService s(path); auto r=s.saveTimelineEvent(id,std::move(v),0); if(!r.ok()) return StringResult::failure(*r.error); return StringResult::success("时间事件已保存"); }); }
-void WorldViewsViewModel::addRelation(QString from, QString to, QString dimension, int strength, QString visibility, QString evidence) { const auto id=command(); run([=](const auto& path){ xuyan::domain::DirectedRelation v; v.id="relation-"+id.substr(0,24); v.from_entity_id=from.toStdString(); v.to_entity_id=to.toStdString(); v.dimension=dimension.toStdString(); v.strength=strength; v.visibility=visibility.toStdString(); v.evidence_status=evidence.toStdString(); xuyan::application::WorldGraphService s(path); auto r=s.saveRelation(id,std::move(v),0); if(!r.ok()) return StringResult::failure(*r.error); return StringResult::success("定向关系已保存"); }); }
+void WorldViewsViewModel::addTimelineEvent(QString name, QString story_time, int order, QString relative, QString truth) { const auto id=command(); const auto world=world_id_.toStdString(); run([=](const auto& path){ xuyan::domain::TimelineEvent v; v.id="timeline-"+id.substr(0,24); v.world_id=world.empty()?firstWorld(path):world; v.name=name.toStdString(); v.story_time=optionalNumber(story_time); v.narrative_order=order; v.relative_time=relative.toStdString(); v.truth_status=truth.toStdString(); xuyan::application::WorldGraphService s(path); auto r=s.saveTimelineEvent(id,std::move(v),0); if(!r.ok()) return StringResult::failure(*r.error); return StringResult::success("时间事件已保存"); }); }
+void WorldViewsViewModel::addRelation(QString from, QString to, QString dimension, int strength, QString visibility, QString evidence) { const auto id=command(); const auto world=world_id_.toStdString(); run([=](const auto& path){ xuyan::domain::DirectedRelation v; v.id="relation-"+id.substr(0,24); v.world_id=world.empty()?firstWorld(path):world; v.from_entity_id=from.toStdString(); v.to_entity_id=to.toStdString(); v.dimension=dimension.toStdString(); v.strength=strength; v.visibility=visibility.toStdString(); v.evidence_status=evidence.toStdString(); xuyan::application::WorldGraphService s(path); auto r=s.saveRelation(id,std::move(v),0); if(!r.ok()) return StringResult::failure(*r.error); return StringResult::success("定向关系已保存"); }); }
 void WorldViewsViewModel::addLocation(QString location, QString parent, QString x, QString y, QString evidence) { const auto id=command(); run([=](const auto& path){ xuyan::domain::LocationPlacement v; v.location_id=location.toStdString(); v.parent_location_id=parent.toStdString(); if(!x.trimmed().isEmpty()&&!y.trimmed().isEmpty()){bool ox=false,oy=false; auto xv=x.toInt(&ox),yv=y.toInt(&oy); if(ox&&oy){v.image_x=xv;v.image_y=yv;}} v.evidence_status=evidence.toStdString(); xuyan::application::WorldGraphService s(path); auto r=s.saveLocation(id,std::move(v),0); if(!r.ok()) return StringResult::failure(*r.error); return StringResult::success("地点标注已保存"); }); }
 void WorldViewsViewModel::addRoute(QString from, QString to, QString minutes, QString evidence) { const auto id=command(); run([=](const auto& path){ xuyan::domain::TravelRoute v; v.id="route-"+id.substr(0,24); v.from_location_id=from.toStdString(); v.to_location_id=to.toStdString(); if(!minutes.trimmed().isEmpty()){bool ok=false;auto m=minutes.toInt(&ok);if(ok)v.travel_minutes=m;} v.evidence_status=evidence.toStdString(); xuyan::application::WorldGraphService s(path); auto r=s.saveRoute(id,std::move(v),0); if(!r.ok()) return StringResult::failure(*r.error); return StringResult::success("地点路线已保存"); }); }
 void WorldViewsViewModel::instantiateCharacter(QString card, int version, QString world, QString snapshot, QString adaptation, QString policy) { const auto id=command(); run([=](const auto& path){ xuyan::application::CharacterInstanceService s(path); auto r=s.instantiate(id,card.toStdString(),version,world.toStdString(),snapshot.toStdString(),adaptation.toStdString(),policy.toStdString()); if(!r.ok()) return StringResult::failure(*r.error); return StringResult::success(r.value->status=="ready"?"人物实例已就绪":"人物实例已创建，但需要解决 "+std::to_string(r.value->conflicts.size())+" 项冲突"); }); }

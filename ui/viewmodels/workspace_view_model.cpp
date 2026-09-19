@@ -327,8 +327,10 @@ void WorkspaceViewModel::splitMerge(QString merge_id) {
 
 void WorkspaceViewModel::createEntity(QString name, QString kind, QString description,
                                       QString aliases, QString tags, QString attributes) {
+    if (world_id_.isEmpty()) { error_text_ = QStringLiteral("请先在首页创建或选择世界"); emit changed(); return; }
     auto entity = fromForm(std::move(name), std::move(kind), std::move(description),
                            std::move(aliases), std::move(tags), std::move(attributes));
+    entity.world_id = world_id_.toStdString();
     const auto command = commandId().toStdString();
     runEntity([command, entity = std::move(entity)](const auto& path) mutable {
         xuyan::application::WorkspaceService service(path);

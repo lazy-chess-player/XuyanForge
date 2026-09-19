@@ -6,6 +6,7 @@
 #include "xuyan/package/zip_archive.h"
 #include "xuyan/storage/workspace_repository.h"
 
+#include <algorithm>
 #include <map>
 #include <limits>
 #include <sstream>
@@ -195,9 +196,16 @@ Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& d
         if (!page.value->has_more) break;
         offset += static_cast<int>(page.value->items.size());
     }
+    auto worlds = repository.listWorldTemplates();
+    if (!worlds.ok()) return Result<PackageReport>::failure(*worlds.error);
+    const auto world_id = !worlds.value->empty() ? worlds.value->front().id
+                        : !entities.empty() ? entities.front().world_id : std::string{};
+    if (world_id.empty()) return Result<PackageReport>::failure(
+        {xuyan::domain::ErrorCode::validation_failed, "还没有可导出的世界", false, "先创建世界并校对资料"});
+    std::erase_if(entities, [&](const auto& entity) { return entity.world_id != world_id; });
     const auto entity_data = entitiesJsonl(entities);
     const auto world_data = xuyan::package::writeJson(JsonValue::Object{
-        {"schema_version", "0.1.0"}, {"title", title}, {"world_id", "world-grey-harbor"},
+        {"schema_version", "0.1.0"}, {"title", title}, {"world_id", world_id},
     });
     const auto package_id = "package-" + xuyan::domain::sha256(world_data + entity_data).substr(0, 24);
     JsonValue::Array files;
@@ -206,7 +214,7 @@ Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& d
     files.emplace_back(JsonValue::Object{{"bytes", static_cast<std::int64_t>(entity_data.size())},
                                          {"path", "entities.jsonl"}, {"sha256", xuyan::domain::sha256(entity_data)}});
     const auto manifest = xuyan::package::writeJson(JsonValue::Object{
-        {"author", author}, {"base_world_version_id", "world-grey-harbor-v1"},
+        {"author", author}, {"base_world_version_id", ""},
         {"contains_private_notes", false}, {"contains_source_text", false},
         {"content_version", "1.0.0"}, {"extensions", JsonValue::Object{}},
         {"files", std::move(files)}, {"format", "xuyanforge-package"}, {"format_version", "0.1.0"},

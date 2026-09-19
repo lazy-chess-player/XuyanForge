@@ -8,8 +8,6 @@
 #include "extraction_job_view_model.h"
 #include "candidate_review_view_model.h"
 #include "world_views_view_model.h"
-#include "xuyan/application/simulation_service.h"
-#include "xuyan/application/demo_world_service.h"
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -29,26 +27,18 @@ int main(int argc, char* argv[]) {
     const auto dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     QDir().mkpath(dataRoot);
     const auto arguments = application.arguments();
+    const auto screenshotIndex = arguments.indexOf(QStringLiteral("--screenshot"));
+    if (screenshotIndex >= 0)
+        QCoreApplication::setOrganizationName(QStringLiteral("XuyanForgePreview"));
     const auto workspaceArgument = arguments.indexOf(QStringLiteral("--workspace"));
     const auto databaseText = workspaceArgument >= 0 && workspaceArgument + 1 < arguments.size()
         ? QFileInfo(arguments.at(workspaceArgument + 1)).absoluteFilePath()
-        : dataRoot + QStringLiteral("/grey-harbor.sqlite");
+        : dataRoot + QStringLiteral("/workspace.sqlite");
     const auto databasePath = databaseText.toStdWString();
-    if (arguments.contains(QStringLiteral("--install-demo"))) {
-        xuyan::application::DemoWorldService demo(databasePath);
-        auto installed = demo.install();
-        if (!installed.ok() || !installed.value->ready) return 3;
-    }
-    if (arguments.contains(QStringLiteral("--production-demo"))) {
-        xuyan::application::SimulationService seed(databasePath);
-        auto root = seed.open();
-        if (root.ok()) {
-            auto session = seed.createSession("ui-production-demo-create", root.value->branch_id, 20, false, 120);
-            if (session.ok() && session.value->turns.empty())
-                seed.stepSessionMock("ui-production-demo-turn-1", session.value->id);
-        }
-    }
     WorkspaceCatalogViewModel workspaceCatalog(databasePath);
+    const auto themePreviewIndex = arguments.indexOf(QStringLiteral("--theme-preview"));
+    if (screenshotIndex >= 0 && themePreviewIndex >= 0 && themePreviewIndex + 1 < arguments.size())
+        workspaceCatalog.setThemeId(arguments.at(themePreviewIndex + 1));
     SimulationViewModel simulation(databasePath);
     WorkspaceViewModel workspace(databasePath);
     SourceViewModel sources(databasePath);
@@ -58,22 +48,26 @@ int main(int argc, char* argv[]) {
     ExtractionJobViewModel extractionJobs(databasePath);
     CandidateReviewViewModel candidateReview(databasePath);
     WorldViewsViewModel worldViews(databasePath);
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::changed,
+                     &workspace, [&workspaceCatalog, &workspace] {
+        workspace.setWorldId(workspaceCatalog.activeWorldId());
+    });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::changed,
+                     &worldViews, [&workspaceCatalog, &worldViews] {
+        worldViews.setWorldId(workspaceCatalog.activeWorldId());
+    });
+    workspace.setWorldId(workspaceCatalog.activeWorldId());
+    worldViews.setWorldId(workspaceCatalog.activeWorldId());
     QObject::connect(&packages, &PackageViewModel::worldImported, &workspace, [&workspace] { workspace.refresh(); });
     QObject::connect(&packages, &PackageViewModel::characterImported, &characters, [&characters] { characters.refresh(); });
     QObject::connect(&packages, &PackageViewModel::backupRestored, &workspaceCatalog,
                      [&workspaceCatalog](const QString& path) { workspaceCatalog.openWorkspace(QUrl::fromLocalFile(path)); });
     QObject::connect(&candidateReview, &CandidateReviewViewModel::candidateAccepted,
                      &workspace, [&workspace] { workspace.refresh(); });
-    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
-                     &workspace, [&workspace] { workspace.refresh(); });
-    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::worldCreated,
                      &sources, [&sources] { sources.refresh(); });
-    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
-                     &characters, [&characters] { characters.refresh(); });
-    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
-                     &worldViews, [&worldViews] { worldViews.refresh(); });
-    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::demoInstalled,
-                     &simulation, [&simulation] { simulation.reload(); });
+    QObject::connect(&sources, &SourceViewModel::sourceImported,
+                     &workspaceCatalog, [&workspaceCatalog] { workspaceCatalog.refreshWorlds(); });
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("simulation"), &simulation);
@@ -117,7 +111,6 @@ int main(int argc, char* argv[]) {
     if (arguments.contains(QStringLiteral("--views-page")) && !engine.rootObjects().isEmpty()) {
         engine.rootObjects().first()->setProperty("activePage", 9);
     }
-    const auto screenshotIndex = arguments.indexOf(QStringLiteral("--screenshot"));
     if (screenshotIndex >= 0 && screenshotIndex + 1 < arguments.size()) {
         const auto screenshotPath = arguments.at(screenshotIndex + 1);
         QTimer::singleShot(1200, &application, [&engine, screenshotPath] {

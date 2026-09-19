@@ -31,6 +31,13 @@ SimulationService::SimulationService(const std::filesystem::path& database_path)
 
 xuyan::domain::Result<xuyan::domain::CommitView> SimulationService::open() {
     xuyan::storage::WorkspaceRepository repository(database_path_);
+    auto active = repository.activeBranchId();
+    if (!active.ok()) return xuyan::domain::Result<xuyan::domain::CommitView>::failure(*active.error);
+    return repository.loadHead(*active.value);
+}
+
+xuyan::domain::Result<xuyan::domain::CommitView> SimulationService::installDemoBranch() {
+    xuyan::storage::WorkspaceRepository repository(database_path_);
     return repository.ensureDemo();
 }
 

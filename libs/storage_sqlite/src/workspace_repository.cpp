@@ -718,6 +718,9 @@ CREATE TABLE IF NOT EXISTS source_document(
   id TEXT PRIMARY KEY,world_id TEXT NOT NULL,name TEXT NOT NULL,sha256 TEXT NOT NULL,
   original_asset_ref TEXT NOT NULL,normalized_asset_ref TEXT NOT NULL,edition TEXT NOT NULL,created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS world_template(
+  id TEXT PRIMARY KEY,name TEXT NOT NULL,source_id TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS source_chapter(
   id TEXT PRIMARY KEY,document_id TEXT NOT NULL,title TEXT NOT NULL,ordinal INTEGER NOT NULL,
   start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,start_codepoint INTEGER NOT NULL,end_codepoint INTEGER NOT NULL,
@@ -990,7 +993,7 @@ CREATE TABLE IF NOT EXISTS simulation_director_intervention(
   actor_id TEXT NOT NULL,speech TEXT NOT NULL,operation TEXT NOT NULL,target_id TEXT NOT NULL,created_at TEXT NOT NULL,
   FOREIGN KEY(session_id) REFERENCES simulation_session(id)
 );
-PRAGMA user_version=22;
+PRAGMA user_version=23;
 )SQL";
     char* message = nullptr;
     if (sqlite3_exec(database_, sql, nullptr, nullptr, &message) != SQLITE_OK) {
@@ -1519,9 +1522,53 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
     } catch (const std::exception& exception) { return Result<MergeResult>::failure(storageError(exception)); }
 }
 
+Result<WorldTemplate> WorkspaceRepository::createWorldTemplate(const std::string& id, const std::string& name) {
+    if (id.empty() || name.empty() || name.size() > 120) return Result<WorldTemplate>::failure(
+        {ErrorCode::validation_failed, "世界名称或 ID 无效", false, "填写 1-120 字符的名称"});
+    try {
+        Transaction transaction(database_);
+        Statement insert(database_, "INSERT INTO world_template(id,name,created_at) VALUES(?,?,?)");
+        bindText(insert.get(), 1, id); bindText(insert.get(), 2, name); bindText(insert.get(), 3, utcNow());
+        if (sqlite3_step(insert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        transaction.commit();
+        return Result<WorldTemplate>::success({id, name, {}});
+    } catch (const std::exception& exception) { return Result<WorldTemplate>::failure(storageError(exception)); }
+}
+
+Result<std::vector<WorldTemplate>> WorkspaceRepository::listWorldTemplates() {
+    try {
+        Statement query(database_, "SELECT id,name,source_id FROM world_template ORDER BY created_at,id");
+        std::vector<WorldTemplate> worlds;
+        while (sqlite3_step(query.get()) == SQLITE_ROW)
+            worlds.push_back({columnText(query.get(), 0), columnText(query.get(), 1), columnText(query.get(), 2)});
+        return Result<std::vector<WorldTemplate>>::success(std::move(worlds));
+    } catch (const std::exception& exception) { return Result<std::vector<WorldTemplate>>::failure(storageError(exception)); }
+}
+
+Result<WorldTemplate> WorkspaceRepository::attachWorldSource(const std::string& world_id,
+                                                              const std::string& source_id) {
+    try {
+        Transaction transaction(database_);
+        Statement source(database_, "SELECT 1 FROM source_document WHERE id=? AND world_id=?");
+        bindText(source.get(), 1, source_id); bindText(source.get(), 2, world_id);
+        if (sqlite3_step(source.get()) != SQLITE_ROW) return Result<WorldTemplate>::failure(
+            {ErrorCode::validation_failed, "来源不属于该世界", false, "重新选择导入来源"});
+        Statement update(database_, "UPDATE world_template SET source_id=? WHERE id=?");
+        bindText(update.get(), 1, source_id); bindText(update.get(), 2, world_id);
+        if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1)
+            throw std::runtime_error("找不到目标世界模板");
+        Statement query(database_, "SELECT name FROM world_template WHERE id=?");
+        bindText(query.get(), 1, world_id);
+        if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到目标世界模板");
+        auto result = WorldTemplate{world_id, columnText(query.get(), 0), source_id};
+        transaction.commit();
+        return Result<WorldTemplate>::success(std::move(result));
+    } catch (const std::exception& exception) { return Result<WorldTemplate>::failure(storageError(exception)); }
+}
+
 Result<SourceDocument> WorkspaceRepository::saveSource(const std::string& command_id,
                                                        const SourceDocument& document) {
-    const auto payload = document.sha256 + '|' + document.name + '|' + document.edition;
+    const auto payload = document.sha256 + '|' + document.name + '|' + document.edition + '|' + document.world_id;
     try {
         Transaction transaction(database_);
         {

@@ -12,6 +12,7 @@ public:
     explicit WorkspaceService(std::filesystem::path database_path);
 
     xuyan::domain::Result<xuyan::domain::EntityPage> openAndList(int limit = 50);
+    xuyan::domain::Result<bool> installTestFixture();
     xuyan::domain::Result<xuyan::domain::EntityPage> search(
         const std::string& query, const std::string& kind = {}, int offset = 0, int limit = 50);
     xuyan::domain::Result<xuyan::domain::WorldEntity> create(
@@ -29,8 +30,6 @@ public:
         int source_expected_revision = -1, int target_expected_revision = -1);
 
 private:
-    xuyan::domain::Result<bool> ensureGreyHarborEntities();
-
     std::filesystem::path database_path_;
 };
 

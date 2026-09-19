@@ -14,6 +14,7 @@ public:
     explicit SimulationService(const std::filesystem::path& database_path);
 
     xuyan::domain::Result<xuyan::domain::CommitView> open();
+    xuyan::domain::Result<xuyan::domain::CommitView> installDemoBranch();
     xuyan::domain::Result<xuyan::domain::CommitView> step(const std::string& command_id);
     xuyan::domain::Result<xuyan::domain::CommitView> setPaused(const std::string& command_id, bool paused);
     xuyan::domain::Result<xuyan::domain::CommitView> forkCurrent(const std::string& command_id,

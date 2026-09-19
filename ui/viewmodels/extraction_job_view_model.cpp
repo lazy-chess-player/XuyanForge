@@ -2,6 +2,9 @@
 
 #include "xuyan/application/extraction_job_service.h"
 #include "xuyan/application/mock_extraction_processor.h"
+#include "xuyan/application/remote_extraction_processor.h"
+#include "xuyan/platform/credential_store.h"
+#include "xuyan/providers/qt_provider_transport.h"
 
 #include <QMetaObject>
 #include <QPointer>
@@ -27,6 +30,8 @@ QVariantList ExtractionJobViewModel::maps(const std::vector<xuyan::domain::Extra
             {"estimatedTokens", static_cast<qlonglong>(job.budget.estimated_input_tokens)},
             {"maxRequests", job.budget.max_requests}, {"consumedRequests", job.budget.consumed_requests},
             {"outputTokenLimit", job.budget.output_token_limit_per_request},
+            {"providerConnectionId", QString::fromStdString(job.provider_connection_id)},
+            {"modelId", QString::fromStdString(job.model_id)},
             {"sampleSteps", job.budget.sample_steps}, {"priceKnown", job.budget.price_known},
             {"schemaVersion", QString::fromStdString(job.schema_version)}, {"promptVersion", QString::fromStdString(job.prompt_version)}});
     }
@@ -66,15 +71,18 @@ void ExtractionJobViewModel::refresh() {
     });
 }
 
-void ExtractionJobViewModel::createJob(QString source_id, int chunk_size, int overlap, int max_requests, int output_token_limit) {
+void ExtractionJobViewModel::createJob(QString source_id, int chunk_size, int overlap, int max_requests,
+                                       int output_token_limit, QString provider_connection_id) {
     if (busy_ || source_id.trimmed().isEmpty()) return;
     busy_ = true; error_text_.clear(); status_text_ = QStringLiteral("正在按段落边界建立持久化步骤…"); emit changed();
     QPointer<ExtractionJobViewModel> self(this); const auto path = database_path_;
     const auto command = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
-    QThreadPool::globalInstance()->start([self, path, source_id, chunk_size, overlap, max_requests, output_token_limit, command] {
+    QThreadPool::globalInstance()->start([self, path, source_id, chunk_size, overlap, max_requests,
+                                          output_token_limit, provider_connection_id, command] {
         xuyan::application::ExtractionJobService service(path);
         auto created = service.create(command, source_id.toStdString(), static_cast<std::size_t>(chunk_size),
-                                      static_cast<std::size_t>(overlap), max_requests, output_token_limit);
+                                      static_cast<std::size_t>(overlap), max_requests, output_token_limit,
+                                      provider_connection_id.toStdString());
         auto listed = service.list();
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, created = std::move(created), listed = std::move(listed)]() mutable {
@@ -142,6 +150,31 @@ void ExtractionJobViewModel::runMock(QString job_id) {
             self->busy_ = false;
             if (!processed.ok()) self->error_text_ = QString::fromStdString(processed.error->message);
             else self->status_text_ = QStringLiteral("Mock 提取完成；候选已进入校对区，不会自动成为事实");
+            if (listed.ok()) self->jobs_ = maps(*listed.value);
+            emit self->changed();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ExtractionJobViewModel::runRemoteSample(QString job_id) {
+    if (busy_ || job_id.isEmpty()) return;
+    busy_ = true; error_text_.clear();
+    status_text_ = QStringLiteral("正在发送当前 1 个文本块至所选模型并校验返回引文…"); emit changed();
+    QPointer<ExtractionJobViewModel> self(this); const auto path = database_path_;
+    QThreadPool::globalInstance()->start([self, path, job_id] {
+        xuyan::platform::SystemCredentialStore credentials;
+        xuyan::providers::QtProviderTransport transport;
+        xuyan::application::RemoteExtractionProcessor processor(path, credentials, transport);
+        auto processed = processor.processNext(job_id.toStdString());
+        xuyan::application::ExtractionJobService service(path); auto listed = service.list();
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, processed = std::move(processed), listed = std::move(listed)]() mutable {
+            if (!self) return;
+            self->busy_ = false;
+            if (!processed.ok()) self->error_text_ = QString::fromStdString(processed.error->message);
+            else if (processed.value->status == "needs_attention")
+                self->status_text_ = QStringLiteral("当前步骤未完成，请查看错误并按需重试；不会自动重发");
+            else self->status_text_ = QStringLiteral("已执行 1 步；可定位候选进入人工校对，未自动写入世界");
             if (listed.ok()) self->jobs_ = maps(*listed.value);
             emit self->changed();
         }, Qt::QueuedConnection);

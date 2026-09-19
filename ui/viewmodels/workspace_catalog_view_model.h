@@ -13,13 +13,12 @@ class WorkspaceCatalogViewModel final : public QObject {
     Q_PROPERTY(bool busy READ busy NOTIFY changed)
     Q_PROPERTY(QString statusText READ statusText NOTIFY changed)
     Q_PROPERTY(QString errorText READ errorText NOTIFY changed)
-    Q_PROPERTY(QVariantList demoStages READ demoStages NOTIFY changed)
-    Q_PROPERTY(int demoCompleted READ demoCompleted NOTIFY changed)
-    Q_PROPERTY(int demoTotal READ demoTotal NOTIFY changed)
-    Q_PROPERTY(bool demoReady READ demoReady NOTIFY changed)
-    Q_PROPERTY(bool demoBusy READ demoBusy NOTIFY changed)
-    Q_PROPERTY(bool onboardingVisible READ onboardingVisible NOTIFY changed)
-    Q_PROPERTY(QString demoVersionId READ demoVersionId NOTIFY changed)
+    Q_PROPERTY(QVariantList worlds READ worlds NOTIFY changed)
+    Q_PROPERTY(QString createdSourceId READ createdSourceId NOTIFY changed)
+    Q_PROPERTY(int createdChapterCount READ createdChapterCount NOTIFY changed)
+    Q_PROPERTY(QString activeWorldId READ activeWorldId NOTIFY changed)
+    Q_PROPERTY(QString themeId READ themeId NOTIFY changed)
+    Q_PROPERTY(QVariantList availableThemes READ availableThemes CONSTANT)
 
 public:
     explicit WorkspaceCatalogViewModel(std::filesystem::path database_path, QObject* parent = nullptr);
@@ -28,25 +27,28 @@ public:
     bool busy() const noexcept { return busy_; }
     QString statusText() const { return status_text_; }
     QString errorText() const { return error_text_; }
-    QVariantList demoStages() const { return demo_stages_; }
-    int demoCompleted() const noexcept { return demo_completed_; }
-    int demoTotal() const noexcept { return demo_stages_.size(); }
-    bool demoReady() const noexcept { return demo_ready_; }
-    bool demoBusy() const noexcept { return demo_busy_; }
-    bool onboardingVisible() const noexcept { return !onboarding_dismissed_ && !demo_ready_; }
-    QString demoVersionId() const { return demo_version_id_; }
+    QVariantList worlds() const { return worlds_; }
+    QString createdSourceId() const { return created_source_id_; }
+    int createdChapterCount() const noexcept { return created_chapter_count_; }
+    QString activeWorldId() const { return active_world_id_; }
+    QString themeId() const { return theme_id_; }
+    QVariantList availableThemes() const {
+        return {QVariantMap{{"id", "dark"}, {"name", QStringLiteral("深色")}},
+                QVariantMap{{"id", "light"}, {"name", QStringLiteral("浅色")}}};
+    }
 
     Q_INVOKABLE void createWorkspace(QString name);
     Q_INVOKABLE void openWorkspace(const QUrl& source);
     Q_INVOKABLE void switchToRecent(int index);
     Q_INVOKABLE void forgetRecent(int index);
-    Q_INVOKABLE void refreshDemo();
-    Q_INVOKABLE void installDemoWorld();
-    Q_INVOKABLE void dismissOnboarding();
+    Q_INVOKABLE void refreshWorlds();
+    Q_INVOKABLE void createWorld(QString name, const QUrl& novel_file);
+    Q_INVOKABLE void selectWorld(int index);
+    Q_INVOKABLE void setThemeId(QString theme_id);
 
 signals:
     void changed();
-    void demoInstalled();
+    void worldCreated();
 
 private:
     void loadRecent();
@@ -54,17 +56,15 @@ private:
     void saveRecent();
     void initializeAndSwitch(QString name, std::filesystem::path path);
     static void restartAt(const QString& path);
-    QString onboardingSettingsKey() const;
 
     std::filesystem::path database_path_;
     QVariantList recent_;
     bool busy_{false};
     QString status_text_{QStringLiteral("当前工作区已打开")};
     QString error_text_;
-    QVariantList demo_stages_;
-    int demo_completed_{0};
-    bool demo_ready_{false};
-    bool demo_busy_{false};
-    bool onboarding_dismissed_{false};
-    QString demo_version_id_;
+    QVariantList worlds_;
+    QString created_source_id_;
+    int created_chapter_count_{0};
+    QString active_world_id_;
+    QString theme_id_{QStringLiteral("dark")};
 };

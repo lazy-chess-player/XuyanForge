@@ -10,7 +10,7 @@ namespace xuyan::domain {
 
 struct WorldEntity {
     std::string id;
-    std::string world_id{"world-grey-harbor"};
+    std::string world_id;
     std::string kind;
     std::string name;
     std::vector<std::string> aliases;

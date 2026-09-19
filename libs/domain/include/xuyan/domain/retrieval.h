@@ -20,7 +20,7 @@ struct EntityRetrievalScope {
 };
 
 struct RetrievalRequest {
-    std::string world_id{"world-grey-harbor"};
+    std::string world_id;
     std::string query;
     std::optional<std::int64_t> story_time;
     std::string actor_id;

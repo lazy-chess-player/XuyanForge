@@ -2,6 +2,7 @@
 
 #include "xuyan/application/source_import_service.h"
 #include "xuyan/application/evidence_service.h"
+#include "xuyan/storage/workspace_repository.h"
 
 #include <QMetaObject>
 #include <QPointer>
@@ -69,8 +70,9 @@ void SourceViewModel::applyDocuments(
     else emit changed();
 }
 
-void SourceViewModel::importFile(const QUrl& file_url) {
+void SourceViewModel::importFile(const QUrl& file_url, QString world_id) {
     if (busy_ || !file_url.isLocalFile()) return;
+    if (world_id.isEmpty()) { error_text_ = QStringLiteral("请先在首页创建世界"); emit changed(); return; }
     busy_ = true;
     error_text_.clear();
     emit changed();
@@ -78,13 +80,18 @@ void SourceViewModel::importFile(const QUrl& file_url) {
     const auto file = file_url.toLocalFile().toStdWString();
     const auto command = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
     QPointer<SourceViewModel> self(this);
-    QThreadPool::globalInstance()->start([self, path, file, command] {
+    QThreadPool::globalInstance()->start([self, path, file, command, world_id] {
         xuyan::domain::Result<xuyan::domain::SourceDocument> imported;
         xuyan::domain::Result<std::vector<xuyan::domain::SourceDocument>> documents;
         try {
             xuyan::application::SourceImportService service(path);
-            imported = service.importTextFile(command, std::filesystem::path(file));
-            if (imported.ok()) documents = service.list();
+            imported = service.importTextFile(command, std::filesystem::path(file), "1", world_id.toStdString());
+            if (imported.ok()) {
+                auto attached = xuyan::storage::WorkspaceRepository(path).attachWorldSource(
+                    world_id.toStdString(), imported.value->id);
+                if (!attached.ok()) imported = decltype(imported)::failure(*attached.error);
+                else documents = service.list();
+            }
         } catch (const std::exception& exception) {
             imported = decltype(imported)::failure({xuyan::domain::ErrorCode::storage_error, exception.what(), true,
                                                     "检查文件与工作区后重试"});
@@ -100,6 +107,7 @@ void SourceViewModel::importFile(const QUrl& file_url) {
             }
             const auto keep = QString::fromStdString(imported.value->id);
             self->applyDocuments(std::move(documents), keep);
+            emit self->sourceImported();
         }, Qt::QueuedConnection);
     });
 }
@@ -117,30 +125,37 @@ void SourceViewModel::selectSource(int index) {
             {QStringLiteral("end"), static_cast<qlonglong>(chapter.end_codepoint)},
         });
     }
-    preview_text_ = QStringLiteral("正在读取标准化文本…");
-    emit changed();
-    loadPreview(documents_[index].id);
+    if (!documents_[index].chapters.empty()) selectChapter(0);
+    else { preview_text_.clear(); emit changed(); }
 }
 
-void SourceViewModel::loadPreview(const std::string& source_id) {
+void SourceViewModel::selectSourceId(QString source_id) {
+    for (int index = 0; index < static_cast<int>(documents_.size()); ++index) {
+        if (QString::fromStdString(documents_[index].id) == source_id) {
+            selectSource(index); return;
+        }
+    }
+    status_text_ = QStringLiteral("正在刷新来源，请稍后再试");
+    refresh();
+}
+
+void SourceViewModel::loadPreview(const std::string& source_id, std::size_t start_codepoint,
+                                  std::size_t end_codepoint) {
     const auto path = database_path_;
     QPointer<SourceViewModel> self(this);
-    QThreadPool::globalInstance()->start([self, path, source_id] {
+    QThreadPool::globalInstance()->start([self, path, source_id, start_codepoint, end_codepoint] {
         xuyan::application::SourceImportService service(path);
-        auto result = service.loadNormalizedText(source_id);
+        auto result = service.evidenceText(source_id, start_codepoint, end_codepoint);
         xuyan::application::EvidenceService evidence_service(path);
         auto evidence = evidence_service.listForSource(source_id);
         if (!self) return;
-        QMetaObject::invokeMethod(self, [self, source_id, result = std::move(result), evidence = std::move(evidence)]() mutable {
+        QMetaObject::invokeMethod(self, [self, source_id, start_codepoint, result = std::move(result), evidence = std::move(evidence)]() mutable {
             if (!self || self->selected_index_ < 0
-                || self->documents_[self->selected_index_].id != source_id) return;
+                || self->documents_[self->selected_index_].id != source_id
+                || self->preview_start_codepoint_ != start_codepoint) return;
+            self->preview_loading_ = false;
             if (!result.ok()) self->error_text_ = QString::fromStdString(result.error->message);
-            else {
-                constexpr std::size_t preview_limit = 200000;
-                const auto preview = result.value->substr(0, preview_limit);
-                self->preview_text_ = QString::fromUtf8(preview.data(), static_cast<qsizetype>(preview.size()));
-                if (result.value->size() > preview_limit) self->preview_text_ += QStringLiteral("\n\n……预览已截断……");
-            }
+            else self->preview_text_ = QString::fromStdString(*result.value);
             self->evidence_.clear(); self->evidence_items_.clear();
             if (evidence.ok()) {
                 self->evidence_ = std::move(*evidence.value);
@@ -156,12 +171,12 @@ void SourceViewModel::loadPreview(const std::string& source_id) {
 
 void SourceViewModel::createEvidence(QString entity_id, QString field_path, int selection_start,
                                      int selection_end, QString provenance_type) {
-    if (busy_ || selected_index_ < 0) return;
+    if (busy_ || preview_loading_ || selected_index_ < 0) return;
     if (selection_start < 0 || selection_end <= selection_start || selection_end > preview_text_.size()) {
         error_text_ = QStringLiteral("请先在原文预览中选择一段非空文本"); emit changed(); return;
     }
-    const auto start_cp = static_cast<std::size_t>(preview_text_.left(selection_start).toUcs4().size());
-    const auto end_cp = static_cast<std::size_t>(preview_text_.left(selection_end).toUcs4().size());
+    const auto start_cp = preview_start_codepoint_ + static_cast<std::size_t>(preview_text_.left(selection_start).toUcs4().size());
+    const auto end_cp = preview_start_codepoint_ + static_cast<std::size_t>(preview_text_.left(selection_end).toUcs4().size());
     const auto source_id = documents_[selected_index_].id;
     const auto path = database_path_; const auto command = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
     busy_ = true; error_text_.clear(); status_text_ = QStringLiteral("正在校验证据区间…"); emit changed();
@@ -194,6 +209,10 @@ void SourceViewModel::createEvidence(QString entity_id, QString field_path, int 
 void SourceViewModel::selectEvidence(int index) {
     if (index < 0 || index >= static_cast<int>(evidence_.size())) return;
     const auto& item = evidence_[static_cast<std::size_t>(index)];
+    if (item.start_codepoint < preview_start_codepoint_ || item.end_codepoint > preview_end_codepoint_) {
+        status_text_ = QStringLiteral("该证据位于其他章节，请先选择对应章节");
+        emit changed(); return;
+    }
     const auto utf16ForCodepoint = [this](std::size_t wanted) {
         qsizetype offset = 0; std::size_t count = 0;
         while (offset < preview_text_.size() && count < wanted) {
@@ -204,8 +223,8 @@ void SourceViewModel::selectEvidence(int index) {
         }
         return static_cast<int>(offset);
     };
-    highlight_start_ = utf16ForCodepoint(item.start_codepoint);
-    highlight_end_ = utf16ForCodepoint(item.end_codepoint);
+    highlight_start_ = utf16ForCodepoint(item.start_codepoint - preview_start_codepoint_);
+    highlight_end_ = utf16ForCodepoint(item.end_codepoint - preview_start_codepoint_);
     emit changed();
 }
 
@@ -213,18 +232,13 @@ void SourceViewModel::selectChapter(int index) {
     if (selected_index_ < 0 || index < 0 || index >= static_cast<int>(documents_[selected_index_].chapters.size())) return;
     selected_chapter_index_ = index;
     const auto& chapter = documents_[selected_index_].chapters[static_cast<std::size_t>(index)];
-    const auto utf16ForCodepoint = [this](std::size_t wanted) {
-        qsizetype offset = 0; std::size_t count = 0;
-        while (offset < preview_text_.size() && count < wanted) {
-            offset += preview_text_.at(offset).isHighSurrogate() && offset + 1 < preview_text_.size()
-                && preview_text_.at(offset + 1).isLowSurrogate() ? 2 : 1;
-            ++count;
-        }
-        return static_cast<int>(offset);
-    };
-    highlight_start_ = utf16ForCodepoint(chapter.start_codepoint);
-    highlight_end_ = utf16ForCodepoint(chapter.end_codepoint);
+    preview_start_codepoint_ = chapter.start_codepoint;
+    preview_end_codepoint_ = std::min(chapter.end_codepoint, chapter.start_codepoint + std::size_t{50000});
+    preview_text_ = QStringLiteral("正在读取本章原文…");
+    preview_loading_ = true;
+    highlight_start_ = 0; highlight_end_ = 0;
     emit changed();
+    loadPreview(documents_[selected_index_].id, preview_start_codepoint_, preview_end_codepoint_);
 }
 
 void SourceViewModel::saveChapter(int index, QString title, qlonglong start_codepoint, qlonglong end_codepoint) {
