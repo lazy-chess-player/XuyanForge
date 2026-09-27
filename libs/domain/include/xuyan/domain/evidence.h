@@ -20,6 +20,7 @@ struct EvidenceReference {
     int revision{0};
 };
 
+/** @brief 校验证据引用的原文范围、摘录与来源字段。 */
 Result<EvidenceReference> validateEvidence(EvidenceReference evidence);
 
 } // namespace xuyan::domain

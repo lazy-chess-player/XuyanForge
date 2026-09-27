@@ -1,5 +1,6 @@
 #include "xuyan/application/provider_generation_service.h"
 
+#include "xuyan/domain/provider_connection.h"
 #include "xuyan/package/json.h"
 #include "xuyan/storage/workspace_repository.h"
 
@@ -11,14 +12,26 @@ namespace {
 
 using xuyan::domain::ErrorCode;
 
+/** @brief 把连接参数或权限问题转换为可展示的校验错误。 */
 xuyan::domain::Error configurationError(std::string message, std::string action) {
     return {ErrorCode::validation_failed, std::move(message), false, std::move(action)};
 }
 
-void clearSecret(std::string& secret) {
-    std::fill(secret.begin(), secret.end(), '\0');
-    secret.clear();
-}
+/** @brief 在成功或异常退出时尽力覆盖本地凭据副本，不负责传输层内部副本。 */
+class SecretWiper final {
+public:
+    /** @brief 借用本次调用的凭据字符串，析构时在其销毁前覆盖内容。 */
+    explicit SecretWiper(std::string& secret) noexcept : secret_(secret) {}
+    SecretWiper(const SecretWiper&) = delete;
+    SecretWiper& operator=(const SecretWiper&) = delete;
+    /** @brief 无论生成调用如何退出，都尽力擦除当前凭据副本。 */
+    ~SecretWiper() noexcept {
+        std::fill(secret_.begin(), secret_.end(), '\0');
+        secret_.clear();
+    }
+private:
+    std::string& secret_;
+};
 
 } // namespace
 
@@ -28,15 +41,22 @@ ProviderGenerationService::ProviderGenerationService(
 
 xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> ProviderGenerationService::generate(
     const std::string& connection_id, const std::string& prompt,
-    const std::string& json_schema, int max_output_tokens, int timeout_ms) {
+    const std::string& json_schema, int max_output_tokens, int timeout_ms,
+    const std::string& expected_connection_fingerprint) {
     if (timeout_ms < 1000 || timeout_ms > 300000) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
         configurationError("模型请求超时必须在 1—300 秒之间", "调整超时设置"));
     try {
         xuyan::storage::WorkspaceRepository repository(database_path_);
         auto connection = repository.loadProviderConnection(connection_id);
         if (!connection.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*connection.error);
-        if (!connection.value->enabled) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
+        if (connection.value->deleted || !connection.value->enabled)
+            return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
             configurationError("模型连接已停用", "启用连接后重试"));
+        // 在读取凭据或构造传输前复核任务绑定的连接配置，阻止端点被静默改写。
+        if (!expected_connection_fingerprint.empty()
+            && xuyan::domain::providerConnectionFingerprint(*connection.value) != expected_connection_fingerprint)
+            return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
+                configurationError("模型连接配置已变化，未发送小说片段", "重新创建解析任务并确认连接"));
         if (connection.value->default_model.empty()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
             configurationError("模型连接未指定默认模型", "填写实际模型标识"));
         if (connection.value->kind != "local" && connection.value->data_policy != "remote_allowed")
@@ -54,14 +74,15 @@ xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> ProviderGenera
         auto request = xuyan::providers::buildProviderRequest(*protocol.value, generation);
         if (!request.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*request.error);
 
+        // 凭据仅在本次传输调用期间取出，不进入请求正文或工作区数据库。
         std::string secret;
+        const SecretWiper wipe_secret(secret);
         if (connection.value->kind != "local") {
             auto credential = credentials_.get(connection.value->credential_ref);
             if (!credential.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*credential.error);
             secret = std::move(*credential.value);
         }
         auto response = transport_.send(*request.value, secret, timeout_ms);
-        clearSecret(secret);
         if (!response.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*response.error);
         if (response.value->http_status < 200 || response.value->http_status >= 300
             || response.value->timed_out || response.value->cancelled) {
@@ -71,14 +92,16 @@ xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> ProviderGenera
                                                            response.value->cancelled));
         }
         return xuyan::providers::parseProviderResponse(*protocol.value, response.value->body);
-    } catch (const std::exception& exception) {
+    } catch (const std::exception&) {
         return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
-            {ErrorCode::storage_error, exception.what(), true, "检查工作区与网络后重试"});
+            {ErrorCode::storage_error, "模型连接或传输发生内部错误；详情已隐藏", true,
+             "检查工作区与网络后重试"});
     }
 }
 
 xuyan::domain::Result<ProviderTestReport> ProviderGenerationService::testStructuredGeneration(
     const std::string& connection_id, int timeout_ms) {
+    // 自检只使用固定合成提示词，不携带导入的小说或世界资料。
     const std::string prompt =
         "这是连接自检。请只输出 JSON 对象：ok 必须为 true，provider 填写当前提供商名称。不要输出解释。";
     const std::string schema =

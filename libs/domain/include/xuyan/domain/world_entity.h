@@ -36,7 +36,9 @@ struct EntityMergeResult {
     bool active{true};
 };
 
+/** @brief 校验世界实体的身份、类型与可编辑字段。 */
 Result<WorldEntity> validateEntity(WorldEntity entity);
+/** @brief 判断实体类型是否属于当前协议支持的集合。 */
 bool isSupportedEntityKind(std::string_view kind);
 
 } // namespace xuyan::domain

@@ -44,12 +44,15 @@ add_library(xuyan_domain STATIC
 target_include_directories(xuyan_domain PUBLIC libs/domain/include)
 target_compile_features(xuyan_domain PUBLIC cxx_std_20)
 
-add_library(xuyan_engine STATIC
-    libs/engine/src/mock_provider.cpp
-    libs/engine/src/simulation_engine.cpp
-)
-target_include_directories(xuyan_engine PUBLIC libs/engine/include)
-target_link_libraries(xuyan_engine PUBLIC xuyan_domain)
+if(XUYANFORGE_BUILD_TESTS)
+    # 固定响应与合成情景只参与测试，不进入正式应用的链接依赖。
+    add_library(xuyan_test_engine STATIC
+        tests/engine/mock_provider.cpp
+        tests/engine/simulation_engine.cpp
+    )
+    target_include_directories(xuyan_test_engine PUBLIC tests/include)
+    target_link_libraries(xuyan_test_engine PUBLIC xuyan_domain)
+endif()
 
 add_library(xuyan_providers STATIC
     libs/providers/src/model_protocol.cpp
@@ -69,7 +72,7 @@ add_library(xuyan_storage_sqlite STATIC
     libs/storage_sqlite/src/workspace_repository.cpp
 )
 target_include_directories(xuyan_storage_sqlite PUBLIC libs/storage_sqlite/include)
-target_link_libraries(xuyan_storage_sqlite PUBLIC xuyan_domain SQLite::SQLite3)
+target_link_libraries(xuyan_storage_sqlite PUBLIC xuyan_domain SQLite::SQLite3 PRIVATE xuyan_package)
 
 add_library(xuyan_application STATIC
     libs/application/src/branch_outcome_service.cpp
@@ -93,7 +96,7 @@ add_library(xuyan_application STATIC
     libs/application/src/world_graph_service.cpp
 )
 target_include_directories(xuyan_application PUBLIC libs/application/include)
-target_link_libraries(xuyan_application PUBLIC xuyan_domain xuyan_engine xuyan_package xuyan_providers xuyan_storage_sqlite)
+target_link_libraries(xuyan_application PUBLIC xuyan_domain xuyan_package xuyan_providers xuyan_storage_sqlite)
 
 if(WIN32)
     add_library(xuyan_platform_credentials STATIC
@@ -111,10 +114,13 @@ else()
 endif()
 
 if(XUYANFORGE_BUILD_UI)
-    set(CMAKE_AUTOMOC ON)
-    find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2)
-    qt_standard_project_setup(REQUIRES 6.5)
+    find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2)
+    qt_standard_project_setup(REQUIRES 6.8)
     qt_policy(SET QTP0004 NEW)
+    if(XUYANFORGE_BUILD_TESTS)
+        # 只有界面测试目标需要 QuickTest；纯核心与正式发行构建不增加此依赖。
+        find_package(Qt6 6.8 REQUIRED COMPONENTS QuickTest)
+    endif()
 
     add_library(xuyan_providers_qt STATIC
         libs/providers_qt/src/qt_provider_transport.cpp
@@ -124,8 +130,6 @@ if(XUYANFORGE_BUILD_UI)
 
     qt_add_executable(xuyanforge_app
         apps/native/main.cpp
-        ui/viewmodels/simulation_view_model.cpp
-        ui/viewmodels/simulation_view_model.h
         ui/viewmodels/workspace_view_model.cpp
         ui/viewmodels/workspace_view_model.h
         ui/viewmodels/workspace_catalog_view_model.cpp
@@ -157,7 +161,24 @@ if(XUYANFORGE_BUILD_UI)
     qt_add_qml_module(xuyanforge_app
         URI XuyanForge
         VERSION 1.0
-        QML_FILES ui/qml/Main.qml
+        QML_FILES
+            ui/qml/Main.qml
+            ui/qml/UiTheme.qml
+            ui/qml/AppButton.qml
+            ui/qml/AppComboBox.qml
+            ui/qml/AppField.qml
+            ui/qml/SectionPanel.qml
+            ui/qml/ProjectSidebar.qml
+            ui/qml/HomePage.qml
+            ui/qml/SourcePage.qml
+            ui/qml/TaskPage.qml
+            ui/qml/ReviewPage.qml
+            ui/qml/EntityPage.qml
+            ui/qml/ProviderPage.qml
+            ui/qml/CharacterPage.qml
+            ui/qml/WorkspacePage.qml
+            ui/qml/PackagePage.qml
+            ui/qml/ViewsPage.qml
     )
 
     install(TARGETS xuyanforge_app
@@ -168,8 +189,11 @@ endif()
 
 if(XUYANFORGE_BUILD_TESTS)
     enable_testing()
-    add_executable(core_tests tests/core_tests.cpp tests/legacy_fixture.cpp libs/application/src/demo_world_service.cpp)
-    target_link_libraries(core_tests PRIVATE xuyan_application xuyan_platform_credentials xuyan_providers)
+    if(XUYANFORGE_BUILD_UI)
+        add_subdirectory(tests)
+    endif()
+    add_executable(core_tests tests/core_tests.cpp tests/synthetic_world_data.cpp tests/synthetic_fixture.cpp)
+    target_link_libraries(core_tests PRIVATE xuyan_application xuyan_test_engine xuyan_platform_credentials xuyan_providers)
     add_test(NAME core_tests COMMAND core_tests)
     add_executable(stress_tests tests/stress_tests.cpp)
     target_link_libraries(stress_tests PRIVATE xuyan_storage_sqlite)

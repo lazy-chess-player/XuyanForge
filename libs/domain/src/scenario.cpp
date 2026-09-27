@@ -7,27 +7,19 @@
 namespace xuyan::domain {
 namespace {
 
+/** @brief 在可变状态中按标识查找人物，未找到时返回空指针。 */
 CharacterState* mutableCharacter(ScenarioState& state, const std::string& id) {
     const auto it = std::find_if(state.characters.begin(), state.characters.end(),
                                  [&id](const CharacterState& item) { return item.id == id; });
     return it == state.characters.end() ? nullptr : &*it;
 }
 
+/** @brief 构造不可自动重试的情景规则冲突错误。 */
 Error ruleError(std::string message) {
     return Error{ErrorCode::rule_conflict, std::move(message), false, "修改行动或由作者介入"};
 }
 
 } // namespace
-
-ScenarioState makeGreyHarborInitialState() {
-    ScenarioState state;
-    state.narration = "谈判前一天傍晚，暴雨笼罩灰港。议和印章由沈棠保管。";
-    state.characters = {
-        {"actor-xucheng", "许澄", true, false, 0},
-        {"actor-shentang", "沈棠", false, false, 0},
-    };
-    return state;
-}
 
 const CharacterState* findCharacter(const ScenarioState& state, const std::string& id) {
     const auto it = std::find_if(state.characters.begin(), state.characters.end(),

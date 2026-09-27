@@ -6,6 +6,7 @@
 namespace xuyan::domain {
 namespace {
 
+/** @brief 根据首字节判定 UTF-8 序列宽度；非法首字节返回零。 */
 std::size_t sequenceLength(unsigned char first) {
     if (first <= 0x7f) return 1;
     if ((first & 0xe0) == 0xc0) return 2;
@@ -14,6 +15,7 @@ std::size_t sequenceLength(unsigned char first) {
     return 0;
 }
 
+/** @brief 校验单个 UTF-8 序列的续字节、最短编码、代理项和 Unicode 上界。 */
 bool validateSequence(std::string_view text, std::size_t offset, std::size_t length) {
     if (length == 0 || offset + length > text.size()) return false;
     const auto first = static_cast<unsigned char>(text[offset]);
@@ -29,12 +31,14 @@ bool validateSequence(std::string_view text, std::size_t offset, std::size_t len
     return true;
 }
 
+/** @brief 去除章节标题两端的 ASCII 空格和制表符并返回独立字符串。 */
 std::string trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
     while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1);
     return std::string{text};
 }
 
+/** @brief 识别 Markdown 标题或中文章回标题，并把识别出的标题写入输出参数。 */
 bool isHeading(std::string_view line, std::string& title) {
     auto clean = trim(line);
     if (clean.empty()) return false;
@@ -54,6 +58,7 @@ bool isHeading(std::string_view line, std::string& title) {
     return false;
 }
 
+/** @brief 从文本开头扫描到目标码点，返回其 UTF-8 字节起点。 */
 std::size_t byteAtCodepoint(std::string_view text, std::size_t target) {
     std::size_t byte = 0;
     std::size_t codepoint = 0;
@@ -118,12 +123,14 @@ Result<std::vector<SourceChapter>> detectChapters(std::string_view text, std::st
         line_start = newline + 1;
     }
 
+    // 没有标题时整篇算一章；标题前的正文单独保留为序章，保证索引覆盖全文。
     if (headings.empty()) headings.emplace_back(0, "正文");
     else if (headings.front().first != 0) headings.insert(headings.begin(), {0, "序章"});
     std::vector<SourceChapter> chapters;
     chapters.reserve(headings.size());
     std::size_t cumulative_codepoints = 0;
     std::size_t previous_byte = 0;
+    // 相邻标题之间的字节和码点范围在同一轮累积，避免每章从头重复扫描。
     for (std::size_t index = 0; index < headings.size(); ++index) {
         const auto start = headings[index].first;
         cumulative_codepoints += utf8CodepointCount(text.substr(previous_byte, start - previous_byte));
@@ -154,4 +161,3 @@ Result<std::string> codepointSlice(std::string_view utf8, std::size_t start, std
 }
 
 } // namespace xuyan::domain
-

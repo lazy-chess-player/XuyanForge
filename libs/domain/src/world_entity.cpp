@@ -6,12 +6,14 @@
 namespace xuyan::domain {
 namespace {
 
+/** @brief 检查实体字段是否包含禁止的控制字符。 */
 bool containsControl(std::string_view value) {
     return std::any_of(value.begin(), value.end(), [](unsigned char character) {
         return character < 0x20 && character != '\t';
     });
 }
 
+/** @brief 清理实体标签或别名中的空项与重复项。 */
 void normalizeList(std::vector<std::string>& values) {
     values.erase(std::remove_if(values.begin(), values.end(), [](const auto& value) { return value.empty(); }), values.end());
     std::sort(values.begin(), values.end());
@@ -74,4 +76,3 @@ Result<WorldEntity> validateEntity(WorldEntity entity) {
 }
 
 } // namespace xuyan::domain
-

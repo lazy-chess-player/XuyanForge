@@ -158,7 +158,7 @@ void PackageViewModel::compareBranches(int left_index, int right_index) {
                 QStringList differences;
                 for (const auto& item : result.value->differences)
                     differences << QStringLiteral("%1：%2 → %3").arg(QString::fromStdString(item.field), QString::fromStdString(item.left_value), QString::fromStdString(item.right_value));
-                self->comparison_text_ = QStringLiteral("共同提交 %1\n左：%2 次调用 / %3+%4 token；右：%5 次调用 / %6+%7 token\n%8")
+                self->comparison_text_ = QStringLiteral("共同提交 %1\n左：%2 次调用 / %3+%4 词元；右：%5 次调用 / %6+%7 词元\n%8")
                     .arg(QString::fromStdString(result.value->common_commit_id).left(16))
                     .arg(result.value->left_calls).arg(result.value->left_input_tokens).arg(result.value->left_output_tokens)
                     .arg(result.value->right_calls).arg(result.value->right_input_tokens).arg(result.value->right_output_tokens)

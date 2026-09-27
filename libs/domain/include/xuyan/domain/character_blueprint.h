@@ -25,7 +25,7 @@ struct CharacterBlueprint {
     bool deleted{false};
 };
 
+/** @brief 校验并规范化人物卡字段；失败时返回可供界面展示的错误。 */
 Result<CharacterBlueprint> validateBlueprint(CharacterBlueprint blueprint);
 
 } // namespace xuyan::domain
-

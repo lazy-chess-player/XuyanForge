@@ -36,11 +36,15 @@ struct ProviderGenerationResult {
     int output_tokens{0};
 };
 
+/** @brief 将统一生成请求转换成指定厂商协议的 HTTP 请求；不附加明文密钥。 */
 xuyan::domain::Result<ProviderHttpRequest> buildProviderRequest(
     ProviderProtocol protocol, const StructuredGenerationRequest& request);
+/** @brief 解析厂商响应并归一化正文、错误类型和用量。 */
 xuyan::domain::Result<ProviderGenerationResult> parseProviderResponse(
     ProviderProtocol protocol, std::string_view response_json);
+/** @brief 根据 HTTP 状态、超时和取消标志归类请求失败。 */
 ProviderGenerationResult classifyProviderFailure(int http_status, bool timed_out, bool cancelled);
+/** @brief 将连接的提供商类型映射到受支持的协议。 */
 xuyan::domain::Result<ProviderProtocol> protocolForProviderKind(std::string_view kind);
 
 } // namespace xuyan::providers

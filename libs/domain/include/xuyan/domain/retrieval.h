@@ -33,7 +33,9 @@ struct RetrievalHit {
     int lexical_score{0};
 };
 
+/** @brief 校验实体可见性、时间范围和授权角色。 */
 Result<EntityRetrievalScope> validateEntityRetrievalScope(EntityRetrievalScope scope);
+/** @brief 校验世界实体检索请求与结果数量上限。 */
 Result<RetrievalRequest> validateRetrievalRequest(RetrievalRequest request);
 
 } // namespace xuyan::domain

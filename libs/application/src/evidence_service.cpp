@@ -20,6 +20,7 @@ xuyan::domain::Result<xuyan::domain::EvidenceReference> EvidenceService::create(
         auto source = repository.loadSource(source_id);
         if (!source.ok()) return xuyan::domain::Result<xuyan::domain::EvidenceReference>::failure(*source.error);
         SourceImportService sources(database_path_);
+        // 引文总从标准化原文重新取得，不接受调用方提交的任意字符串。
         auto quote = sources.evidenceText(source_id, start_codepoint, end_codepoint);
         if (!quote.ok()) return xuyan::domain::Result<xuyan::domain::EvidenceReference>::failure(*quote.error);
         xuyan::domain::EvidenceReference evidence;

@@ -2,25 +2,59 @@
 
 #include "xuyan/application/source_import_service.h"
 #include "xuyan/domain/hash.h"
+#include "xuyan/domain/provider_connection.h"
 #include "xuyan/domain/source_document.h"
 #include "xuyan/storage/workspace_repository.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
+#include <string_view>
+#include <vector>
 
 namespace xuyan::application {
 namespace {
 
-std::vector<std::size_t> paragraphBoundaries(std::string_view utf8) {
-    std::vector<std::size_t> result;
+struct TextBoundaries {
+    std::vector<std::size_t> paragraphs;
+    std::vector<std::size_t> sentences;
+};
+
+/** @brief 单次扫描标准化 UTF-8 正文，建立单换行段尾与句末的码点边界索引。 */
+TextBoundaries textBoundaries(std::string_view utf8) {
+    TextBoundaries result;
     std::size_t codepoint = 0;
     for (std::size_t offset = 0; offset < utf8.size();) {
         const auto lead = static_cast<unsigned char>(utf8[offset]);
         const auto width = lead < 0x80 ? 1U : lead < 0xe0 ? 2U : lead < 0xf0 ? 3U : 4U;
-        if (utf8[offset] == '\n' && offset + 1 < utf8.size() && utf8[offset + 1] == '\n') result.push_back(codepoint + 2);
+        const auto current = utf8.substr(offset, width);
+        if (current == "\n") result.paragraphs.push_back(codepoint + 1);
+        if (current == "。" || current == "！" || current == "？" || current == "；"
+            || current == "!" || current == "?" || current == ";") {
+            auto sentence_end = codepoint + 1;
+            for (auto tail = offset + width; tail < utf8.size();) {
+                const auto remaining = utf8.substr(tail);
+                if (remaining.starts_with("”") || remaining.starts_with("’")
+                    || remaining.starts_with("」") || remaining.starts_with("』")
+                    || remaining.starts_with("）")) tail += 3;
+                else if (remaining.starts_with('"') || remaining.starts_with(')')) ++tail;
+                else break;
+                ++sentence_end;
+            }
+            result.sentences.push_back(sentence_end);
+        }
         offset += width; ++codepoint;
     }
     return result;
+}
+
+/** @brief 在允许长度区间内选择最靠后的边界；不存在时返回零以触发下级回退。 */
+std::size_t lastBoundaryInRange(const std::vector<std::size_t>& boundaries,
+                                std::size_t minimum, std::size_t maximum) {
+    const auto after = std::upper_bound(boundaries.begin(), boundaries.end(), maximum);
+    if (after == boundaries.begin()) return 0;
+    const auto boundary = *std::prev(after);
+    return boundary >= minimum ? boundary : 0;
 }
 
 } // namespace
@@ -42,7 +76,8 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     const auto total = xuyan::domain::utf8CodepointCount(*text.value);
     if (total == 0) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
         {xuyan::domain::ErrorCode::validation_failed, "空来源不能创建提取任务", false, "选择包含正文的来源"});
-    const auto boundaries = paragraphBoundaries(*text.value);
+    // 正文只解码一次，先建立段尾/句末索引，再用码点到字节的映射截取每一步。
+    const auto boundaries = textBoundaries(*text.value);
     // Normalize once: repeated codepointSlice() rescans the complete novel for every step.
     std::vector<std::uint32_t> byte_offsets;
     byte_offsets.reserve(total + 1);
@@ -55,6 +90,7 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     xuyan::storage::WorkspaceRepository repository(database_path_);
     auto source = repository.loadSource(source_id);
     if (!source.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*source.error);
+    // 先把章节和章节之间的空隙拆成不交叉的区段，后续切片不会越过章节边界。
     std::vector<std::pair<std::size_t, std::size_t>> segments;
     std::size_t covered = 0;
     for (const auto& chapter : source.value->chapters) {
@@ -67,15 +103,21 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     if (segments.empty()) segments.emplace_back(0, total);
     xuyan::domain::ExtractionJob job;
     job.id = "job-" + xuyan::domain::sha256(command_id).substr(0, 24); job.source_id = source_id;
+    // 远程任务只绑定当时的连接指纹；创建任务本身不读取密钥，也不调用模型。
     if (!provider_connection_id.empty()) {
         auto connection = repository.loadProviderConnection(provider_connection_id);
         if (!connection.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*connection.error);
-        if (!connection.value->enabled || connection.value->default_model.empty())
+        if (connection.value->deleted || !connection.value->enabled || connection.value->default_model.empty())
             return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
                 {xuyan::domain::ErrorCode::validation_failed, "所选模型连接未启用或缺少模型", false,
                  "先在模型连接页完成配置"});
+        if (connection.value->kind != "local" && connection.value->data_policy != "remote_allowed")
+            return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
+                {xuyan::domain::ErrorCode::validation_failed, "当前数据策略不允许远程发送小说", false,
+                 "明确允许远程发送后重新创建任务"});
         job.provider_connection_id = provider_connection_id;
         job.model_id = connection.value->default_model;
+        job.provider_connection_fingerprint = xuyan::domain::providerConnectionFingerprint(*connection.value);
     }
     int ordinal = 1;
     for (const auto& [segment_start, segment_end] : segments) {
@@ -84,11 +126,12 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
         auto end = std::min(segment_end, start + maximum_codepoints);
         if (end < segment_end) {
             const auto minimum = start + maximum_codepoints / 2;
-            const auto candidate = std::upper_bound(boundaries.begin(), boundaries.end(), end);
-            if (candidate != boundaries.begin()) {
-                const auto boundary = *std::prev(candidate);
-                if (boundary >= minimum) end = boundary;
-            }
+            // 优先在段尾切片；单行长段才退到句尾，过长句最终仍受最大码点数约束。
+            const auto paragraph = lastBoundaryInRange(boundaries.paragraphs, minimum, end);
+            const auto sentence = paragraph == 0
+                ? lastBoundaryInRange(boundaries.sentences, minimum, end) : 0;
+            if (paragraph != 0) end = paragraph;
+            else if (sentence != 0) end = sentence;
         }
         const auto chunk = std::string_view(*text.value).substr(byte_offsets[start], byte_offsets[end] - byte_offsets[start]);
         xuyan::domain::ExtractionStep step;
@@ -114,6 +157,12 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
 
 xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>> ExtractionJobService::list() {
     try { return xuyan::storage::WorkspaceRepository(database_path_).listExtractionJobs(); }
+    catch (const std::exception& exception) { return xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>>::failure(
+        {xuyan::domain::ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
+}
+xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>> ExtractionJobService::listForWorld(
+    const std::string& world_id) {
+    try { return xuyan::storage::WorkspaceRepository(database_path_).listExtractionJobsForWorld(world_id); }
     catch (const std::exception& exception) { return xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>>::failure(
         {xuyan::domain::ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }

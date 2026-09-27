@@ -19,6 +19,9 @@ struct ProviderConnection {
     int revision{0};
 };
 
+/** @brief 校验模型连接配置，拒绝无效提供商及不安全地址。 */
 Result<ProviderConnection> validateProviderConnection(ProviderConnection connection);
+/** @brief 计算不含密钥的连接配置指纹，用于识别任务执行期间的配置变化。 */
+std::string providerConnectionFingerprint(const ProviderConnection& connection);
 
 } // namespace xuyan::domain

@@ -5,7 +5,9 @@
 
 namespace xuyan::domain {
 namespace {
+/** @brief 判断地图或关系证据状态是否属于允许值。 */
 bool validEvidence(std::string_view value) { return value == "evidence" || value == "assumption"; }
+/** @brief 对关系与事件的多值引用删除空项并去重。 */
 void normalize(std::vector<std::string>& values) {
     values.erase(std::remove_if(values.begin(), values.end(), [](const auto& v) { return v.empty(); }), values.end());
     std::sort(values.begin(), values.end()); values.erase(std::unique(values.begin(), values.end()), values.end());

@@ -49,7 +49,7 @@ private:
 
     std::filesystem::path database_path_;
     bool busy_{false};
-    QString status_text_{QStringLiteral("世界包与人物包默认不包含 API Key")};
+    QString status_text_{QStringLiteral("世界包与人物包默认不包含模型密钥")};
     QString error_text_;
     QStringList branch_names_;
     QStringList branch_ids_;

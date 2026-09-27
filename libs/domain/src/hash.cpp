@@ -20,6 +20,7 @@ constexpr std::array<std::uint32_t, 64> constants{
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
+/** @brief 将 32 位字按 SHA-256 所需位数循环右移。 */
 std::uint32_t rotateRight(std::uint32_t value, int amount) {
     return (value >> amount) | (value << (32 - amount));
 }

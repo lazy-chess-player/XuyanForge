@@ -31,7 +31,9 @@ struct BranchRootBinding {
     std::string root_hash;
 };
 
+/** @brief 校验人物实例与其世界版本、知识策略等绑定信息。 */
 Result<CharacterInstance> validateCharacterInstance(CharacterInstance instance);
+/** @brief 校验分支根节点关联的世界和人物快照。 */
 Result<BranchRootBinding> validateBranchRootBinding(BranchRootBinding binding);
 
 } // namespace xuyan::domain

@@ -319,7 +319,7 @@ void WorkspaceViewModel::splitMerge(QString merge_id) {
             if (!self) return;
             self->busy_ = false;
             if (!result.ok()) { self->error_text_ = QString::fromStdString(result.error->message); emit self->changed(); return; }
-            self->status_text_ = QStringLiteral("拆分完成；双方稳定 ID 与证据引用已恢复");
+            self->status_text_ = QStringLiteral("拆分完成；双方稳定标识与证据引用已恢复");
             self->offset_ = 0; self->loadPage(self->last_query_, self->last_kind_, QString::fromStdString(result.value->source.id));
         }, Qt::QueuedConnection);
     });

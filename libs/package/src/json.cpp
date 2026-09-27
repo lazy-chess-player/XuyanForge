@@ -13,10 +13,12 @@ namespace {
 using xuyan::domain::Error;
 using xuyan::domain::ErrorCode;
 
+/** @brief 将 JSON 格式错误转换为可展示的非重试领域错误。 */
 Error jsonError(std::string message) {
     return Error{ErrorCode::validation_failed, std::move(message), false, "修正 JSON 后重试"};
 }
 
+/** @brief 将已校验的 Unicode 码点编码并追加到 UTF-8 字符串。 */
 void appendUtf8(std::string& output, std::uint32_t codepoint) {
     if (codepoint <= 0x7f) output.push_back(static_cast<char>(codepoint));
     else if (codepoint <= 0x7ff) {
@@ -36,9 +38,11 @@ void appendUtf8(std::string& output, std::uint32_t codepoint) {
 
 class Parser {
 public:
+    /** @brief 绑定只读输入及解析深度、节点数量上限；输入须在解析器存活期间有效。 */
     Parser(std::string_view input, std::size_t depth, std::size_t nodes)
         : input_(input), maximum_depth_(depth), maximum_nodes_(nodes) {}
 
+    /** @brief 解析唯一根值并拒绝末尾多余内容。 */
     xuyan::domain::Result<JsonValue> run() {
         auto result = value(0);
         if (!result.ok()) return result;
@@ -48,11 +52,13 @@ public:
     }
 
 private:
+    /** @brief 跳过 JSON 语法允许的空白字符。 */
     void whitespace() {
         while (position_ < input_.size() && (input_[position_] == ' ' || input_[position_] == '\n'
                || input_[position_] == '\r' || input_[position_] == '\t')) ++position_;
     }
 
+    /** @brief 在深度和节点上限内分派解析一个 JSON 值。 */
     xuyan::domain::Result<JsonValue> value(std::size_t depth) {
         whitespace();
         if (++nodes_ > maximum_nodes_) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 节点数量超过上限"));
@@ -73,6 +79,7 @@ private:
         return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 包含无效值"));
     }
 
+    /** @brief 解析字符串转义与 UTF-16 代理项，返回解码后的 UTF-8。 */
     xuyan::domain::Result<std::string> string() {
         if (input_[position_++] != '"') return xuyan::domain::Result<std::string>::failure(jsonError("需要 JSON 字符串"));
         std::string output;
@@ -111,6 +118,7 @@ private:
         return xuyan::domain::Result<std::string>::failure(jsonError("JSON 字符串未闭合"));
     }
 
+    /** @brief 将反斜杠 u 后的四个十六进制字符解析为码点单元。 */
     xuyan::domain::Result<std::uint32_t> hexCodepoint() {
         if (position_ + 4 > input_.size()) return xuyan::domain::Result<std::uint32_t>::failure(jsonError("Unicode 转义被截断"));
         std::uint32_t result = 0;
@@ -125,6 +133,7 @@ private:
         return xuyan::domain::Result<std::uint32_t>::success(result);
     }
 
+    /** @brief 严格解析 JSON 整数或有限实数，并拒绝溢出。 */
     xuyan::domain::Result<JsonValue> number() {
         const auto begin = position_;
         if (input_[position_] == '-') ++position_;
@@ -160,6 +169,7 @@ private:
         return xuyan::domain::Result<JsonValue>::success(JsonValue(parsed));
     }
 
+    /** @brief 递归解析数组元素，直到闭合方括号。 */
     xuyan::domain::Result<JsonValue> array(std::size_t depth) {
         ++position_;
         JsonValue::Array result;
@@ -177,6 +187,7 @@ private:
         return xuyan::domain::Result<JsonValue>::success(JsonValue(std::move(result)));
     }
 
+    /** @brief 递归解析对象键值并拒绝重复键。 */
     xuyan::domain::Result<JsonValue> object(std::size_t depth) {
         ++position_;
         JsonValue::Object result;
@@ -210,6 +221,7 @@ private:
     std::size_t nodes_{0};
 };
 
+/** @brief 递归向输出缓冲追加紧凑 JSON，字符串交由转义函数处理。 */
 void writeValue(const JsonValue& value, std::string& output) {
     if (value.isNull()) output += "null";
     else if (value.isBool()) output += value.boolean() ? "true" : "false";

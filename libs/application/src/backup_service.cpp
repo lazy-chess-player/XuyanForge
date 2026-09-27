@@ -22,8 +22,10 @@ constexpr std::uintmax_t maximum_asset_file = 128ULL * 1024 * 1024;
 constexpr std::uintmax_t maximum_total = 4ULL * 1024 * 1024 * 1024;
 constexpr int maximum_files = 10000;
 
+/** @brief 构造不暴露资产内容的备份失败结果。 */
 Error backupError(std::string message) { return {ErrorCode::storage_error, std::move(message), false, "检查备份路径、完整性和磁盘空间"}; }
 
+/** @brief 在给定大小上限内读取备份或资产文件。 */
 std::string readFile(const std::filesystem::path& path, std::uintmax_t limit = maximum_asset_file) {
     const auto size = std::filesystem::file_size(path);
     if (size > limit) throw std::runtime_error("备份文件超过大小上限");
@@ -32,6 +34,7 @@ std::string readFile(const std::filesystem::path& path, std::uintmax_t limit = m
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+/** @brief 创建父目录后完整写入备份文件，写入失败时抛出异常。 */
 void writeFile(const std::filesystem::path& path, std::string_view bytes) {
     std::filesystem::create_directories(path.parent_path());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -40,17 +43,20 @@ void writeFile(const std::filesystem::path& path, std::string_view bytes) {
     if (!output) throw std::runtime_error("写入备份文件失败");
 }
 
+/** @brief 为一次备份或恢复生成同级临时目录路径。 */
 std::filesystem::path stagingPath(const std::filesystem::path& destination) {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     return destination.parent_path() / (destination.filename().string() + ".partial-" + std::to_string(stamp));
 }
 
+/** @brief 从备份清单读取必需的字符串字段，缺失或类型不符时拒绝。 */
 std::string requiredString(const JsonValue& object, std::string_view key) {
     const auto* value = object.find(key);
     if (value == nullptr || !value->isString()) throw std::runtime_error("备份清单字段缺失或类型错误");
     return value->string();
 }
 
+/** @brief 拒绝绝对路径、越界分量和资产目录外的备份条目。 */
 void validateRelativeAssetPath(const std::string& value) {
     const std::filesystem::path path(value);
     if (path.empty() || path.is_absolute() || value.find('\\') != std::string::npos)
@@ -75,6 +81,7 @@ Result<BackupReport> BackupService::create(const std::filesystem::path& destinat
         auto database_backup = repository.backupTo(database_target);
         if (!database_backup.ok()) throw std::runtime_error(database_backup.error->message);
 
+        // 数据库先通过 SQLite 在线快照写入暂存目录，再逐个复制并哈希资产。
         JsonValue::Array assets;
         BackupReport report{database_target};
         const auto assets_root = database_path_.parent_path() / "assets";
@@ -102,6 +109,7 @@ Result<BackupReport> BackupService::create(const std::filesystem::path& destinat
             {"database", JsonValue::Object{{"path", "workspace.sqlite"}, {"sha256", xuyan::domain::sha256(database_bytes)},
                                             {"size", static_cast<std::int64_t>(database_bytes.size())}}},
             {"assets", std::move(assets)}, {"credentials_included", false}});
+        // 清单最后写入；整套文件准备好后才把暂存目录重命名为正式备份。
         writeFile(staging / "manifest.json", xuyan::package::writeJson(manifest));
         if (!destination_directory.parent_path().empty()) std::filesystem::create_directories(destination_directory.parent_path());
         std::filesystem::rename(staging, destination_directory);
@@ -117,6 +125,7 @@ Result<BackupReport> BackupService::restore(
     const std::filesystem::path& backup_directory, const std::filesystem::path& destination_directory) {
     const auto staging = stagingPath(destination_directory);
     try {
+        // 先校验清单格式和凭据标记，恢复过程不接纳凭据文件。
         if (!std::filesystem::is_directory(backup_directory) || std::filesystem::exists(destination_directory))
             return Result<BackupReport>::failure(backupError("备份源无效或恢复目标已存在"));
         if (std::filesystem::is_symlink(backup_directory / "manifest.json")) throw std::runtime_error("备份清单不能是符号链接");
@@ -133,6 +142,7 @@ Result<BackupReport> BackupService::restore(
         const auto database_path = requiredString(*database, "path");
         if (database_path != "workspace.sqlite") throw std::runtime_error("备份数据库路径无效");
         if (std::filesystem::is_symlink(backup_directory / database_path)) throw std::runtime_error("备份数据库不能是符号链接");
+        // 数据库与资产均核对摘要后写入暂存目录，正式目标保持未创建。
         const auto database_bytes = readFile(backup_directory / database_path, 2ULL * 1024 * 1024 * 1024);
         if (xuyan::domain::sha256(database_bytes) != requiredString(*database, "sha256"))
             throw std::runtime_error("备份数据库摘要不匹配");
@@ -150,6 +160,7 @@ Result<BackupReport> BackupService::restore(
             if (report.asset_bytes + bytes.size() > maximum_total) throw std::runtime_error("备份资产总量超过上限");
             report.asset_bytes += bytes.size(); writeFile(staging / relative, bytes);
         }
+        // 所有文件验证通过后才原子切换为用户指定的恢复目录。
         if (!destination_directory.parent_path().empty()) std::filesystem::create_directories(destination_directory.parent_path());
         std::filesystem::rename(staging, destination_directory);
         return Result<BackupReport>::success(std::move(report));

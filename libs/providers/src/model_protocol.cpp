@@ -12,23 +12,28 @@ namespace {
 using xuyan::domain::ErrorCode;
 using xuyan::package::JsonValue;
 
+/** @brief 构造协议数据不合法时的非重试错误。 */
 xuyan::domain::Error protocolError(std::string message) {
     return {ErrorCode::validation_failed, std::move(message), false, "保留原始响应并暂停该推演回合"};
 }
 
+/** @brief 安全读取对象成员；输入为空或非对象时返回空指针。 */
 const JsonValue* member(const JsonValue* value, std::string_view name) {
     return value != nullptr && value->isObject() ? value->find(name) : nullptr;
 }
 
+/** @brief 从可选 JSON 节点读取字符串，类型不符时返回空串。 */
 std::string stringValue(const JsonValue* value) {
     return value != nullptr && value->isString() ? value->string() : std::string{};
 }
 
+/** @brief 从可选节点读取非负计数，并限制到 int 安全范围。 */
 int integerValue(const JsonValue* value) {
     if (value == nullptr || !value->isInteger()) return 0;
     return static_cast<int>(std::clamp<std::int64_t>(value->integer(), 0, 2'000'000'000));
 }
 
+/** @brief 去除端点尾部斜线并附加协议路径，避免重复后缀。 */
 std::string appendPath(std::string endpoint, std::string_view path) {
     while (!endpoint.empty() && endpoint.back() == '/') endpoint.pop_back();
     if (endpoint.ends_with(path)) return endpoint;
@@ -36,12 +41,14 @@ std::string appendPath(std::string endpoint, std::string_view path) {
     return endpoint;
 }
 
+/** @brief 将结构化输出 Schema 解析为 JSON 对象，格式错误时抛出异常。 */
 JsonValue schemaValue(const std::string& schema) {
     auto parsed = xuyan::package::parseJson(schema);
     if (!parsed.ok() || !parsed.value->isObject()) throw std::runtime_error("结构化输出 Schema 不是有效 JSON 对象");
     return std::move(*parsed.value);
 }
 
+/** @brief 按厂商协议构造结构化生成请求的 JSON 正文。 */
 JsonValue requestBody(ProviderProtocol protocol, const StructuredGenerationRequest& request) {
     const auto schema = schemaValue(request.json_schema);
     const JsonValue user_message(JsonValue::Object{{"role", "user"}, {"content", request.prompt}});
@@ -81,6 +88,7 @@ JsonValue requestBody(ProviderProtocol protocol, const StructuredGenerationReque
             {"responseJsonSchema", schema}, {"maxOutputTokens", request.max_output_tokens}, {"candidateCount", 1}}}};
 }
 
+/** @brief 解析响应式协议的正文、拒绝状态与用量。 */
 ProviderGenerationResult parseOpenAiResponses(const JsonValue& root) {
     ProviderGenerationResult result;
     const auto status = stringValue(member(&root, "status"));
@@ -106,6 +114,7 @@ ProviderGenerationResult parseOpenAiResponses(const JsonValue& root) {
     return result;
 }
 
+/** @brief 解析兼容聊天协议的首个候选与结束原因。 */
 ProviderGenerationResult parseCompatible(const JsonValue& root) {
     ProviderGenerationResult result;
     const auto* usage = member(&root, "usage");
@@ -125,6 +134,7 @@ ProviderGenerationResult parseCompatible(const JsonValue& root) {
     return result;
 }
 
+/** @brief 解析消息协议的文本块、停止原因与用量。 */
 ProviderGenerationResult parseAnthropic(const JsonValue& root) {
     ProviderGenerationResult result;
     const auto reason = stringValue(member(&root, "stop_reason"));
@@ -142,6 +152,7 @@ ProviderGenerationResult parseAnthropic(const JsonValue& root) {
     return result;
 }
 
+/** @brief 解析内容生成协议的首个候选及安全拦截状态。 */
 ProviderGenerationResult parseGemini(const JsonValue& root) {
     ProviderGenerationResult result;
     const auto* usage = member(&root, "usageMetadata");
@@ -178,6 +189,7 @@ xuyan::domain::Result<ProviderHttpRequest> buildProviderRequest(
     try {
         ProviderHttpRequest result;
         result.headers["Content-Type"] = "application/json";
+        // 协议层只标记凭据应放入的请求头，不在请求对象中保存密钥。
         if (protocol == ProviderProtocol::openai_responses) {
             result.url = appendPath(request.endpoint, "/responses"); result.credential_header = "Authorization: Bearer";
         } else if (protocol == ProviderProtocol::openai_compatible) {
@@ -213,6 +225,7 @@ xuyan::domain::Result<ProviderGenerationResult> parseProviderResponse(
 
 ProviderGenerationResult classifyProviderFailure(int http_status, bool timed_out, bool cancelled) {
     ProviderGenerationResult result; result.status = "error";
+    // 超时可能已被上游计费，因此不能据此自动重试。
     if (cancelled) { result.failure_kind = "cancelled"; return result; }
     if (timed_out) { result.failure_kind = "timeout_unknown"; result.retryable = false; return result; }
     if (http_status == 401 || http_status == 403) result.failure_kind = "authentication";

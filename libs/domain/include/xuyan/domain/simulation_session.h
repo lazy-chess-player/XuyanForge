@@ -9,8 +9,8 @@ namespace xuyan::domain {
 
 struct ActorModelBinding {
     std::string actor_id;
-    std::string provider_connection_id{"mock"};
-    std::string model_id{"grey-harbor-fixed-v1"};
+    std::string provider_connection_id;
+    std::string model_id;
 };
 
 struct ActorIntent {
@@ -77,8 +77,11 @@ struct SimulationSession {
     std::vector<SimulationTurn> turns;
 };
 
+/** @brief 校验模型提出的人物意图和所引用的输入提交。 */
 Result<ActorIntent> validateActorIntent(ActorIntent intent);
+/** @brief 校验会话状态、额度和回合记录的一致性。 */
 Result<SimulationSession> validateSimulationSession(SimulationSession session);
+/** @brief 将受支持的人物意图转为确定性的情景操作。 */
 Result<ProposedOperation> toProposedOperation(const ActorIntent& intent);
 
 } // namespace xuyan::domain

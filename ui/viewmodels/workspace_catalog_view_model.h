@@ -19,6 +19,8 @@ class WorkspaceCatalogViewModel final : public QObject {
     Q_PROPERTY(QString activeWorldId READ activeWorldId NOTIFY changed)
     Q_PROPERTY(QString themeId READ themeId NOTIFY changed)
     Q_PROPERTY(QVariantList availableThemes READ availableThemes CONSTANT)
+    Q_PROPERTY(QString languageId READ languageId NOTIFY languageChanged)
+    Q_PROPERTY(QVariantList availableLanguages READ availableLanguages CONSTANT)
 
 public:
     explicit WorkspaceCatalogViewModel(std::filesystem::path database_path, QObject* parent = nullptr);
@@ -32,6 +34,10 @@ public:
     int createdChapterCount() const noexcept { return created_chapter_count_; }
     QString activeWorldId() const { return active_world_id_; }
     QString themeId() const { return theme_id_; }
+    QString languageId() const { return language_id_; }
+    QVariantList availableLanguages() const {
+        return {QVariantMap{{"id", "zh-CN"}, {"name", QStringLiteral("简体中文")}}};
+    }
     QVariantList availableThemes() const {
         return {QVariantMap{{"id", "dark"}, {"name", QStringLiteral("深色")}},
                 QVariantMap{{"id", "light"}, {"name", QStringLiteral("浅色")}}};
@@ -45,10 +51,12 @@ public:
     Q_INVOKABLE void createWorld(QString name, const QUrl& novel_file);
     Q_INVOKABLE void selectWorld(int index);
     Q_INVOKABLE void setThemeId(QString theme_id);
+    Q_INVOKABLE void setLanguageId(QString language_id);
 
 signals:
     void changed();
     void worldCreated();
+    void languageChanged();
 
 private:
     void loadRecent();
@@ -67,4 +75,5 @@ private:
     int created_chapter_count_{0};
     QString active_world_id_;
     QString theme_id_{QStringLiteral("dark")};
+    QString language_id_{QStringLiteral("zh-CN")};
 };

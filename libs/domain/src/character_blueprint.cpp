@@ -5,10 +5,12 @@
 namespace xuyan::domain {
 namespace {
 
+/** @brief 检查文本是否含不允许出现在人物卡中的控制字符。 */
 bool hasControl(std::string_view text) {
     return std::any_of(text.begin(), text.end(), [](unsigned char value) { return value < 0x20 && value != '\t'; });
 }
 
+/** @brief 删除空项并排序去重人物卡的多值字段。 */
 void normalize(std::vector<std::string>& values) {
     values.erase(std::remove_if(values.begin(), values.end(), [](const auto& value) { return value.empty(); }), values.end());
     std::sort(values.begin(), values.end());
@@ -44,4 +46,3 @@ Result<CharacterBlueprint> validateBlueprint(CharacterBlueprint blueprint) {
 }
 
 } // namespace xuyan::domain
-

@@ -1,24 +1,24 @@
-#include "xuyan/application/workspace_service.h"
-#include "xuyan/application/character_service.h"
+#include "synthetic_fixture.h"
 #include "xuyan/storage/workspace_repository.h"
 
-namespace xuyan::application {
+namespace xuyan::test {
 
-xuyan::domain::Result<bool> WorkspaceService::installTestFixture() {
-    xuyan::storage::WorkspaceRepository repository(database_path_);
+/** @brief 在空白测试工作区显式创建有限合成条目；已有条目时保持原状。 */
+xuyan::domain::Result<bool> installSyntheticEntities(const std::filesystem::path& database_path) {
+    xuyan::storage::WorkspaceRepository repository(database_path);
     auto page = repository.searchEntities({}, {}, 0, 1);
     if (!page.ok()) return xuyan::domain::Result<bool>::failure(*page.error);
     if (page.value->total > 0) return xuyan::domain::Result<bool>::success(false);
     const std::vector<xuyan::domain::WorldEntity> samples{
-        {"entity-xucheng", "world-grey-harbor", "character", "许澄", {"许代表"}, {"城卫署", "谈判"},
+        {"entity-xucheng", "world-synthetic-test", "character", "许澄", {"许代表"}, {"城卫署", "谈判"},
          "城卫署谈判代表，重视秩序；在场景开始时知道北门今夜封闭。", "{\"role\":\"negotiator\"}", "accepted"},
-        {"entity-shentang", "world-grey-harbor", "character", "沈棠", {"沈代表"}, {"盐运商会", "谈判"},
+        {"entity-shentang", "world-synthetic-test", "character", "沈棠", {"沈代表"}, {"盐运商会", "谈判"},
          "盐运商会代表，重视交易信誉；担心暴雨造成货物滞留。", "{\"role\":\"merchant\"}", "accepted"},
-        {"entity-seal", "world-grey-harbor", "item", "议和印章", {"印章"}, {"唯一物品", "议和"},
+        {"entity-seal", "world-synthetic-test", "item", "议和印章", {"印章"}, {"唯一物品", "议和"},
          "谈判凭证，初始由沈棠持有。检查后可能发现伪造迹象。", "{\"unique\":true}", "accepted"},
-        {"entity-grey-harbor", "world-grey-harbor", "location", "灰港", {}, {"港口", "暴雨"},
+        {"entity-synthetic-test", "world-synthetic-test", "location", "测试场景", {}, {"港口", "暴雨"},
          "城卫署与盐运商会准备谈判的港城；暴雨期间渡口停航。", "{\"weather\":\"storm\"}", "accepted"},
-        {"entity-no-teleport", "world-grey-harbor", "rule", "禁止瞬间移动", {}, {"硬约束"},
+        {"entity-no-teleport", "world-synthetic-test", "rule", "禁止瞬间移动", {}, {"硬约束"},
          "当前世界不存在可用的瞬间移动方式。", "{\"severity\":\"hard\"}", "accepted"},
     };
     for (const auto& sample : samples) {
@@ -28,8 +28,9 @@ xuyan::domain::Result<bool> WorkspaceService::installTestFixture() {
     return xuyan::domain::Result<bool>::success(true);
 }
 
-xuyan::domain::Result<bool> CharacterService::installTestFixture() {
-    xuyan::storage::WorkspaceRepository repository(database_path_);
+/** @brief 在测试工作区显式创建一张合成人物卡；已有卡片时保持原状。 */
+xuyan::domain::Result<bool> installSyntheticBlueprint(const std::filesystem::path& database_path) {
+    xuyan::storage::WorkspaceRepository repository(database_path);
     auto existing = repository.listBlueprints();
     if (!existing.ok()) return xuyan::domain::Result<bool>::failure(*existing.error);
     if (!existing.value->empty()) return xuyan::domain::Result<bool>::success(false);
@@ -51,4 +52,4 @@ xuyan::domain::Result<bool> CharacterService::installTestFixture() {
     return xuyan::domain::Result<bool>::success(true);
 }
 
-} // namespace xuyan::application
+} // namespace xuyan::test

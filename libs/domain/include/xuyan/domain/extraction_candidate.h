@@ -3,7 +3,9 @@
 #include "xuyan/domain/scenario.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace xuyan::domain {
 
@@ -26,6 +28,15 @@ struct ExtractionCandidate {
     int revision{0};
 };
 
+/** @brief 保存按世界、来源和审核状态查询的一页候选及匹配总数。 */
+struct ExtractionCandidatePage {
+    std::vector<ExtractionCandidate> items;
+    std::uint64_t total{0};
+    int limit{0};
+    std::int64_t offset{0};
+};
+
+/** @brief 校验待审核抽取候选及其原文证据范围。 */
 Result<ExtractionCandidate> validateExtractionCandidate(ExtractionCandidate candidate);
 
 } // namespace xuyan::domain

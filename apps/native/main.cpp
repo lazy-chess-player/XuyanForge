@@ -1,4 +1,3 @@
-#include "simulation_view_model.h"
 #include "workspace_view_model.h"
 #include "workspace_catalog_view_model.h"
 #include "source_view_model.h"
@@ -17,7 +16,9 @@
 #include <QFileInfo>
 #include <QQuickWindow>
 #include <QTimer>
+#include <QTranslator>
 
+// 初始化本地工作区和界面服务，并按需生成无样例数据的界面预览。
 int main(int argc, char* argv[]) {
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QGuiApplication application(argc, argv);
@@ -39,7 +40,6 @@ int main(int argc, char* argv[]) {
     const auto themePreviewIndex = arguments.indexOf(QStringLiteral("--theme-preview"));
     if (screenshotIndex >= 0 && themePreviewIndex >= 0 && themePreviewIndex + 1 < arguments.size())
         workspaceCatalog.setThemeId(arguments.at(themePreviewIndex + 1));
-    SimulationViewModel simulation(databasePath);
     WorkspaceViewModel workspace(databasePath);
     SourceViewModel sources(databasePath);
     CharacterViewModel characters(databasePath);
@@ -56,8 +56,24 @@ int main(int argc, char* argv[]) {
                      &worldViews, [&workspaceCatalog, &worldViews] {
         worldViews.setWorldId(workspaceCatalog.activeWorldId());
     });
+    // 当前世界是小说、解析任务和候选校对的共同数据边界。
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::changed,
+                     &sources, [&workspaceCatalog, &sources] {
+        sources.setWorldId(workspaceCatalog.activeWorldId());
+    });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::changed,
+                     &extractionJobs, [&workspaceCatalog, &extractionJobs] {
+        extractionJobs.setWorldId(workspaceCatalog.activeWorldId());
+    });
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::changed,
+                     &candidateReview, [&workspaceCatalog, &candidateReview] {
+        candidateReview.setWorldId(workspaceCatalog.activeWorldId());
+    });
     workspace.setWorldId(workspaceCatalog.activeWorldId());
     worldViews.setWorldId(workspaceCatalog.activeWorldId());
+    sources.setWorldId(workspaceCatalog.activeWorldId());
+    extractionJobs.setWorldId(workspaceCatalog.activeWorldId());
+    candidateReview.setWorldId(workspaceCatalog.activeWorldId());
     QObject::connect(&packages, &PackageViewModel::worldImported, &workspace, [&workspace] { workspace.refresh(); });
     QObject::connect(&packages, &PackageViewModel::characterImported, &characters, [&characters] { characters.refresh(); });
     QObject::connect(&packages, &PackageViewModel::backupRestored, &workspaceCatalog,
@@ -70,7 +86,17 @@ int main(int argc, char* argv[]) {
                      &workspaceCatalog, [&workspaceCatalog] { workspaceCatalog.refreshWorlds(); });
 
     QQmlApplicationEngine engine;
-    engine.rootContext()->setContextProperty(QStringLiteral("simulation"), &simulation);
+    QTranslator applicationTranslator;
+    QObject::connect(&workspaceCatalog, &WorkspaceCatalogViewModel::languageChanged,
+                     &engine, [&application, &engine, &applicationTranslator, &workspaceCatalog] {
+        application.removeTranslator(&applicationTranslator);
+        if (workspaceCatalog.languageId() != QStringLiteral("zh-CN")) {
+            const auto directory = QCoreApplication::applicationDirPath() + QStringLiteral("/translations");
+            if (applicationTranslator.load(QStringLiteral("xuyanforge_") + workspaceCatalog.languageId(), directory))
+                application.installTranslator(&applicationTranslator);
+        }
+        engine.retranslate();
+    });
     engine.rootContext()->setContextProperty(QStringLiteral("workspace"), &workspace);
     engine.rootContext()->setContextProperty(QStringLiteral("workspaceCatalog"), &workspaceCatalog);
     engine.rootContext()->setContextProperty(QStringLiteral("sources"), &sources);

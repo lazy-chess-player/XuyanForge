@@ -10,7 +10,7 @@ xuyan::domain::Result<xuyan::domain::ActorContext> buildActorContext(
     if (actor == nullptr) return xuyan::domain::Result<xuyan::domain::ActorContext>::failure(
         {xuyan::domain::ErrorCode::missing_context, "人物不在当前分支状态中", false, "刷新人物绑定"});
     xuyan::domain::ActorContext context; context.actor_id = actor_id; context.input_commit_id = input_commit_id;
-    context.visible_facts = {"灰港正值暴雨", "翌日将举行议和谈判", "议和印章当前持有人：" + state.seal_holder_id};
+    context.visible_facts = {"测试场景正值暴雨", "翌日将举行议和谈判", "议和印章当前持有人：" + state.seal_holder_id};
     if (actor->knows_gate_closure) context.visible_facts.push_back("北门今夜封闭");
     if (actor->knows_seal_forgery) context.visible_facts.push_back("议和印章存在伪造迹象");
     std::ostringstream serialized; serialized << "actor=" << actor_id << "\ninput_commit=" << input_commit_id;

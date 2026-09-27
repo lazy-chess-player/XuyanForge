@@ -21,6 +21,8 @@ WorkspaceCatalogViewModel::WorkspaceCatalogViewModel(std::filesystem::path datab
     loadRecent();
     theme_id_ = QSettings().value(QStringLiteral("appearance/themeId"), QStringLiteral("dark")).toString();
     if (theme_id_ != QStringLiteral("dark") && theme_id_ != QStringLiteral("light")) theme_id_ = QStringLiteral("dark");
+    language_id_ = QSettings().value(QStringLiteral("appearance/languageId"), QStringLiteral("zh-CN")).toString();
+    if (language_id_ != QStringLiteral("zh-CN")) language_id_ = QStringLiteral("zh-CN");
     if (!QCoreApplication::arguments().contains(QStringLiteral("--screenshot")))
         registerRecent(QString::fromStdWString(database_path_.stem().wstring()), currentPath());
     refreshWorlds();
@@ -53,7 +55,7 @@ void WorkspaceCatalogViewModel::createWorld(QString name, const QUrl& novel_file
         error_text_ = QStringLiteral("世界名称不能为空且不能超过 120 个字符"); emit changed(); return;
     }
     if (!novel_file.isEmpty() && !novel_file.isLocalFile()) {
-        error_text_ = QStringLiteral("请选择本机 TXT 或 Markdown 小说"); emit changed(); return;
+        error_text_ = QStringLiteral("请选择本机纯文本或标记文本小说"); emit changed(); return;
     }
     busy_ = true; error_text_.clear(); created_source_id_.clear(); created_chapter_count_ = 0;
     status_text_ = QStringLiteral("正在创建世界并解析章节…"); emit changed();
@@ -110,6 +112,14 @@ void WorkspaceCatalogViewModel::setThemeId(QString theme_id) {
     if (theme_id_ == theme_id) return;
     theme_id_ = std::move(theme_id);
     QSettings settings; settings.setValue(QStringLiteral("appearance/themeId"), theme_id_); settings.sync();
+    emit changed();
+}
+
+void WorkspaceCatalogViewModel::setLanguageId(QString language_id) {
+    if (language_id != QStringLiteral("zh-CN") || language_id == language_id_) return;
+    language_id_ = std::move(language_id);
+    QSettings settings; settings.setValue(QStringLiteral("appearance/languageId"), language_id_); settings.sync();
+    emit languageChanged();
     emit changed();
 }
 
@@ -196,7 +206,7 @@ void WorkspaceCatalogViewModel::createWorkspace(QString name) {
 }
 
 void WorkspaceCatalogViewModel::openWorkspace(const QUrl& source) {
-    if (!source.isLocalFile()) { error_text_ = QStringLiteral("请选择本机 SQLite 工作区文件"); emit changed(); return; }
+    if (!source.isLocalFile()) { error_text_ = QStringLiteral("请选择本机工作区数据库文件"); emit changed(); return; }
     const auto path = source.toLocalFile();
     initializeAndSwitch(QFileInfo(path).completeBaseName(), std::filesystem::path(path.toStdWString()));
 }

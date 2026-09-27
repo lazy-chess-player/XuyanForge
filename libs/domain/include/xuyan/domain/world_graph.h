@@ -63,9 +63,13 @@ struct MapView {
     std::vector<TravelRoute> routes;
 };
 
+/** @brief 校验时间线事件及其前因后果引用。 */
 Result<TimelineEvent> validateTimelineEvent(TimelineEvent event);
+/** @brief 校验有向关系、有效时间和可见性。 */
 Result<DirectedRelation> validateDirectedRelation(DirectedRelation relation);
+/** @brief 校验地点的层级位置和可选地图坐标。 */
 Result<LocationPlacement> validateLocationPlacement(LocationPlacement placement);
+/** @brief 校验地点间路线、耗时和方向。 */
 Result<TravelRoute> validateTravelRoute(TravelRoute route);
 
 } // namespace xuyan::domain

@@ -35,6 +35,6 @@ private:
     std::filesystem::path database_path_;
     QVariantList connections_;
     bool busy_{false};
-    QString status_text_{QStringLiteral("凭据由 Windows 凭据管理器保护")};
+    QString status_text_{QStringLiteral("凭据由系统凭据管理器保护")};
     QString error_text_;
 };

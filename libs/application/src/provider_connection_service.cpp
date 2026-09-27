@@ -30,6 +30,7 @@ Result<ProviderConnection> ProviderConnectionService::save(
     if (new_secret && (new_secret->empty() || new_secret->size() > 65536)) return Result<ProviderConnection>::failure(
         {ErrorCode::validation_failed, "API Key 不能为空且不能超过 64 KiB", false, "重新输入凭据"});
 
+    // 数据库提交失败时恢复旧凭据，使系统凭据与连接元数据尽量保持一致。
     std::optional<std::string> previous_secret;
     if (new_secret) {
         auto previous = credentials_.get(validated.value->credential_ref);

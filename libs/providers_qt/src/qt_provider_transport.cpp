@@ -19,6 +19,7 @@ xuyan::domain::Result<xuyan::application::ProviderTransportResponse> QtProviderT
 
     QNetworkAccessManager manager;
     QNetworkRequest network_request(url);
+    // 仅允许不降低传输安全等级的重定向；密钥在发送前才加入请求头。
     network_request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                                  QNetworkRequest::NoLessSafeRedirectPolicy);
     network_request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("XuyanForge/0.0.1 provider-client"));
@@ -41,6 +42,7 @@ xuyan::domain::Result<xuyan::application::ProviderTransportResponse> QtProviderT
     bool timed_out = false;
     bool too_large = false;
     constexpr qsizetype maximum_response_bytes = 2 * 1024 * 1024;
+    // 边接收边限制响应体大小，避免异常端点耗尽内存。
     QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&] {
         response_body += reply->readAll();
         if (response_body.size() > maximum_response_bytes) {
@@ -54,6 +56,7 @@ xuyan::domain::Result<xuyan::application::ProviderTransportResponse> QtProviderT
         reply->abort();
     });
     timer.start(timeout_ms);
+    // 本地事件循环只等待本次请求，超时后主动中止网络回复。
     loop.exec();
     response_body += reply->readAll();
     timer.stop();

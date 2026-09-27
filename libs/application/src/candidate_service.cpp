@@ -15,10 +15,12 @@ using xuyan::domain::ErrorCode;
 using xuyan::domain::Result;
 using xuyan::package::JsonValue;
 
+/** @brief 从候选 JSON 对象读取必需字段；非对象时返回空指针。 */
 const JsonValue* required(const JsonValue& object, std::string_view key) {
     return object.isObject() ? object.find(key) : nullptr;
 }
 
+/** @brief 将模型输出的协议错误转为拒绝提交的可报告结果。 */
 Result<xuyan::domain::ExtractionJob> protocolError(std::string message) {
     return Result<xuyan::domain::ExtractionJob>::failure(
         {ErrorCode::validation_failed, std::move(message), false, "拒绝该输出并检查模型协议"});
@@ -52,6 +54,7 @@ Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
             || (step->status != "running" && step->status != "completed") || step->attempt != expected_attempt)
             return Result<xuyan::domain::ExtractionJob>::failure(
                 {ErrorCode::revision_conflict, "候选对应的步骤尝试已过期", false, "刷新任务后重试"});
+        // 重新读取不可变原文，不信任模型报告的引文文本或码点范围。
         SourceImportService sources(database_path_);
         auto step_text = sources.evidenceText(job.value->source_id,
                                               step->start_codepoint, step->end_codepoint);
@@ -101,6 +104,18 @@ Result<std::vector<xuyan::domain::ExtractionCandidate>> CandidateService::list(c
         {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }
 
+Result<xuyan::domain::ExtractionCandidatePage> CandidateService::listPage(
+    const std::string& world_id, const std::string& source_id,
+    const std::string& review_status, int limit, std::int64_t offset) {
+    try {
+        return xuyan::storage::WorkspaceRepository(database_path_).listExtractionCandidatesPage(
+            world_id, source_id, review_status, limit, offset);
+    } catch (const std::exception& exception) {
+        return Result<xuyan::domain::ExtractionCandidatePage>::failure(
+            {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"});
+    }
+}
+
 Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
     const std::string& command_id, const std::string& candidate_id, int expected_revision,
     const std::string& review_status, const std::string& name,
@@ -116,6 +131,7 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
         candidate.name = name; candidate.fields_json = xuyan::package::writeJson(*fields.value);
         candidate.provenance_type = provenance_type; candidate.review_status = review_status;
         std::optional<xuyan::domain::WorldEntity> entity;
+        // 接受候选时仍按来源类型区分事实、原文人物说法和模型假设。
         if (review_status == "accepted") {
             auto source = repository.loadSource(candidate.source_id);
             if (!source.ok()) return Result<xuyan::domain::ExtractionCandidate>::failure(*source.error);

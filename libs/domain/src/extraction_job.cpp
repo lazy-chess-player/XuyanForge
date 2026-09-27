@@ -9,6 +9,11 @@ Result<ExtractionJob> validateExtractionJob(ExtractionJob job) {
     if (job.id.empty() || job.source_id.empty() || job.steps.empty() || job.steps.size() > 100000)
         return Result<ExtractionJob>::failure(
             {ErrorCode::validation_failed, "提取任务缺少 ID、来源或有效步骤", false, "重新创建任务"});
+    if ((job.provider_connection_id.empty() && (!job.model_id.empty() || !job.provider_connection_fingerprint.empty()))
+        || (!job.provider_connection_id.empty()
+            && (job.model_id.empty() || job.provider_connection_fingerprint.size() != 64)))
+        return Result<ExtractionJob>::failure(
+            {ErrorCode::validation_failed, "提取任务的模型连接快照无效", false, "重新选择模型连接并创建任务"});
     std::size_t previous_start = 0;
     for (std::size_t index = 0; index < job.steps.size(); ++index) {
         auto& step = job.steps[index];

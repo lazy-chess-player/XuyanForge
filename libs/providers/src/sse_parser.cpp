@@ -8,10 +8,12 @@ namespace {
 using xuyan::domain::Error;
 using xuyan::domain::ErrorCode;
 
+/** @brief 构造事件流不完整或越界时的非重试错误。 */
 Error incomplete(std::string message) {
     return Error{ErrorCode::validation_failed, std::move(message), false, "保留原始响应并将请求标记为输出不完整"};
 }
 
+/** @brief 严格检查事件数据的 UTF-8 编码，包括过长编码与代理项。 */
 bool validUtf8(std::string_view text) {
     std::size_t index = 0;
     while (index < text.size()) {
@@ -70,6 +72,7 @@ xuyan::domain::Result<std::vector<SseEvent>> SseParser::finish() {
 
 xuyan::domain::Result<std::vector<SseEvent>> SseParser::parseAvailable(bool end_of_stream) {
     std::vector<SseEvent> events;
+    // 仅消费完整的空行分隔帧，半帧继续保存在缓冲区。
     for (;;) {
         const auto lf = buffer_.find("\n\n");
         const auto crlf = buffer_.find("\r\n\r\n");
@@ -134,4 +137,3 @@ xuyan::domain::Result<SseEvent> SseParser::parseFrame(std::string_view frame) {
 }
 
 } // namespace xuyan::providers
-

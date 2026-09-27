@@ -84,7 +84,7 @@ void ProviderViewModel::saveConnection(QString id, int revision, QString name, Q
         }
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, values = std::move(values), error] () mutable {
-            if (self) self->finish(std::move(values), error.isEmpty() ? QStringLiteral("连接已保存；API Key 未写入工作区") : QString{}, error);
+            if (self) self->finish(std::move(values), error.isEmpty() ? QStringLiteral("连接已保存；模型密钥未写入工作区") : QString{}, error);
         }, Qt::QueuedConnection);
     });
 }
@@ -126,7 +126,7 @@ void ProviderViewModel::probeConnection(QString id) {
         if (error.isEmpty() && loaded.value->kind != "local") {
             xuyan::platform::SystemCredentialStore credentials;
             auto credential = credentials.get(loaded.value->credential_ref);
-            if (!credential.ok()) error = QStringLiteral("缺少系统凭据，请先输入 API Key 并保存");
+            if (!credential.ok()) error = QStringLiteral("缺少系统凭据，请先输入模型密钥并保存");
             else secret = std::move(*credential.value);
         }
         if (error.isEmpty()) {
@@ -151,9 +151,9 @@ void ProviderViewModel::probeConnection(QString id) {
             timer.start(10000); loop.exec();
             const auto http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
             if (!timer.isActive()) error = QStringLiteral("端点验证超时（10 秒），未修改连接配置");
-            else if (http >= 200 && http < 300) status = QStringLiteral("端点验证成功（HTTP %1）；具体模型能力仍需逐项验证").arg(http);
-            else if (http == 401 || http == 403) error = QStringLiteral("端点可达，但凭据被拒绝（HTTP %1）").arg(http);
-            else if (http > 0) error = QStringLiteral("端点返回 HTTP %1；请检查 base URL 和协议类型").arg(http);
+            else if (http >= 200 && http < 300) status = QStringLiteral("接口验证成功（状态码 %1）；具体模型能力仍需逐项验证").arg(http);
+            else if (http == 401 || http == 403) error = QStringLiteral("接口可达，但凭据被拒绝（状态码 %1）").arg(http);
+            else if (http > 0) error = QStringLiteral("接口返回状态码 %1；请检查接口地址和协议类型").arg(http);
             else error = QStringLiteral("无法连接端点：%1").arg(reply->errorString());
             reply->deleteLater();
         }
@@ -185,7 +185,7 @@ void ProviderViewModel::testStructuredGeneration(QString id) {
                 error = QStringLiteral("结构化生成失败：%1；未推进任何推演分支")
                     .arg(QString::fromStdString(report.value->failure_kind));
             } else {
-                status = QStringLiteral("真实生成成功 · %1 · JSON 已验证 · %2/%3 tokens · %4 ms")
+                status = QStringLiteral("真实生成成功 · %1 · 结构化内容已验证 · %2/%3 词元 · %4 毫秒")
                     .arg(QString::fromStdString(report.value->model_id))
                     .arg(report.value->input_tokens).arg(report.value->output_tokens).arg(report.value->elapsed_ms);
             }

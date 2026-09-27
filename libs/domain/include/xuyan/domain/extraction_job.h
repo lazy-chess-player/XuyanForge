@@ -50,6 +50,7 @@ struct ExtractionJob {
     std::string prompt_version{"extract-v1"};
     std::string provider_connection_id;
     std::string model_id;
+    std::string provider_connection_fingerprint;
     int total_steps{0};
     int completed_steps{0};
     bool cancel_requested{false};
@@ -58,6 +59,7 @@ struct ExtractionJob {
     std::vector<ExtractionStep> steps;
 };
 
+/** @brief 校验解析任务状态、步骤与预算的一致性。 */
 Result<ExtractionJob> validateExtractionJob(ExtractionJob job);
 
 } // namespace xuyan::domain

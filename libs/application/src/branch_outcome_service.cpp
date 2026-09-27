@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -20,13 +21,16 @@ using xuyan::domain::ErrorCode;
 using xuyan::domain::Result;
 using xuyan::package::JsonValue;
 
+/** @brief 将布尔值转成诊断和导出使用的稳定文本。 */
 std::string booleanText(bool value) { return value ? "true" : "false"; }
 
+/** @brief 仅在两个分支字段不同的情况下加入差异项。 */
 void addDifference(std::vector<BranchDifference>& result, std::string field,
                    const std::string& left, const std::string& right) {
     if (left != right) result.push_back({std::move(field), left, right});
 }
 
+/** @brief 先写临时文件再替换目标；替换失败时尝试恢复原文件。 */
 Result<std::string> writeAtomically(const std::filesystem::path& destination, const std::string& content) {
     if (destination.empty()) return Result<std::string>::failure(
         {ErrorCode::validation_failed, "导出路径不能为空", false, "选择目标文件"});
@@ -61,6 +65,7 @@ Result<std::string> writeAtomically(const std::filesystem::path& destination, co
     }
 }
 
+/** @brief 沿父提交链收集共同祖先之后的提交，并按时间顺序返回。 */
 std::vector<std::string> chainAfter(xuyan::storage::WorkspaceRepository& repository,
                                     const std::string& head, const std::string& ancestor) {
     std::vector<std::string> result;
@@ -75,6 +80,7 @@ std::vector<std::string> chainAfter(xuyan::storage::WorkspaceRepository& reposit
     return result;
 }
 
+/** @brief 将一个推演会话的调用次数与令牌用量累计到指定比较侧。 */
 void addCost(BranchComparison& comparison, const xuyan::domain::SimulationSession& session, bool left) {
     int input = 0, output = 0;
     for (const auto& turn : session.turns) { input += turn.call.input_tokens; output += turn.call.output_tokens; }
@@ -87,13 +93,13 @@ void addCost(BranchComparison& comparison, const xuyan::domain::SimulationSessio
     }
 }
 
+/** @brief 将当前分支状态压缩成不依赖固定人物名称的可读概览。 */
 std::string stateSummary(const CommitView& head) {
-    const auto* xu = xuyan::domain::findCharacter(head.state, "actor-xucheng");
-    const auto* shen = xuyan::domain::findCharacter(head.state, "actor-shentang");
     std::ostringstream out;
-    out << "回合 " << head.state.turn << "；印章持有人 " << head.state.seal_holder_id
-        << "；已检查=" << booleanText(head.state.seal_inspected)
-        << "；许澄信任=" << (xu ? xu->trust : 0) << "；沈棠信任=" << (shen ? shen->trust : 0);
+    out << "回合 " << head.state.turn << "；唯一物品持有人 " << head.state.seal_holder_id
+        << "；已检查=" << booleanText(head.state.seal_inspected);
+    for (const auto& actor : head.state.characters)
+        out << "；" << (actor.name.empty() ? actor.id : actor.name) << "信任=" << actor.trust;
     return out.str();
 }
 
@@ -135,14 +141,17 @@ Result<BranchComparison> BranchOutcomeService::compare(
         addDifference(result.differences, "seal_holder_id", left.value->state.seal_holder_id, right.value->state.seal_holder_id);
         addDifference(result.differences, "seal_inspected", booleanText(left.value->state.seal_inspected), booleanText(right.value->state.seal_inspected));
         addDifference(result.differences, "completed", booleanText(left.value->state.completed), booleanText(right.value->state.completed));
-        for (const auto& actor_id : {std::string{"actor-xucheng"}, std::string{"actor-shentang"}}) {
+        std::set<std::string> actor_ids;
+        for (const auto& actor : left.value->state.characters) actor_ids.insert(actor.id);
+        for (const auto& actor : right.value->state.characters) actor_ids.insert(actor.id);
+        for (const auto& actor_id : actor_ids) {
             const auto* l = xuyan::domain::findCharacter(left.value->state, actor_id);
             const auto* r = xuyan::domain::findCharacter(right.value->state, actor_id);
-            if (l && r) {
-                addDifference(result.differences, actor_id + ".knows_gate_closure", booleanText(l->knows_gate_closure), booleanText(r->knows_gate_closure));
-                addDifference(result.differences, actor_id + ".knows_seal_forgery", booleanText(l->knows_seal_forgery), booleanText(r->knows_seal_forgery));
-                addDifference(result.differences, actor_id + ".trust", std::to_string(l->trust), std::to_string(r->trust));
-            }
+            addDifference(result.differences, actor_id + ".present", booleanText(l != nullptr), booleanText(r != nullptr));
+            if (!l || !r) continue;
+            addDifference(result.differences, actor_id + ".knows_gate_closure", booleanText(l->knows_gate_closure), booleanText(r->knows_gate_closure));
+            addDifference(result.differences, actor_id + ".knows_seal_forgery", booleanText(l->knows_seal_forgery), booleanText(r->knows_seal_forgery));
+            addDifference(result.differences, actor_id + ".trust", std::to_string(l->trust), std::to_string(r->trust));
         }
         auto sessions = repository.listSimulationSessions();
         if (!sessions.ok()) return Result<BranchComparison>::failure(*sessions.error);

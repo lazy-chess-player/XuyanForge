@@ -13,6 +13,7 @@ namespace {
 using xuyan::domain::ErrorCode;
 using xuyan::domain::Result;
 
+/** @brief 将一个已验证的 Unicode 码点附加为 UTF-8 字节序列。 */
 void appendUtf8(std::string& output, char32_t codepoint) {
     if (codepoint <= 0x7f) output.push_back(static_cast<char>(codepoint));
     else if (codepoint <= 0x7ff) {
@@ -30,6 +31,7 @@ void appendUtf8(std::string& output, char32_t codepoint) {
     }
 }
 
+/** @brief 按 BOM 指定的字节序解码 UTF-16，并拒绝不完整或孤立代理项。 */
 Result<DecodedSourceText> decodeUtf16(std::string_view bytes, bool little_endian) {
     if (bytes.size() < 2 || (bytes.size() - 2) % 2 != 0) return Result<DecodedSourceText>::failure(
         {ErrorCode::validation_failed, "UTF-16 来源字节数无效", false, "检查文件是否完整"});
@@ -40,6 +42,7 @@ Result<DecodedSourceText> decodeUtf16(std::string_view bytes, bool little_endian
         std::uint16_t unit = little_endian ? static_cast<std::uint16_t>(first | (second << 8))
                                            : static_cast<std::uint16_t>((first << 8) | second);
         char32_t codepoint = unit;
+        // 代理项必须成对出现；组合后再编码为一个 Unicode 码点。
         if (unit >= 0xd800 && unit <= 0xdbff) {
             if (offset + 3 >= bytes.size()) return Result<DecodedSourceText>::failure(
                 {ErrorCode::validation_failed, "UTF-16 高代理项缺少低代理项", false, "修复来源编码"});
@@ -61,6 +64,7 @@ Result<DecodedSourceText> decodeUtf16(std::string_view bytes, bool little_endian
 }
 
 #ifdef _WIN32
+/** @brief 使用 Windows 编码转换接口把 GB18030 字节转成标准化 UTF-8。 */
 Result<DecodedSourceText> decodeGb18030(std::string_view bytes) {
     const auto wide_count = MultiByteToWideChar(54936, MB_ERR_INVALID_CHARS, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
     if (wide_count <= 0) return Result<DecodedSourceText>::failure(
@@ -81,6 +85,7 @@ Result<DecodedSourceText> decodeGb18030(std::string_view bytes) {
 } // namespace
 
 Result<DecodedSourceText> decodeSourceText(std::string_view bytes) {
+    // 明确 BOM 优先；无 BOM 时先严格尝试 UTF-8，Windows 才回退 GB18030。
     if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xff && static_cast<unsigned char>(bytes[1]) == 0xfe)
         return decodeUtf16(bytes, true);
     if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xfe && static_cast<unsigned char>(bytes[1]) == 0xff)

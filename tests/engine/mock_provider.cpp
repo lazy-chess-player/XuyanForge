@@ -14,7 +14,7 @@ xuyan::domain::Result<MockStepResult> MockProvider::next(const xuyan::domain::Sc
     }
     if (input.completed || input.turn >= 3) {
         return Result<MockStepResult>::failure(
-            Error{ErrorCode::validation_failed, "灰港样例的三个回合已完成", false, "从检查点创建新分支"});
+            Error{ErrorCode::validation_failed, "测试场景样例的三个回合已完成", false, "从检查点创建新分支"});
     }
 
     std::this_thread::sleep_for(latency_);

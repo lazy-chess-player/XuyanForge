@@ -14,6 +14,7 @@
 namespace xuyan::application {
 namespace {
 
+/** @brief 生成离线步骤的稳定命令 ID，避免恢复后重复提交。 */
 std::string commandId(std::string_view prefix, const std::string& job_id, int revision) {
     return std::string(prefix) + '-' + xuyan::domain::sha256(job_id + '|' + std::to_string(revision)).substr(0, 24);
 }
@@ -31,11 +32,16 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> MockExtractionProcessor::pro
     auto claimed = jobs.claimNext(commandId("mock-claim", job_id, job.value->revision), job_id, job.value->revision);
     if (!claimed.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*claimed.error);
     SourceImportService sources(database_path_);
-    auto full_text = sources.loadNormalizedText(job.value->source_id);
-    if (!full_text.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*full_text.error);
-    auto chunk = xuyan::domain::codepointSlice(*full_text.value, claimed.value->start_codepoint, claimed.value->end_codepoint);
-    if (!chunk.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*chunk.error);
+    auto chunk = sources.evidenceText(job.value->source_id,
+                                      claimed.value->start_codepoint, claimed.value->end_codepoint);
+    if (!chunk.ok()) {
+        // 已领取步骤必须落盘为终结失败，不能因本地资产损坏而永久停在运行中。
+        return jobs.finishStep(commandId("mock-missing-source", job_id, job.value->revision), job_id,
+                               claimed.value->ordinal, claimed.value->attempt, "failed", {},
+                               "原文片段无法读取；请检查工作区资产后重试");
+    }
 
+    // 只对原文句段打启发式分数，离线样本不会读取凭据或访问网络。
     struct Sentence {
         std::size_t start_byte;
         std::size_t end_byte;
@@ -65,6 +71,7 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> MockExtractionProcessor::pro
             ranked.push_back({sentence_start_byte, byte, sentence_start_cp, codepoint, score});
         sentence_start_byte = byte; sentence_start_cp = codepoint;
     }
+    // 最多挑选五个动作句，再恢复原文顺序以便人工对照证据。
     std::stable_sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
         return left.score > right.score;
     });

@@ -13,31 +13,37 @@ namespace {
 using xuyan::domain::Error;
 using xuyan::domain::ErrorCode;
 
+/** @brief 构造无须自动重试的包格式校验错误。 */
 Error packageError(std::string message) {
     return Error{ErrorCode::validation_failed, std::move(message), false, "检查包文件后重试"};
 }
 
+/** @brief 向 ZIP 字节流写入小端 16 位整数。 */
 void put16(std::string& output, std::uint16_t value) {
     output.push_back(static_cast<char>(value & 0xff));
     output.push_back(static_cast<char>((value >> 8) & 0xff));
 }
 
+/** @brief 向 ZIP 字节流写入小端 32 位整数。 */
 void put32(std::string& output, std::uint32_t value) {
     put16(output, static_cast<std::uint16_t>(value & 0xffff));
     put16(output, static_cast<std::uint16_t>((value >> 16) & 0xffff));
 }
 
+/** @brief 按小端格式读取 16 位 ZIP 字段，越界时抛出异常。 */
 std::uint16_t get16(std::string_view input, std::size_t offset) {
     if (offset + 2 > input.size()) throw std::runtime_error("ZIP 字段被截断");
     return static_cast<std::uint16_t>(static_cast<unsigned char>(input[offset]))
          | static_cast<std::uint16_t>(static_cast<unsigned char>(input[offset + 1]) << 8);
 }
 
+/** @brief 按小端格式读取 32 位 ZIP 字段，越界时抛出异常。 */
 std::uint32_t get32(std::string_view input, std::size_t offset) {
     return static_cast<std::uint32_t>(get16(input, offset))
          | (static_cast<std::uint32_t>(get16(input, offset + 2)) << 16);
 }
 
+/** @brief 在大小上限内读取 ZIP 文件的全部字节。 */
 std::string readBounded(const std::filesystem::path& source, std::size_t maximum) {
     std::error_code error;
     const auto size = std::filesystem::file_size(source, error);
@@ -79,6 +85,7 @@ bool safePackagePath(std::string_view path) {
 xuyan::domain::Result<std::string> writeZip(const std::filesystem::path& destination,
                                             const std::vector<ZipEntry>& entries) {
     try {
+        // 先写各条目的本地文件头和数据，末尾再生成中央目录索引。
         if (entries.size() > 65535) throw std::runtime_error("ZIP 条目数量超过格式上限");
         struct Central { std::string name; std::uint32_t crc; std::uint32_t size; std::uint32_t offset; };
         std::vector<Central> central;

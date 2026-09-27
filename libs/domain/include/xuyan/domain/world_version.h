@@ -33,7 +33,9 @@ struct HistoricalSnapshot {
     std::vector<std::string> unresolved_entity_ids;
 };
 
+/** @brief 校验已发布世界版本与实体修订清单。 */
 Result<WorldVersion> validateWorldVersion(WorldVersion version);
+/** @brief 校验指定故事时间的历史快照及未决实体记录。 */
 Result<HistoricalSnapshot> validateHistoricalSnapshot(HistoricalSnapshot snapshot);
 
 } // namespace xuyan::domain

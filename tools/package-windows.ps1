@@ -1,18 +1,28 @@
 param(
     [string]$BuildDirectory = "build/windows-release",
-    [string]$OutputDirectory = "build/windows-package",
+    [string]$OutputDirectory = ("build/windows-package-" + [DateTime]::UtcNow.ToString("yyyyMMddHHmmss") + "-" + [Guid]::NewGuid().ToString("N")),
     [switch]$CreatePortableZip,
     [switch]$CreateInstaller
 )
 
 $ErrorActionPreference = "Stop"
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$buildRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "build"))
 $buildPath = [System.IO.Path]::GetFullPath((Join-Path $projectRoot $BuildDirectory))
 $outputPath = [System.IO.Path]::GetFullPath((Join-Path $projectRoot $OutputDirectory))
+$buildPrefix = $buildRoot.TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+$sourcePrefix = $buildPath.TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
 
-if (-not $buildPath.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-    -not $outputPath.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Build and output directories must stay inside the XuyanForge workspace."
+if (-not $buildPath.StartsWith($buildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+    -not $outputPath.StartsWith($buildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $outputPath.Equals($buildPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $outputPath.StartsWith($sourcePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Build and output directories must be separate subdirectories of build."
+}
+
+if ((Test-Path -LiteralPath $outputPath) -and
+    (Get-ChildItem -LiteralPath $outputPath -Force | Select-Object -First 1)) {
+    throw "Output directory is not empty. Choose a fresh directory to avoid bundling stale files: $outputPath"
 }
 
 $executable = Join-Path $buildPath "xuyanforge_app.exe"
@@ -31,11 +41,23 @@ if ($LASTEXITCODE -ne 0) {
     throw "windeployqt failed with exit code $LASTEXITCODE"
 }
 
+$blockedExtensions = @('.sqlite', '.db', '.wal', '.shm', '.txt', '.md', '.key', '.pem')
+$blockedNames = @('core_tests.exe', 'stress_tests.exe', 'CMakeCache.txt', '.env')
+$unexpected = @(Get-ChildItem -LiteralPath $outputPath -Recurse -File -Force | Where-Object {
+    $blockedExtensions -contains $_.Extension.ToLowerInvariant() -or
+    $blockedNames -contains $_.Name
+})
+if ($unexpected.Count -gt 0) {
+    throw "Deployment contains non-product files; inspect the fresh output directory: $outputPath"
+}
+
 Write-Host "Windows deployment created at $outputPath"
 
+# PowerShell 5.1 may decode a UTF-8 script without BOM as a legacy code page.
 $manifest = @{
     product = "XuyanForge"
     version = "0.2-alpha"
+    version_label = ("0.2 " + [char]0x9884 + [char]0x89C8 + [char]0x7248)
     architecture = "x86_64"
     user_data_location = "Qt AppLocalDataLocation"
     uninstall_data_policy = "retain"
@@ -45,8 +67,8 @@ $manifest = @{
 Set-Content -LiteralPath (Join-Path $outputPath "release-manifest.json") -Value $manifest -Encoding UTF8
 
 if ($CreatePortableZip) {
-    $zipPath = Join-Path (Split-Path $outputPath -Parent) "XuyanForge-0.2-alpha-windows-x86_64-portable.zip"
-    if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+    $artifactId = [DateTime]::UtcNow.ToString("yyyyMMddHHmmss") + "-" + [Guid]::NewGuid().ToString("N")
+    $zipPath = Join-Path (Split-Path $outputPath -Parent) "XuyanForge-0.2-alpha-windows-x86_64-portable-$artifactId.zip"
     Compress-Archive -Path (Join-Path $outputPath "*") -DestinationPath $zipPath -CompressionLevel Optimal
     Write-Host "Portable archive created at $zipPath"
 }
@@ -54,8 +76,9 @@ if ($CreatePortableZip) {
 if ($CreateInstaller) {
     $makeNsis = Get-Command makensis -ErrorAction SilentlyContinue
     if (-not $makeNsis) { throw "NSIS makensis was not found. Install NSIS or omit -CreateInstaller." }
-    $installerPath = Join-Path (Split-Path $outputPath -Parent) "XuyanForge-0.2-alpha-windows-x86_64-setup.exe"
-    $scriptPath = Join-Path (Split-Path $outputPath -Parent) "xuyanforge-installer.generated.nsi"
+    $artifactId = [DateTime]::UtcNow.ToString("yyyyMMddHHmmss") + "-" + [Guid]::NewGuid().ToString("N")
+    $installerPath = Join-Path (Split-Path $outputPath -Parent) "XuyanForge-0.2-alpha-windows-x86_64-setup-$artifactId.exe"
+    $scriptPath = Join-Path (Split-Path $outputPath -Parent) "xuyanforge-installer-$artifactId.generated.nsi"
     $escapedOutput = $outputPath.Replace('$', '$$')
     $escapedInstaller = $installerPath.Replace('$', '$$')
     $nsis = @"

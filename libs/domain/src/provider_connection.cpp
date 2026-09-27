@@ -1,7 +1,10 @@
 #include "xuyan/domain/provider_connection.h"
 
+#include "xuyan/domain/hash.h"
+
 #include <algorithm>
 #include <array>
+#include <string_view>
 
 namespace xuyan::domain {
 
@@ -45,6 +48,25 @@ Result<ProviderConnection> validateProviderConnection(ProviderConnection connect
             {ErrorCode::validation_failed, "local_only 连接必须使用回环地址", false, "改用 localhost、127.0.0.1 或 [::1]"});
     }
     return Result<ProviderConnection>::success(std::move(connection));
+}
+
+std::string providerConnectionFingerprint(const ProviderConnection& connection) {
+    std::string material;
+    const auto append = [&material](std::string_view field) {
+        material += std::to_string(field.size());
+        material.push_back(':');
+        material.append(field);
+    };
+    append(connection.id);
+    append(connection.kind);
+    append(connection.endpoint);
+    append(connection.default_model);
+    append(connection.credential_ref);
+    append(connection.data_policy);
+    append(std::to_string(connection.revision));
+    append(connection.enabled ? "1" : "0");
+    append(connection.deleted ? "1" : "0");
+    return sha256(material);
 }
 
 } // namespace xuyan::domain
