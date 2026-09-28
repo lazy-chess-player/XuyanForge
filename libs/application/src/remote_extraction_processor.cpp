@@ -12,12 +12,14 @@
 
 #include <algorithm>
 #include <mutex>
+#include <type_traits>
 #include <unordered_set>
 
 namespace xuyan::application {
 namespace {
 
 using xuyan::domain::ExtractionJob;
+using xuyan::domain::ExtractionJobState;
 using xuyan::domain::Result;
 using xuyan::package::JsonValue;
 
@@ -70,10 +72,8 @@ private:
 };
 
 /** @brief 检测必须由人工结算或恢复的步骤，防止跳过未知结果继续消耗预算。 */
-bool needsAttention(const ExtractionJob& job) {
-    return job.status == "needs_attention" || std::any_of(job.steps.begin(), job.steps.end(), [](const auto& step) {
-        return step.status == "running" || step.status == "failed" || step.status == "unknown";
-    });
+bool needsAttention(const ExtractionJobState& job) {
+    return job.requires_attention;
 }
 
 /** @brief 为同一步骤/尝试生成稳定命令 ID，使领取与完成回报可安全重放。 */
@@ -83,8 +83,9 @@ std::string commandId(std::string_view prefix, const std::string& job_id, int or
 }
 
 /** @brief 构造可直接展示给用户的校验失败结果，不包含请求正文或凭据。 */
-Result<ExtractionJob> error(std::string message) {
-    return Result<ExtractionJob>::failure(
+template<class JobResult = ExtractionJobState>
+Result<JobResult> error(std::string message) {
+    return Result<JobResult>::failure(
         {xuyan::domain::ErrorCode::validation_failed, std::move(message), false, "检查模型连接或该步骤后重试"});
 }
 
@@ -97,10 +98,10 @@ RemoteExtractionProcessor::RemoteExtractionProcessor(std::filesystem::path datab
 Result<ExtractionJob> RemoteExtractionProcessor::processNext(const std::string& job_id) {
     try {
         ExecutionLease lease(database_path_, job_id);
-        if (!lease.acquired()) return error("此解析任务已有执行者；请等待当前调用停止");
-        return processNextUnchecked(job_id);
+        if (!lease.acquired()) return error<ExtractionJob>("此解析任务已有执行者；请等待当前调用停止");
+        return processNextUnchecked<ExtractionJob>(job_id);
     } catch (...) {
-        return error("远程解析发生内部错误；请检查持久化任务状态，详情已隐藏");
+        return error<ExtractionJob>("远程解析发生内部错误；请检查持久化任务状态，详情已隐藏");
     }
 }
 
@@ -115,7 +116,7 @@ Result<RemoteBatchResult> RemoteExtractionProcessor::processBatch(
         if (!lease.acquired()) return BatchResult::failure({xuyan::domain::ErrorCode::rule_conflict,
             "此解析任务已有执行者", false, "等待当前调用停止"});
         ExtractionJobService jobs(database_path_);
-        auto current = jobs.load(job_id);
+        auto current = jobs.loadState(job_id);
         if (!current.ok()) return BatchResult::failure(*current.error);
         if (current.value->provider_connection_id.empty()
             || current.value->schema_version != typedCandidateSchemaVersion
@@ -136,16 +137,22 @@ Result<RemoteBatchResult> RemoteExtractionProcessor::processBatch(
                 }
             }
             // 回调可以取消任务；重新读取后才判断是否允许下一次发送。
-            current = jobs.load(job_id);
+            current = jobs.loadState(job_id);
             if (!current.ok()) return BatchResult::failure(*current.error);
             const auto stopped = [&](RemoteBatchStopReason reason) {
-                return BatchResult::success({std::move(*current.value), processed, reason});
+                // 仅返回时读取一次完整结果，批次运行过程不复制前序模型输出。
+                auto full = jobs.load(job_id);
+                if (!full.ok()) return BatchResult::failure(*full.error);
+                if (full.value->revision != current.value->revision)
+                    return BatchResult::failure({xuyan::domain::ErrorCode::revision_conflict,
+                        "批次停止检查点已被其他操作改变", false, "重新加载任务，不自动继续发送"});
+                return BatchResult::success({std::move(*full.value), processed, reason});
             };
             if (current.value->status == "completed") return stopped(RemoteBatchStopReason::completed);
             if (current.value->status == "cancelled") return stopped(RemoteBatchStopReason::cancelled);
             if (needsAttention(*current.value)) return stopped(RemoteBatchStopReason::needs_attention);
             if (action == RemoteBatchAction::cancel || current.value->cancel_requested) {
-                current = jobs.cancel("remote-batch-cancel-" + xuyan::domain::sha256(
+                current = jobs.cancelState("remote-batch-cancel-" + xuyan::domain::sha256(
                     job_id + '|' + std::to_string(current.value->revision)), job_id, current.value->revision);
                 if (!current.ok()) return BatchResult::failure(*current.error);
                 return stopped(RemoteBatchStopReason::cancelled);
@@ -155,11 +162,9 @@ Result<RemoteBatchResult> RemoteExtractionProcessor::processBatch(
             if (processed >= options.maximum_steps) return stopped(RemoteBatchStopReason::step_limit);
             if (current.value->budget.consumed_requests >= current.value->budget.max_requests)
                 return stopped(RemoteBatchStopReason::budget_exhausted);
-            if (std::none_of(current.value->steps.begin(), current.value->steps.end(), [](const auto& step) {
-                    return step.status == "ready";
-                })) return stopped(RemoteBatchStopReason::needs_attention);
+            if (!current.value->has_ready_step) return stopped(RemoteBatchStopReason::needs_attention);
             // 不持有注册表锁或数据库事务等待 HTTP；逐步提交后再通知轻量进度。
-            current = processNextUnchecked(job_id);
+            current = processNextUnchecked<ExtractionJobState>(job_id);
             if (!current.ok()) return BatchResult::failure(*current.error);
             ++processed;
         }
@@ -169,43 +174,47 @@ Result<RemoteBatchResult> RemoteExtractionProcessor::processBatch(
     }
 }
 
-Result<ExtractionJob> RemoteExtractionProcessor::processNextUnchecked(const std::string& job_id) {
+template<class JobResult>
+Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::string& job_id) {
     ExtractionJobService jobs(database_path_);
-    auto job = jobs.load(job_id);
-    if (!job.ok()) return job;
-    if (job.value->provider_connection_id.empty()) return error("此任务未绑定模型连接；请新建并选择连接");
-    if (job.value->status == "cancelled" || job.value->status == "completed") return error("任务已经结束");
+    auto job = jobs.loadState(job_id);
+    if (!job.ok()) return Result<JobResult>::failure(*job.error);
+    if (job.value->provider_connection_id.empty()) return error<JobResult>("此任务未绑定模型连接；请新建并选择连接");
+    if (job.value->status == "cancelled" || job.value->status == "completed") return error<JobResult>("任务已经结束");
     if (job.value->cancel_requested || needsAttention(*job.value))
-        return error("任务已请求取消或存在未结算步骤；请先人工核对状态");
+        return error<JobResult>("任务已请求取消或存在未结算步骤；请先人工核对状态");
     // 旧任务继续可读，但不能在未重新确认的情况下更换协议或消耗发送预算。
     if (job.value->schema_version != typedCandidateSchemaVersion
         || job.value->prompt_version != typedCandidatePromptVersion)
-        return error("此任务不是当前类型化提取协议；请重新创建任务并确认发送范围");
+        return error<JobResult>("此任务不是当前类型化提取协议；请重新创建任务并确认发送范围");
     xuyan::storage::WorkspaceRepository repository(database_path_);
     auto connection = repository.loadProviderConnection(job.value->provider_connection_id);
-    if (!connection.ok()) return Result<ExtractionJob>::failure(*connection.error);
+    if (!connection.ok()) return Result<JobResult>::failure(*connection.error);
     // 配置在建任务后变化时，先于领取步骤和消耗请求预算拒绝；网关发送前还会再次核对。
     if (job.value->provider_connection_fingerprint.empty()
         || xuyan::domain::providerConnectionFingerprint(*connection.value)
             != job.value->provider_connection_fingerprint)
-        return error("模型连接自建任务后已变化；请重新创建任务并确认发送目标");
-    const auto next = std::find_if(job.value->steps.begin(), job.value->steps.end(), [](const auto& step) {
-        return step.status == "ready";
-    });
-    if (next == job.value->steps.end()) return error("没有可抽样的待执行步骤");
+        return error<JobResult>("模型连接自建任务后已变化；请重新创建任务并确认发送目标");
+    auto next_result = jobs.nextStep(job_id);
+    if (!next_result.ok()) return Result<JobResult>::failure(*next_result.error);
+    if (!next_result.value->has_value()) return error<JobResult>("没有可抽样的待执行步骤");
+    const auto& next = **next_result.value;
     SourceImportService sources(database_path_);
-    auto chunk = sources.evidenceText(job.value->source_id, next->start_codepoint, next->end_codepoint);
-    if (!chunk.ok()) return Result<ExtractionJob>::failure(*chunk.error);
+    auto chunk = sources.evidenceText(job.value->source_id, next.start_codepoint, next.end_codepoint);
+    if (!chunk.ok()) return Result<JobResult>::failure(*chunk.error);
 
     // 原文片段确认可读之后才领取步骤；领取事务承担预算上限检查。
-    const auto claimed = jobs.claimNext(commandId("remote-claim", job_id, next->ordinal, next->attempt + 1),
+    const auto claimed = jobs.claimNext(commandId("remote-claim", job_id, next.ordinal, next.attempt + 1),
                                         job_id, job.value->revision);
-    if (!claimed.ok()) return Result<ExtractionJob>::failure(*claimed.error);
+    if (!claimed.ok()) return Result<JobResult>::failure(*claimed.error);
     const auto& step = *claimed.value;
     // 所有请求失败均按同一尝试次数持久化，避免状态停留在运行中。
     const auto finishFailure = [&](const std::string& status, const std::string& reason) {
-        return jobs.finishStep(commandId("remote-finish", job_id, step.ordinal, step.attempt), job_id,
-                               step.ordinal, step.attempt, status, {}, reason);
+        if constexpr (std::is_same_v<JobResult, ExtractionJobState>)
+            return jobs.finishStepState(commandId("remote-finish", job_id, step.ordinal, step.attempt), job_id,
+                                        step.ordinal, step.attempt, status, {}, reason);
+        else return jobs.finishStep(commandId("remote-finish", job_id, step.ordinal, step.attempt), job_id,
+                                    step.ordinal, step.attempt, status, {}, reason);
     };
     try {
         // 四类输出分别要求不同字段；小说正文只作为不可信数据，无法指定写入事实。
@@ -251,8 +260,14 @@ Result<ExtractionJob> RemoteExtractionProcessor::processNextUnchecked(const std:
             {"schema_version", job.value->schema_version}, {"prompt_version", job.value->prompt_version},
             {"candidates", std::move(candidates)}});
         CandidateService ingestion(database_path_);
-        auto committed = ingestion.ingestStepOutput(commandId("remote-commit", job_id, step.ordinal, step.attempt),
-                                                    job_id, step.ordinal, step.attempt, output);
+        const auto commit = [&] {
+            if constexpr (std::is_same_v<JobResult, ExtractionJobState>)
+                return ingestion.ingestStepOutputState(commandId("remote-commit", job_id, step.ordinal, step.attempt),
+                                                        job_id, step.ordinal, step.attempt, output);
+            else return ingestion.ingestStepOutput(commandId("remote-commit", job_id, step.ordinal, step.attempt),
+                                                   job_id, step.ordinal, step.attempt, output);
+        };
+        auto committed = commit();
         if (!committed.ok()) return finishFailure("failed", "模型候选未通过本地证据校验");
         return committed;
     } catch (...) {

@@ -25,6 +25,12 @@ Result<ExtractionJob> validateExtractionJob(ExtractionJob job) {
         previous_start = step.start_codepoint;
     }
     job.total_steps = static_cast<int>(job.steps.size());
+    job.has_ready_step = std::any_of(job.steps.begin(), job.steps.end(), [](const auto& step) { return step.status == "ready"; });
+    job.has_running_step = std::any_of(job.steps.begin(), job.steps.end(), [](const auto& step) { return step.status == "running"; });
+    job.requires_attention = job.has_running_step || job.status == "needs_attention"
+        || std::any_of(job.steps.begin(), job.steps.end(), [](const auto& step) {
+            return step.status == "failed" || step.status == "unknown";
+        });
     if (job.budget.max_requests <= 0 || job.budget.max_requests > 1000000
         || job.budget.output_token_limit_per_request < 1 || job.budget.output_token_limit_per_request > 1000000
         || job.budget.sample_steps < 0 || job.budget.sample_steps > job.total_steps

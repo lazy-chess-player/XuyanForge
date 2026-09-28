@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <type_traits>
 
 namespace xuyan::application {
 namespace {
@@ -22,8 +23,9 @@ const JsonValue* required(const JsonValue& object, std::string_view key) {
 }
 
 /** @brief 将模型输出的协议错误转为拒绝提交的可报告结果。 */
-Result<xuyan::domain::ExtractionJob> protocolError(std::string message) {
-    return Result<xuyan::domain::ExtractionJob>::failure(
+template<class JobResult>
+Result<JobResult> protocolError(std::string message) {
+    return Result<JobResult>::failure(
         {ErrorCode::validation_failed, std::move(message), false, "拒绝该输出并检查模型协议"});
 }
 
@@ -34,9 +36,23 @@ CandidateService::CandidateService(std::filesystem::path database_path) : databa
 Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
     const std::string& command_id, const std::string& job_id, int step_ordinal,
     int expected_attempt, const std::string& output_json) {
-    if (output_json.size() > 8 * 1024 * 1024) return protocolError("候选输出超过 8 MiB 上限");
+    return ingestStepOutputImpl<xuyan::domain::ExtractionJob>(command_id, job_id, step_ordinal, expected_attempt, output_json);
+}
+
+Result<xuyan::domain::ExtractionJobState> CandidateService::ingestStepOutputState(
+    const std::string& command_id, const std::string& job_id, int step_ordinal,
+    int expected_attempt, const std::string& output_json) {
+    return ingestStepOutputImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, step_ordinal, expected_attempt, output_json);
+}
+
+/** @brief 共用协议和原文证据校验，仅根据结果类型选择完整或检查点提交接口。 */
+template<class JobResult>
+Result<JobResult> CandidateService::ingestStepOutputImpl(
+    const std::string& command_id, const std::string& job_id, int step_ordinal,
+    int expected_attempt, const std::string& output_json) {
+    if (output_json.size() > 8 * 1024 * 1024) return protocolError<JobResult>("候选输出超过 8 MiB 上限");
     auto parsed = xuyan::package::parseJson(output_json, 32, 20000);
-    if (!parsed.ok() || !parsed.value->isObject()) return protocolError("候选输出不是有效 JSON 对象");
+    if (!parsed.ok() || !parsed.value->isObject()) return protocolError<JobResult>("候选输出不是有效 JSON 对象");
     const auto* schema = required(*parsed.value, "schema_version");
     const auto* prompt = required(*parsed.value, "prompt_version");
     const auto* items = required(*parsed.value, "candidates");
@@ -45,27 +61,26 @@ Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
             || (schema->string() == typedCandidateSchemaVersion && prompt->string() == typedCandidatePromptVersion))
         || parsed.value->object().size() != 3
         || items == nullptr || !items->isArray() || items->array().size() > 256)
-        return protocolError("候选输出版本或 candidates 数组无效");
+        return protocolError<JobResult>("候选输出版本或 candidates 数组无效");
     if (schema->string() == typedCandidateSchemaVersion && items->array().size() > 5)
-        return protocolError("类型化单步输出超过 5 条候选上限");
+        return protocolError<JobResult>("类型化单步输出超过 5 条候选上限");
     try {
         xuyan::storage::WorkspaceRepository repository(database_path_);
-        auto job = repository.loadExtractionJob(job_id);
-        if (!job.ok()) return Result<xuyan::domain::ExtractionJob>::failure(*job.error);
+        auto job = repository.loadExtractionJobState(job_id);
+        if (!job.ok()) return Result<JobResult>::failure(*job.error);
         if (job.value->schema_version != schema->string() || job.value->prompt_version != prompt->string())
-            return protocolError("候选输出版本与任务固定协议不一致");
-        const auto step = std::find_if(job.value->steps.begin(), job.value->steps.end(), [step_ordinal](const auto& value) {
-            return value.ordinal == step_ordinal;
-        });
-        if (step == job.value->steps.end()
-            || (step->status != "running" && step->status != "completed") || step->attempt != expected_attempt)
-            return Result<xuyan::domain::ExtractionJob>::failure(
+            return protocolError<JobResult>("候选输出版本与任务固定协议不一致");
+        auto metadata = repository.loadExtractionStepMetadata(job_id, step_ordinal);
+        if (!metadata.ok()) return Result<JobResult>::failure(*metadata.error);
+        const auto* step = &*metadata.value;
+        if ((step->status != "running" && step->status != "completed") || step->attempt != expected_attempt)
+            return Result<JobResult>::failure(
                 {ErrorCode::revision_conflict, "候选对应的步骤尝试已过期", false, "刷新任务后重试"});
         // 重新读取不可变原文，不信任模型报告的引文文本或码点范围。
         SourceImportService sources(database_path_);
         auto step_text = sources.evidenceText(job.value->source_id,
                                               step->start_codepoint, step->end_codepoint);
-        if (!step_text.ok()) return Result<xuyan::domain::ExtractionJob>::failure(*step_text.error);
+        if (!step_text.ok()) return Result<JobResult>::failure(*step_text.error);
         std::vector<xuyan::domain::ExtractionCandidate> candidates;
         candidates.reserve(items->array().size());
         for (std::size_t index = 0; index < items->array().size(); ++index) {
@@ -78,22 +93,22 @@ Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
                 || fields == nullptr || !fields->isObject() || start == nullptr || !start->isInteger()
                 || end == nullptr || !end->isInteger() || quote == nullptr || !quote->isString()
                 || provenance == nullptr || !provenance->isString() || start->integer() < 0 || end->integer() < 0)
-                return protocolError("候选字段缺失或类型错误");
-            if (item.object().size() != 7) return protocolError("候选含有协议以外的属性");
+                return protocolError<JobResult>("候选字段缺失或类型错误");
+            if (item.object().size() != 7) return protocolError<JobResult>("候选含有协议以外的属性");
             if (schema->string() == typedCandidateSchemaVersion) {
                 // 模型不能绕过远程解析器，提交缺字段候选或自称人工确认事实。
                 auto typed = validateTypedCandidateFields(type->string(), *fields, quote->string(), name->string());
-                if (!typed.ok()) return Result<xuyan::domain::ExtractionJob>::failure(*typed.error);
-                if (provenance->string() != "model_inference") return protocolError("模型候选不能自动声明为确认事实");
+                if (!typed.ok()) return Result<JobResult>::failure(*typed.error);
+                if (provenance->string() != "model_inference") return protocolError<JobResult>("模型候选不能自动声明为确认事实");
             }
             const auto start_cp = static_cast<std::size_t>(start->integer());
             const auto end_cp = static_cast<std::size_t>(end->integer());
             if (start_cp < step->start_codepoint || end_cp > step->end_codepoint)
-                return protocolError("候选证据范围超出当前文本块");
+                return protocolError<JobResult>("候选证据范围超出当前文本块");
             auto original = xuyan::domain::codepointSlice(*step_text.value,
                 start_cp - step->start_codepoint, end_cp - step->start_codepoint);
             if (!original.ok() || *original.value != quote->string())
-                return protocolError("候选引文与来源码点区间不一致");
+                return protocolError<JobResult>("候选引文与来源码点区间不一致");
             xuyan::domain::ExtractionCandidate candidate;
             candidate.id = "candidate-" + xuyan::domain::sha256(command_id + '|' + std::to_string(index)).substr(0, 24);
             candidate.job_id = job_id; candidate.step_ordinal = step_ordinal; candidate.source_id = job.value->source_id;
@@ -103,12 +118,15 @@ Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
             candidate.quote_hash = xuyan::domain::sha256(candidate.quote); candidate.provenance_type = provenance->string();
             candidate.schema_version = schema->string(); candidate.prompt_version = prompt->string();
             auto valid = xuyan::domain::validateExtractionCandidate(std::move(candidate));
-            if (!valid.ok()) return Result<xuyan::domain::ExtractionJob>::failure(*valid.error);
+            if (!valid.ok()) return Result<JobResult>::failure(*valid.error);
             candidates.push_back(std::move(*valid.value));
         }
-        return repository.commitExtractionCandidates(command_id, job_id, step_ordinal, expected_attempt,
-                                                     output_json, std::move(candidates));
-    } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionJob>::failure(
+        if constexpr (std::is_same_v<JobResult, xuyan::domain::ExtractionJobState>)
+            return repository.commitExtractionCandidatesState(command_id, job_id, step_ordinal, expected_attempt,
+                                                              output_json, std::move(candidates));
+        else return repository.commitExtractionCandidates(command_id, job_id, step_ordinal, expected_attempt,
+                                                         output_json, std::move(candidates));
+    } catch (const std::exception& exception) { return Result<JobResult>::failure(
         {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }
 

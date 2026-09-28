@@ -3,6 +3,7 @@
 #include "xuyan/domain/extraction_job.h"
 
 #include <filesystem>
+#include <optional>
 #include <vector>
 
 namespace xuyan::application {
@@ -23,14 +24,25 @@ public:
     xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>> listForWorld(const std::string& world_id);
     /** @brief 读取指定任务的步骤、预算、提供商快照和状态。 */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> load(const std::string& job_id);
+    /** @brief 读取不含步骤列表/历史正文的持久化检查点和停止标志。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> loadState(const std::string& job_id);
+    /** @brief 只查询下一片待执行步骤的定位元数据；没有待执行片时返回空值。 */
+    xuyan::domain::Result<std::optional<xuyan::domain::ExtractionStep>> nextStep(const std::string& job_id);
     /** @brief 按期望修订请求取消任务，并持久化未执行步骤的取消状态。 */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> cancel(
+        const std::string& command_id, const std::string& job_id, int expected_revision);
+    /** @brief 取消任务并返回同事务轻量检查点，不载入全部历史输出。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> cancelState(
         const std::string& command_id, const std::string& job_id, int expected_revision);
     /** @brief 原子领取一个待执行步骤并消耗相应请求预算；失败不返回步骤。 */
     xuyan::domain::Result<xuyan::domain::ExtractionStep> claimNext(
         const std::string& command_id, const std::string& job_id, int expected_revision);
     /** @brief 按步骤尝试次数提交完成、失败或未知状态，拒绝过期回报。 */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> finishStep(
+        const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
+        const std::string& terminal_status, const std::string& output_json, const std::string& error_message);
+    /** @brief 结算步骤并仅返回检查点，幂等与预算语义和完整结果接口相同。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> finishStepState(
         const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
         const std::string& terminal_status, const std::string& output_json, const std::string& error_message);
     /** @brief 显式重试失败或未知的步骤；不会自动重发可能已计费的请求。 */

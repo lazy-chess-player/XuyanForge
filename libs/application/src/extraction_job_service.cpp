@@ -181,6 +181,35 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::cancel
     catch (const std::exception& exception) { return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
         {xuyan::domain::ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }
+
+xuyan::domain::Result<xuyan::domain::ExtractionJobState> ExtractionJobService::loadState(const std::string& job_id) {
+    try { return xuyan::storage::WorkspaceRepository(database_path_).loadExtractionJobState(job_id); }
+    catch (...) { return xuyan::domain::Result<xuyan::domain::ExtractionJobState>::failure(
+        {xuyan::domain::ErrorCode::storage_error, "无法读取解析检查点，详情已隐藏", false, "检查工作区"}); }
+}
+
+xuyan::domain::Result<std::optional<xuyan::domain::ExtractionStep>> ExtractionJobService::nextStep(const std::string& job_id) {
+    try { return xuyan::storage::WorkspaceRepository(database_path_).nextExtractionStep(job_id); }
+    catch (...) { return xuyan::domain::Result<std::optional<xuyan::domain::ExtractionStep>>::failure(
+        {xuyan::domain::ErrorCode::storage_error, "无法读取下一解析片段，详情已隐藏", false, "检查工作区"}); }
+}
+
+xuyan::domain::Result<xuyan::domain::ExtractionJobState> ExtractionJobService::cancelState(
+    const std::string& command_id, const std::string& job_id, int expected_revision) {
+    try { return xuyan::storage::WorkspaceRepository(database_path_).cancelExtractionJobState(
+        command_id, job_id, expected_revision); }
+    catch (...) { return xuyan::domain::Result<xuyan::domain::ExtractionJobState>::failure(
+        {xuyan::domain::ErrorCode::storage_error, "无法保存取消检查点，详情已隐藏", false, "检查工作区"}); }
+}
+
+xuyan::domain::Result<xuyan::domain::ExtractionJobState> ExtractionJobService::finishStepState(
+    const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
+    const std::string& terminal_status, const std::string& output_json, const std::string& error_message) {
+    try { return xuyan::storage::WorkspaceRepository(database_path_).finishExtractionStepState(
+        command_id, job_id, ordinal, expected_attempt, terminal_status, output_json, error_message); }
+    catch (...) { return xuyan::domain::Result<xuyan::domain::ExtractionJobState>::failure(
+        {xuyan::domain::ErrorCode::storage_error, "无法保存解析检查点，详情已隐藏", false, "检查工作区"}); }
+}
 xuyan::domain::Result<xuyan::domain::ExtractionStep> ExtractionJobService::claimNext(
     const std::string& command_id, const std::string& job_id, int expected_revision) {
     try { return xuyan::storage::WorkspaceRepository(database_path_).claimExtractionStep(command_id, job_id, expected_revision); }

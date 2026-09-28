@@ -55,8 +55,9 @@ public:
     xuyan::domain::Result<RemoteBatchResult> processBatch(
         const std::string& job_id, const RemoteBatchOptions& options);
 private:
-    /** @brief 在调用者已持有任务执行租约时处理单步；不重复获取同一租约。 */
-    xuyan::domain::Result<xuyan::domain::ExtractionJob> processNextUnchecked(const std::string& job_id);
+    /** @brief 持有执行租约时共用单步流程；单步返回事务内完整任务，批次仅返回同事务检查点。 */
+    template<class JobResult>
+    xuyan::domain::Result<JobResult> processNextUnchecked(const std::string& job_id);
     std::filesystem::path database_path_;
     ICredentialStore& credentials_;
     IProviderTransport& transport_;

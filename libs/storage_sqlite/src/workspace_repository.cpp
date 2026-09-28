@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 
 namespace xuyan::storage {
@@ -548,11 +549,12 @@ EvidenceReference readEvidence(sqlite3_stmt* query) {
     return value;
 }
 
-xuyan::domain::ExtractionJob readExtractionJob(sqlite3* database, const std::string& job_id) {
+/** @brief 读取计数、冻结配置和索引停止标志，不搬入步骤输出；调用者负责读快照或写事务。 */
+xuyan::domain::ExtractionJobState readExtractionJobState(sqlite3* database, const std::string& job_id) {
     Statement query(database, "SELECT id,source_id,status,schema_version,prompt_version,provider_connection_id,model_id,total_steps,completed_steps,cancel_requested,revision FROM extraction_job WHERE id=?");
     bindText(query.get(), 1, job_id);
     if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到提取任务：" + job_id);
-    xuyan::domain::ExtractionJob job;
+    xuyan::domain::ExtractionJobState job;
     job.id = columnText(query.get(), 0); job.source_id = columnText(query.get(), 1); job.status = columnText(query.get(), 2);
     job.schema_version = columnText(query.get(), 3); job.prompt_version = columnText(query.get(), 4);
     job.provider_connection_id = columnText(query.get(), 5); job.model_id = columnText(query.get(), 6);
@@ -578,19 +580,76 @@ xuyan::domain::ExtractionJob readExtractionJob(sqlite3* database, const std::str
             job.budget.currency = columnText(budget.get(), 7);
         }
     }
+    // 复用 (job_id,status,ordinal) 索引查询存在性，既不扫描输出也不创建完整步骤数组。
+    Statement flags(database, "SELECT EXISTS(SELECT 1 FROM extraction_step WHERE job_id=? AND status='ready'),"
+        "EXISTS(SELECT 1 FROM extraction_step WHERE job_id=? AND status='running'),"
+        "EXISTS(SELECT 1 FROM extraction_step WHERE job_id=? AND status IN ('running','failed','unknown'))");
+    for (int parameter = 1; parameter <= 3; ++parameter) bindText(flags.get(), parameter, job_id);
+    if (sqlite3_step(flags.get()) != SQLITE_ROW) throw std::runtime_error("无法读取任务停止标志");
+    job.has_ready_step = sqlite3_column_int(flags.get(), 0) != 0;
+    job.has_running_step = sqlite3_column_int(flags.get(), 1) != 0;
+    job.requires_attention = sqlite3_column_int(flags.get(), 2) != 0 || job.status == "needs_attention";
+    return job;
+}
+
+/** @brief 从步骤查询的八个定位字段读取元数据，默认不含输出正文及错误详情。 */
+xuyan::domain::ExtractionStep readExtractionStepMetadata(sqlite3_stmt* row) {
+    xuyan::domain::ExtractionStep step;
+    step.id = columnText(row, 0); step.job_id = columnText(row, 1); step.ordinal = sqlite3_column_int(row, 2);
+    step.start_codepoint = static_cast<std::size_t>(sqlite3_column_int64(row, 3));
+    step.end_codepoint = static_cast<std::size_t>(sqlite3_column_int64(row, 4));
+    step.chunk_hash = columnText(row, 5); step.status = columnText(row, 6); step.attempt = sqlite3_column_int(row, 7);
+    return step;
+}
+
+/** @brief 读取单个步骤元数据，用于原子领取重放和定点候选校验。 */
+xuyan::domain::ExtractionStep readExtractionStep(sqlite3* database, const std::string& job_id, int ordinal) {
+    Statement query(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt FROM extraction_step WHERE job_id=? AND ordinal=?");
+    bindText(query.get(), 1, job_id); sqlite3_bind_int(query.get(), 2, ordinal);
+    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到提取步骤");
+    return readExtractionStepMetadata(query.get());
+}
+
+/** @brief 通过状态索引只读取最早的一片待执行定位信息，空队列返回空值。 */
+std::optional<xuyan::domain::ExtractionStep> readNextExtractionStep(sqlite3* database, const std::string& job_id) {
+    Statement query(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt FROM extraction_step WHERE job_id=? AND status='ready' ORDER BY ordinal LIMIT 1");
+    bindText(query.get(), 1, job_id);
+    const auto status = sqlite3_step(query.get());
+    if (status == SQLITE_DONE) return std::nullopt;
+    if (status != SQLITE_ROW) throw std::runtime_error("无法读取下一提取步骤");
+    return readExtractionStepMetadata(query.get());
+}
+
+/** @brief 命令重放时仅读取原领取步骤的完整结果，保留旧接口语义而不加载其他步骤。 */
+xuyan::domain::ExtractionStep readClaimReplayStep(sqlite3* database, const std::string& job_id, int ordinal) {
+    Statement query(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt,output_json,error_message FROM extraction_step WHERE job_id=? AND ordinal=?");
+    bindText(query.get(), 1, job_id); sqlite3_bind_int(query.get(), 2, ordinal);
+    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("领取重放步骤缺失");
+    auto step = readExtractionStepMetadata(query.get());
+    step.output_json = columnText(query.get(), 8); step.error_message = columnText(query.get(), 9);
+    return step;
+}
+
+/** @brief 只供完整结果或编辑查询读取全部步骤，调度循环使用检查点接口。 */
+xuyan::domain::ExtractionJob readExtractionJob(sqlite3* database, const std::string& job_id) {
+    xuyan::domain::ExtractionJob job;
+    static_cast<xuyan::domain::ExtractionJobState&>(job) = readExtractionJobState(database, job_id);
     Statement steps(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt,output_json,error_message FROM extraction_step WHERE job_id=? ORDER BY ordinal");
     bindText(steps.get(), 1, job_id);
     while (sqlite3_step(steps.get()) == SQLITE_ROW) {
-        xuyan::domain::ExtractionStep step;
-        step.id = columnText(steps.get(), 0); step.job_id = columnText(steps.get(), 1);
-        step.ordinal = sqlite3_column_int(steps.get(), 2);
-        step.start_codepoint = static_cast<std::size_t>(sqlite3_column_int64(steps.get(), 3));
-        step.end_codepoint = static_cast<std::size_t>(sqlite3_column_int64(steps.get(), 4));
-        step.chunk_hash = columnText(steps.get(), 5); step.status = columnText(steps.get(), 6);
-        step.attempt = sqlite3_column_int(steps.get(), 7); step.output_json = columnText(steps.get(), 8);
+        auto step = readExtractionStepMetadata(steps.get());
+        step.output_json = columnText(steps.get(), 8);
         step.error_message = columnText(steps.get(), 9); job.steps.push_back(std::move(step));
     }
     return job;
+}
+
+/** @brief 在当前事务内选择完整或检查点结果，保持同一份写入及幂等实现。 */
+template<class JobResult>
+JobResult readExtractionResult(sqlite3* database, const std::string& job_id) {
+    if constexpr (std::is_same_v<JobResult, xuyan::domain::ExtractionJobState>)
+        return readExtractionJobState(database, job_id);
+    else return readExtractionJob(database, job_id);
 }
 
 xuyan::domain::ExtractionCandidate readCandidate(sqlite3_stmt* query) {
@@ -2420,6 +2479,9 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
         }
         job.completed_steps = reused_steps;
         job.status = reused_steps == job.total_steps ? "completed" : "queued";
+        job.has_ready_step = reused_steps < job.total_steps;
+        job.has_running_step = false;
+        job.requires_attention = false;
         if (reused_steps > 0) {
             Statement reuse(database_, "UPDATE extraction_job SET status=?,completed_steps=?,updated_at=? WHERE id=?");
             bindText(reuse.get(), 1, job.status); sqlite3_bind_int(reuse.get(), 2, reused_steps);
@@ -2436,8 +2498,36 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
 }
 
 Result<xuyan::domain::ExtractionJob> WorkspaceRepository::loadExtractionJob(const std::string& job_id) {
-    try { return Result<xuyan::domain::ExtractionJob>::success(readExtractionJob(database_, job_id)); }
+    try {
+        ReadTransaction snapshot(database_);
+        auto job = readExtractionJob(database_, job_id);
+        snapshot.commit();
+        return Result<xuyan::domain::ExtractionJob>::success(std::move(job));
+    }
     catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionJob>::failure(storageError(exception)); }
+}
+
+Result<xuyan::domain::ExtractionJobState> WorkspaceRepository::loadExtractionJobState(const std::string& job_id) {
+    try {
+        ReadTransaction snapshot(database_);
+        auto state = readExtractionJobState(database_, job_id);
+        snapshot.commit();
+        return Result<xuyan::domain::ExtractionJobState>::success(std::move(state));
+    } catch (const std::exception& exception) {
+        return Result<xuyan::domain::ExtractionJobState>::failure(storageError(exception));
+    }
+}
+
+Result<std::optional<xuyan::domain::ExtractionStep>> WorkspaceRepository::nextExtractionStep(const std::string& job_id) {
+    try { return Result<std::optional<xuyan::domain::ExtractionStep>>::success(readNextExtractionStep(database_, job_id)); }
+    catch (const std::exception& exception) {
+        return Result<std::optional<xuyan::domain::ExtractionStep>>::failure(storageError(exception));
+    }
+}
+
+Result<xuyan::domain::ExtractionStep> WorkspaceRepository::loadExtractionStepMetadata(const std::string& job_id, int ordinal) {
+    try { return Result<xuyan::domain::ExtractionStep>::success(readExtractionStep(database_, job_id, ordinal)); }
+    catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionStep>::failure(storageError(exception)); }
 }
 
 Result<std::vector<xuyan::domain::ExtractionJob>> WorkspaceRepository::listExtractionJobs() {
@@ -2482,17 +2572,15 @@ Result<xuyan::domain::ExtractionStep> WorkspaceRepository::claimExtractionStep(
                 if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionStep>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他步骤领取", false, "生成新的命令标识"});
                 const auto ordinal = sqlite3_column_int(replay.get(), 1);
-                auto job = readExtractionJob(database_, job_id);
-                const auto found = std::find_if(job.steps.begin(), job.steps.end(), [ordinal](const auto& step) { return step.ordinal == ordinal; });
-                if (found == job.steps.end()) throw std::runtime_error("领取步骤结果缺失");
-                auto result = *found; transaction.commit(); return Result<xuyan::domain::ExtractionStep>::success(std::move(result));
+                auto result = readClaimReplayStep(database_, job_id, ordinal);
+                transaction.commit(); return Result<xuyan::domain::ExtractionStep>::success(std::move(result));
             }
         }
-        auto job = readExtractionJob(database_, job_id);
+        auto job = readExtractionJobState(database_, job_id);
         if (job.revision != expected_revision || job.cancel_requested) return Result<xuyan::domain::ExtractionStep>::failure(
             {ErrorCode::revision_conflict, "任务已变化或正在取消", false, "刷新任务后重试"});
-        const auto ready = std::find_if(job.steps.begin(), job.steps.end(), [](const auto& step) { return step.status == "ready"; });
-        if (ready == job.steps.end()) return Result<xuyan::domain::ExtractionStep>::failure(
+        const auto ready = readNextExtractionStep(database_, job_id);
+        if (!ready) return Result<xuyan::domain::ExtractionStep>::failure(
             {ErrorCode::missing_context, "没有可领取的提取步骤", false, "检查失败、未知或已完成步骤"});
         if (job.budget.consumed_requests >= job.budget.max_requests) return Result<xuyan::domain::ExtractionStep>::failure(
             {ErrorCode::validation_failed, "提取任务已达到硬调用预算", false, "提高预算或保留未完成步骤供人工处理"});
@@ -2518,8 +2606,22 @@ Result<xuyan::domain::ExtractionStep> WorkspaceRepository::claimExtractionStep(
 Result<xuyan::domain::ExtractionJob> WorkspaceRepository::finishExtractionStep(
     const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
     const std::string& terminal_status, const std::string& output_json, const std::string& error_message) {
+    return finishExtractionStepImpl<xuyan::domain::ExtractionJob>(command_id, job_id, ordinal, expected_attempt, terminal_status, output_json, error_message);
+}
+
+Result<xuyan::domain::ExtractionJobState> WorkspaceRepository::finishExtractionStepState(
+    const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
+    const std::string& terminal_status, const std::string& output_json, const std::string& error_message) {
+    return finishExtractionStepImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, ordinal, expected_attempt, terminal_status, output_json, error_message);
+}
+
+/** @brief 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
+template<class JobResult>
+Result<JobResult> WorkspaceRepository::finishExtractionStepImpl(
+    const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
+    const std::string& terminal_status, const std::string& output_json, const std::string& error_message) {
     if ((terminal_status != "completed" && terminal_status != "failed" && terminal_status != "unknown")
-        || output_json.size() > 8 * 1024 * 1024 || error_message.size() > 4096) return Result<xuyan::domain::ExtractionJob>::failure(
+        || output_json.size() > 8 * 1024 * 1024 || error_message.size() > 4096) return Result<JobResult>::failure(
         {ErrorCode::validation_failed, "步骤终态或结果大小无效", false, "使用 completed、failed 或 unknown"});
     const auto payload = "finish|" + job_id + '|' + std::to_string(ordinal) + '|' + std::to_string(expected_attempt)
         + '|' + terminal_status + '|' + xuyan::domain::sha256(output_json) + '|' + error_message;
@@ -2529,17 +2631,17 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::finishExtractionStep(
             Statement replay(database_, "SELECT payload_hash FROM extraction_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
             if (sqlite3_step(replay.get()) == SQLITE_ROW) {
-                if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionJob>::failure(
+                if (columnText(replay.get(), 0) != payload) return Result<JobResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他步骤结果", false, "生成新的命令标识"});
-                auto result = readExtractionJob(database_, job_id); transaction.commit();
-                return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
+                auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit();
+                return Result<JobResult>::success(std::move(result));
             }
         }
         Statement finish(database_, "UPDATE extraction_step SET status=?,output_json=?,error_message=?,updated_at=? WHERE job_id=? AND ordinal=? AND status='running' AND attempt=?");
         bindText(finish.get(), 1, terminal_status); bindText(finish.get(), 2, output_json); bindText(finish.get(), 3, error_message);
         bindText(finish.get(), 4, utcNow()); bindText(finish.get(), 5, job_id); sqlite3_bind_int(finish.get(), 6, ordinal);
         sqlite3_bind_int(finish.get(), 7, expected_attempt);
-        if (sqlite3_step(finish.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1) return Result<xuyan::domain::ExtractionJob>::failure(
+        if (sqlite3_step(finish.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1) return Result<JobResult>::failure(
             {ErrorCode::revision_conflict, "步骤不再处于对应运行尝试", false, "刷新任务后重试"});
         Statement counts(database_, "SELECT COUNT(*),SUM(status='completed'),SUM(status='failed'),SUM(status='unknown'),SUM(status='running') FROM extraction_step WHERE job_id=?");
         bindText(counts.get(), 1, job_id);
@@ -2547,7 +2649,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::finishExtractionStep(
         const auto total = sqlite3_column_int(counts.get(), 0); const auto completed = sqlite3_column_int(counts.get(), 1);
         const auto failed = sqlite3_column_int(counts.get(), 2); const auto unknown = sqlite3_column_int(counts.get(), 3);
         const auto running = sqlite3_column_int(counts.get(), 4);
-        auto current = readExtractionJob(database_, job_id);
+        auto current = readExtractionJobState(database_, job_id);
         std::string status = failed > 0 || unknown > 0 ? "needs_attention"
             : completed == total ? "completed" : running > 0 ? "running" : current.cancel_requested ? "cancelled" : "queued";
         Statement update(database_, "UPDATE extraction_job SET status=?,completed_steps=?,revision=revision+1,updated_at=? WHERE id=?");
@@ -2557,12 +2659,24 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::finishExtractionStep(
         bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, job_id);
         sqlite3_bind_int(log.get(), 4, ordinal); bindText(log.get(), 5, utcNow());
         if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
-        auto result = readExtractionJob(database_, job_id); transaction.commit();
-        return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
-    } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionJob>::failure(storageError(exception)); }
+        auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit();
+        return Result<JobResult>::success(std::move(result));
+    } catch (const std::exception& exception) { return Result<JobResult>::failure(storageError(exception)); }
 }
 
 Result<xuyan::domain::ExtractionJob> WorkspaceRepository::cancelExtractionJob(
+    const std::string& command_id, const std::string& job_id, int expected_revision) {
+    return cancelExtractionJobImpl<xuyan::domain::ExtractionJob>(command_id, job_id, expected_revision);
+}
+
+Result<xuyan::domain::ExtractionJobState> WorkspaceRepository::cancelExtractionJobState(
+    const std::string& command_id, const std::string& job_id, int expected_revision) {
+    return cancelExtractionJobImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, expected_revision);
+}
+
+/** @brief 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
+template<class JobResult>
+Result<JobResult> WorkspaceRepository::cancelExtractionJobImpl(
     const std::string& command_id, const std::string& job_id, int expected_revision) {
     const auto payload = "cancel|" + job_id + '|' + std::to_string(expected_revision);
     try {
@@ -2570,17 +2684,17 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::cancelExtractionJob(
         Statement replay(database_, "SELECT payload_hash FROM extraction_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
         if (sqlite3_step(replay.get()) == SQLITE_ROW) {
-            if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionJob>::failure(
+            if (columnText(replay.get(), 0) != payload) return Result<JobResult>::failure(
                 {ErrorCode::command_conflict, "命令标识已用于其他取消", false, "生成新的命令标识"});
-            auto result = readExtractionJob(database_, job_id); transaction.commit(); return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
+            auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit(); return Result<JobResult>::success(std::move(result));
         }
-        auto current = readExtractionJob(database_, job_id);
-        if (current.revision != expected_revision) return Result<xuyan::domain::ExtractionJob>::failure(
+        auto current = readExtractionJobState(database_, job_id);
+        if (current.revision != expected_revision) return Result<JobResult>::failure(
             {ErrorCode::revision_conflict, "任务修订已变化", false, "刷新任务后重试"});
         Statement steps(database_, "UPDATE extraction_step SET status='cancelled',updated_at=? WHERE job_id=? AND status='ready'");
         bindText(steps.get(), 1, utcNow()); bindText(steps.get(), 2, job_id);
         if (sqlite3_step(steps.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
-        const bool running = std::any_of(current.steps.begin(), current.steps.end(), [](const auto& step) { return step.status == "running"; });
+        const bool running = current.has_running_step;
         Statement update(database_, "UPDATE extraction_job SET status=?,cancel_requested=1,revision=revision+1,updated_at=? WHERE id=? AND revision=?");
         bindText(update.get(), 1, running ? "cancelling" : "cancelled"); bindText(update.get(), 2, utcNow()); bindText(update.get(), 3, job_id);
         sqlite3_bind_int(update.get(), 4, expected_revision);
@@ -2589,8 +2703,8 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::cancelExtractionJob(
         bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, job_id);
         sqlite3_bind_int(log.get(), 4, 0); bindText(log.get(), 5, utcNow());
         if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
-        auto result = readExtractionJob(database_, job_id); transaction.commit(); return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
-    } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionJob>::failure(storageError(exception)); }
+        auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit(); return Result<JobResult>::success(std::move(result));
+    } catch (const std::exception& exception) { return Result<JobResult>::failure(storageError(exception)); }
 }
 
 Result<xuyan::domain::ExtractionJob> WorkspaceRepository::retryExtractionStep(
@@ -2642,12 +2756,26 @@ Result<int> WorkspaceRepository::recoverInterruptedExtractionSteps() {
 Result<xuyan::domain::ExtractionJob> WorkspaceRepository::commitExtractionCandidates(
     const std::string& command_id, const std::string& job_id, int step_ordinal, int expected_attempt,
     const std::string& output_json, std::vector<xuyan::domain::ExtractionCandidate> candidates) {
+    return commitExtractionCandidatesImpl<xuyan::domain::ExtractionJob>(command_id, job_id, step_ordinal, expected_attempt, output_json, std::move(candidates));
+}
+
+Result<xuyan::domain::ExtractionJobState> WorkspaceRepository::commitExtractionCandidatesState(
+    const std::string& command_id, const std::string& job_id, int step_ordinal, int expected_attempt,
+    const std::string& output_json, std::vector<xuyan::domain::ExtractionCandidate> candidates) {
+    return commitExtractionCandidatesImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, step_ordinal, expected_attempt, output_json, std::move(candidates));
+}
+
+/** @brief 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
+template<class JobResult>
+Result<JobResult> WorkspaceRepository::commitExtractionCandidatesImpl(
+    const std::string& command_id, const std::string& job_id, int step_ordinal, int expected_attempt,
+    const std::string& output_json, std::vector<xuyan::domain::ExtractionCandidate> candidates) {
     for (auto& candidate : candidates) {
         auto valid = xuyan::domain::validateExtractionCandidate(std::move(candidate));
-        if (!valid.ok()) return Result<xuyan::domain::ExtractionJob>::failure(*valid.error);
+        if (!valid.ok()) return Result<JobResult>::failure(*valid.error);
         candidate = std::move(*valid.value);
         if (candidate.job_id != job_id || candidate.step_ordinal != step_ordinal)
-            return Result<xuyan::domain::ExtractionJob>::failure(
+            return Result<JobResult>::failure(
                 {ErrorCode::validation_failed, "候选不属于当前任务步骤", false, "拒绝该输出"});
     }
     const auto payload = "candidates|" + job_id + '|' + std::to_string(step_ordinal) + '|'
@@ -2658,21 +2786,21 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::commitExtractionCandid
             Statement replay(database_, "SELECT payload_hash FROM extraction_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
             if (sqlite3_step(replay.get()) == SQLITE_ROW) {
-                if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionJob>::failure(
+                if (columnText(replay.get(), 0) != payload) return Result<JobResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他候选提交", false, "生成新的命令标识"});
-                auto result = readExtractionJob(database_, job_id); transaction.commit();
-                return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
+                auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit();
+                return Result<JobResult>::success(std::move(result));
             }
         }
         Statement state(database_, "SELECT j.source_id,s.status,s.attempt,j.cancel_requested FROM extraction_step s JOIN extraction_job j ON j.id=s.job_id WHERE s.job_id=? AND s.ordinal=?");
         bindText(state.get(), 1, job_id); sqlite3_bind_int(state.get(), 2, step_ordinal);
         if (sqlite3_step(state.get()) != SQLITE_ROW || columnText(state.get(), 1) != "running"
-            || sqlite3_column_int(state.get(), 2) != expected_attempt) return Result<xuyan::domain::ExtractionJob>::failure(
+            || sqlite3_column_int(state.get(), 2) != expected_attempt) return Result<JobResult>::failure(
                 {ErrorCode::revision_conflict, "候选步骤尝试已变化", false, "刷新任务后重试"});
         const auto source_id = columnText(state.get(), 0);
         const bool cancel_requested = sqlite3_column_int(state.get(), 3) != 0;
         for (auto& candidate : candidates) {
-            if (candidate.source_id != source_id) return Result<xuyan::domain::ExtractionJob>::failure(
+            if (candidate.source_id != source_id) return Result<JobResult>::failure(
                 {ErrorCode::validation_failed, "候选来源与任务不一致", false, "拒绝该输出"});
             candidate.revision = 1;
             Statement insert(database_, "INSERT INTO extraction_candidate(id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
@@ -2716,9 +2844,9 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::commitExtractionCandid
         bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, job_id);
         sqlite3_bind_int(log.get(), 4, step_ordinal); bindText(log.get(), 5, utcNow());
         if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
-        auto result = readExtractionJob(database_, job_id); transaction.commit();
-        return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
-    } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionJob>::failure(storageError(exception)); }
+        auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit();
+        return Result<JobResult>::success(std::move(result));
+    } catch (const std::exception& exception) { return Result<JobResult>::failure(storageError(exception)); }
 }
 
 Result<std::vector<xuyan::domain::ExtractionCandidate>> WorkspaceRepository::listExtractionCandidates(

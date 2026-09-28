@@ -1056,6 +1056,52 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
     std::filesystem::remove_all(directory, ignored);
 }
 
+/** @brief 仅在本测试线程中记录历史步骤输出的整表读取次数，不接触 SQL 绑定值。 */
+struct ExtractionReadAudit {
+    int full_history_reads{0};
+};
+thread_local ExtractionReadAudit* active_extraction_read_audit = nullptr;
+
+/** @brief 统计显式选择历史输出的步骤查询，不保存原文、结果或凭据。 */
+int traceExtractionReads(unsigned, void* context, void* statement, void*) {
+    auto& audit = *static_cast<ExtractionReadAudit*>(context);
+    const auto* sql = sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
+    const std::string_view query = sql == nullptr ? "" : sql;
+    if (query.starts_with("SELECT") && query.find("FROM extraction_step") != std::string_view::npos
+        && query.find("output_json") != std::string_view::npos
+        && query.find("AND ordinal=?") == std::string_view::npos) ++audit.full_history_reads;
+    return 0;
+}
+
+/** @brief 为本测试新开的连接挂接只读语句计数器，其他线程不挂接。 */
+int attachExtractionReadAudit(sqlite3* database, char**, const sqlite3_api_routines*) {
+    if (active_extraction_read_audit != nullptr)
+        return sqlite3_trace_v2(database, SQLITE_TRACE_STMT, traceExtractionReads, active_extraction_read_audit);
+    return SQLITE_OK;
+}
+
+/** @brief 作用域内注册 SQLite 测试扩展；所有被挂接连接必须在本对象销毁前关闭。 */
+class ScopedExtractionReadAudit {
+public:
+    /** @brief 注册语句计数钩子，函数指针转换仅适配 SQLite 指定的 C 扩展接口。 */
+    ScopedExtractionReadAudit() {
+        require(active_extraction_read_audit == nullptr, "read audits must not nest");
+        active_extraction_read_audit = &counts;
+        if (sqlite3_auto_extension(reinterpret_cast<void (*)()>(attachExtractionReadAudit)) != SQLITE_OK) {
+            active_extraction_read_audit = nullptr;
+            throw std::runtime_error("cannot install read audit");
+        }
+    }
+    /** @brief 注销仅属于本测试的扩展，避免影响后续核心用例。 */
+    ~ScopedExtractionReadAudit() {
+        sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(attachExtractionReadAudit));
+        active_extraction_read_audit = nullptr;
+    }
+    ScopedExtractionReadAudit(const ScopedExtractionReadAudit&) = delete;
+    ScopedExtractionReadAudit& operator=(const ScopedExtractionReadAudit&) = delete;
+    ExtractionReadAudit counts;
+};
+
 /** @brief 验证原文远程批次遍历、持久化续跑、次数硬上限和所有停止边界；不访问真实网络。 */
 void testRemoteBatchCheckpoints() {
     using namespace xuyan::application;
@@ -1077,6 +1123,10 @@ void testRemoteBatchCheckpoints() {
         }
     } cleanup{directory, parent};
     const auto database = directory / "workspace.sqlite";
+    ScopedExtractionReadAudit read_audit;
+    const auto* stress = std::getenv("XUYANFORGE_REMOTE_BATCH_STRESS");
+    const bool large_batch = stress != nullptr && std::string_view(stress) == "1";
+    const int full_chapters = large_batch ? 1000 : 40;
     InMemoryCredentialStore credentials;
     ProviderConnectionService connections(database, credentials);
     xuyan::domain::ProviderConnection connection;
@@ -1095,13 +1145,15 @@ void testRemoteBatchCheckpoints() {
             require(output.good(), "runtime manuscript must be writable");
             for (int chapter = 1; chapter <= chapters; ++chapter) {
                 output << "# 第" << chapter << "章\n记录者完成编号" << label << '-' << chapter << "的核对。\n";
-                for (int line = 0; line < 6; ++line) output << "远处的云层缓慢变换颜色。\n";
+                const int lines = large_batch && label == "full" ? 900 : 6;
+                for (int line = 0; line < lines; ++line) output << "远处的云层缓慢变换颜色。\n";
             }
         }
         auto source = sources.importTextFile("batch-source-" + label, manuscript, "1", "owned-batch-world");
         require(source.ok() && static_cast<int>(source.value->chapters.size()) == chapters,
                 "runtime source must retain every chapter");
-        auto job = jobs.create("batch-job-" + label, source.value->id, 500, 0, requests, 512, connection.id);
+        auto job = jobs.create("batch-job-" + label, source.value->id,
+                              large_batch && label == "full" ? 50000 : 500, 0, requests, 512, connection.id);
         require(job.ok() && job.value->total_steps == chapters && job.value->completed_steps == 0,
                 "each owned chapter must create an uncached ready step");
         return *job.value;
@@ -1140,7 +1192,7 @@ void testRemoteBatchCheckpoints() {
                 {"entities", JsonValue::Array{}}, {"relations", JsonValue::Array{}}, {"rules", JsonValue::Array{}},
                 {"events", JsonValue::Array{JsonValue::Object{
                     {"name", "完成核对"}, {"quote", quote}, {"fields", JsonValue::Object{
-                        {"action", "完成核对"}, {"participants", JsonValue::Array{"记录者"}},
+                        {"action", std::string(900, 'x') + "完成核对"}, {"participants", JsonValue::Array{"记录者"}},
                         {"location", ""}, {"time_text", ""}}}}}}});
             const auto response = xuyan::package::writeJson(JsonValue::Object{
                 {"status", "completed"}, {"output", JsonValue::Array{JsonValue::Object{
@@ -1159,7 +1211,7 @@ void testRemoteBatchCheckpoints() {
         std::vector<std::string> quotes;
     } transport;
     RemoteExtractionProcessor processor(database, credentials, transport);
-    const auto full = createJob("full", 40);
+    const auto full = createJob("full", full_chapters, full_chapters + 10);
     RemoteBatchOptions pause;
     pause.maximum_steps = 50;
     int notifications = 0;
@@ -1167,7 +1219,8 @@ void testRemoteBatchCheckpoints() {
         auto durable = jobs.load(progress.job_id);
         require(durable.ok() && durable.value->revision == progress.revision
                     && durable.value->completed_steps == progress.completed_steps
-                    && progress.consumed_requests == progress.completed_steps && progress.maximum_requests == 50,
+                    && progress.consumed_requests == progress.completed_steps
+                    && progress.maximum_requests == full_chapters + 10,
                 "progress must report durable counts without raw data");
         ++notifications;
         return progress.processed_steps == 2 ? RemoteBatchAction::pause : RemoteBatchAction::proceed;
@@ -1185,18 +1238,28 @@ void testRemoteBatchCheckpoints() {
             "reconstructed processor must resume without replay and honor the call limit");
     RemoteBatchOptions all;
     all.maximum_steps = 100000;
+    read_audit.counts.full_history_reads = 0;
+    const auto batch_started = std::chrono::steady_clock::now();
     auto finished = reopened.processBatch(full.id, all);
     require(finished.ok() && finished.value->reason == RemoteBatchStopReason::completed
-                && finished.value->processed_steps == 37 && finished.value->job.completed_steps == 40
-                && transport.calls == 40 && std::all_of(finished.value->job.steps.begin(), finished.value->job.steps.end(),
+                && finished.value->processed_steps == full_chapters - 3
+                && finished.value->job.completed_steps == full_chapters
+                && transport.calls == full_chapters && std::all_of(finished.value->job.steps.begin(), finished.value->job.steps.end(),
                     [](const auto& step) { return step.status == "completed" && step.attempt == 1; }),
             "every owned chapter must complete once across pause and reconstruction");
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - batch_started).count();
+    std::cout << "Owned remote batch validation: " << full_chapters << " chapters, "
+              << finished.value->job.steps.back().end_codepoint << " source codepoints, "
+              << finished.value->processed_steps << " resumed steps, " << read_audit.counts.full_history_reads
+              << " historical output SELECTs, " << elapsed << " seconds.\n";
+    require(read_audit.counts.full_history_reads <= 1,
+            "batch scheduling must read historical outputs only once for its final full snapshot");
     auto sorted_quotes = transport.quotes;
     std::sort(sorted_quotes.begin(), sorted_quotes.end());
     require(std::adjacent_find(sorted_quotes.begin(), sorted_quotes.end()) == sorted_quotes.end(),
             "resuming must not resend a completed fragment");
     auto candidates = CandidateService(database).list();
-    require(candidates.ok() && candidates.value->size() == 40,
+    require(candidates.ok() && candidates.value->size() == static_cast<std::size_t>(full_chapters),
             "full fake batch must retain one pending candidate for each chapter");
     for (const auto& candidate : *candidates.value) {
         auto evidence = sources.evidenceText(candidate.source_id, candidate.start_codepoint, candidate.end_codepoint);
@@ -1205,16 +1268,35 @@ void testRemoteBatchCheckpoints() {
                     && candidate.review_status == "candidate" && candidate.provenance_type == "model_inference",
                 "every persisted candidate must retain immutable evidence and await review");
     }
+    auto complete_state = jobs.loadState(full.id);
+    auto no_next = jobs.nextStep(full.id);
+    require(complete_state.ok() && complete_state.value->completed_steps == full_chapters
+                && !complete_state.value->has_ready_step && !complete_state.value->has_running_step
+                && !complete_state.value->requires_attention && no_next.ok() && !no_next.value->has_value(),
+            "checkpoint state must match the completed full snapshot without inventing a ready step");
+    const auto& first_step = finished.value->job.steps.front();
+    const auto command_suffix = xuyan::domain::sha256(full.id + '|' + std::to_string(first_step.ordinal)
+        + '|' + std::to_string(first_step.attempt)).substr(0, 24);
+    const auto before_state_replay = read_audit.counts.full_history_reads;
+    auto checkpoint_replay = CandidateService(database).ingestStepOutputState(
+        "remote-commit-" + command_suffix, full.id, first_step.ordinal, first_step.attempt, first_step.output_json);
+    require(checkpoint_replay.ok() && checkpoint_replay.value->revision == finished.value->job.revision
+                && read_audit.counts.full_history_reads == before_state_replay,
+            "checkpoint candidate replay must preserve revision without loading historical outputs");
+    auto claim_replay = jobs.claimNext("remote-claim-" + command_suffix, full.id, full.revision);
+    require(claim_replay.ok() && claim_replay.value->output_json == first_step.output_json
+                && claim_replay.value->status == "completed" && claim_replay.value->attempt == 1,
+            "claim replay must retain its original full single-step result without changing budget");
     auto completion_options = all;
     completion_options.on_progress = [](const RemoteBatchProgress&) { return RemoteBatchAction::cancel; };
     const auto replay = reopened.processBatch(full.id, completion_options);
     require(replay.ok() && replay.value->reason == RemoteBatchStopReason::completed
-                && replay.value->processed_steps == 0 && transport.calls == 40,
+                && replay.value->processed_steps == 0 && transport.calls == full_chapters,
             "completed batches must return without sends or budget consumption");
     RemoteBatchOptions invalid;
     for (const auto limit : {0, -1, 100001}) {
         invalid.maximum_steps = limit;
-        require(!processor.processBatch(full.id, invalid).ok() && transport.calls == 40,
+        require(!processor.processBatch(full.id, invalid).ok() && transport.calls == full_chapters,
                 "unspecified and invalid batch limits must fail before scheduling");
     }
     const auto capped = createJob("budget", 4, 2);
@@ -1227,6 +1309,12 @@ void testRemoteBatchCheckpoints() {
     require(still_capped.ok() && still_capped.value->processed_steps == 0 && transport.calls == calls_after_cap,
             "reconstruction must not reset exhausted request allowance");
     const auto stopped_job = createJob("token");
+    auto ready_state = jobs.loadState(stopped_job.id);
+    auto next_metadata = jobs.nextStep(stopped_job.id);
+    require(ready_state.ok() && ready_state.value->has_ready_step && !ready_state.value->requires_attention
+                && next_metadata.ok() && next_metadata.value->has_value()
+                && (**next_metadata.value).ordinal == 1 && (**next_metadata.value).output_json.empty(),
+            "queued checkpoint must return only the first step's immutable location metadata");
     std::stop_source stop;
     stop.request_stop();
     auto stopped_options = all;
@@ -1322,7 +1410,10 @@ void testRemoteBatchCheckpoints() {
                     && failed.value->job.budget.consumed_requests == 1 && transport.calls == before + 1,
                 "unknown or failed results must persist and stop after one attempt");
         auto unchanged = reopened.processBatch(failed_job.id, all);
+        auto failed_state = jobs.loadState(failed_job.id);
         require(unchanged.ok() && unchanged.value->processed_steps == 0
+                    && failed_state.ok() && failed_state.value->requires_attention
+                    && failed_state.value->has_ready_step && !failed_state.value->has_running_step
                     && !reopened.processNext(failed_job.id).ok() && transport.calls == before + 1,
                 "both entries must refuse to skip or auto-retry unresolved steps");
         transport.timed_out = transport.cancelled = transport.throw_after_send = transport.malformed = false;

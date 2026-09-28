@@ -17,6 +17,10 @@ public:
     xuyan::domain::Result<xuyan::domain::ExtractionJob> ingestStepOutput(
         const std::string& command_id, const std::string& job_id, int step_ordinal,
         int expected_attempt, const std::string& output_json);
+    /** @brief 执行同一份字段/原文校验和原子候选提交，仅返回检查点而非历史步骤列表。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> ingestStepOutputState(
+        const std::string& command_id, const std::string& job_id, int step_ordinal,
+        int expected_attempt, const std::string& output_json);
     /** @brief 按审核状态列出候选；默认仅列待校对项。 */
     xuyan::domain::Result<std::vector<xuyan::domain::ExtractionCandidate>> list(
         const std::string& review_status = "candidate");
@@ -30,6 +34,10 @@ public:
         const std::string& review_status, const std::string& name,
         const std::string& fields_json, const std::string& provenance_type);
 private:
+    /** @brief 共用候选校验实现，结果类型决定提交后的快照范围，不放松证据条件。 */
+    template<class JobResult> xuyan::domain::Result<JobResult> ingestStepOutputImpl(
+        const std::string& command_id, const std::string& job_id, int step_ordinal,
+        int expected_attempt, const std::string& output_json);
     std::filesystem::path database_path_;
 };
 

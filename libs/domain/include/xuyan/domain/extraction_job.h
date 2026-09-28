@@ -42,7 +42,8 @@ struct ExtractionQualityReport {
     bool model_quality_verified{false};
 };
 
-struct ExtractionJob {
+/** @brief 无步骤正文的任务检查点；供调度读取计数、连接快照和停止条件。 */
+struct ExtractionJobState {
     std::string id;
     std::string source_id;
     std::string status{"queued"};
@@ -56,6 +57,13 @@ struct ExtractionJob {
     bool cancel_requested{false};
     int revision{0};
     ExtractionBudget budget;
+    bool has_ready_step{false};
+    bool has_running_step{false};
+    bool requires_attention{false};
+};
+
+/** @brief 供编辑和完整结果查询使用的任务快照，显式包含全部步骤及历史输出。 */
+struct ExtractionJob : ExtractionJobState {
     std::vector<ExtractionStep> steps;
 };
 

@@ -170,6 +170,12 @@ public:
         const std::string& command_id, xuyan::domain::ExtractionJob job);
     /** @brief 加载任务及其全部解析步骤。 */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> loadExtractionJob(const std::string& job_id);
+    /** @brief 在同一只读快照中读取任务计数和索引停止标志，不读取任何历史步骤正文。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> loadExtractionJobState(const std::string& job_id);
+    /** @brief 限量查询最早的待执行步骤，不携带历史输出或错误详情；没有待执行步骤时返回空值。 */
+    xuyan::domain::Result<std::optional<xuyan::domain::ExtractionStep>> nextExtractionStep(const std::string& job_id);
+    /** @brief 按任务/序号读取单步定位元数据，不查询 output_json 或 error_message。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionStep> loadExtractionStepMetadata(const std::string& job_id, int ordinal);
     /** @brief 列出当前工作区的解析任务。 */
     xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>> listExtractionJobs();
     /** @brief 仅列出指定世界来源对应的解析任务及步骤。 */
@@ -178,11 +184,18 @@ public:
     /** @brief 按预期修订请求取消解析任务。 */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> cancelExtractionJob(
         const std::string& command_id, const std::string& job_id, int expected_revision);
+    /** @brief 原子取消并只返回同事务检查点，供大任务调度避免加载全部步骤。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> cancelExtractionJobState(
+        const std::string& command_id, const std::string& job_id, int expected_revision);
     /** @brief 以事务认领下一待执行步骤并递增尝试次数。 */
     xuyan::domain::Result<xuyan::domain::ExtractionStep> claimExtractionStep(
         const std::string& command_id, const std::string& job_id, int expected_revision);
     /** @brief 按预期尝试次数写入步骤终态与结果。 */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> finishExtractionStep(
+        const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
+        const std::string& terminal_status, const std::string& output_json, const std::string& error_message);
+    /** @brief 使用与完整结果相同的幂等事务结算单步，但仅返回任务检查点。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> finishExtractionStepState(
         const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
         const std::string& terminal_status, const std::string& output_json, const std::string& error_message);
     /** @brief 将允许重试的步骤恢复为待执行状态。 */
@@ -192,6 +205,10 @@ public:
     xuyan::domain::Result<int> recoverInterruptedExtractionSteps();
     /** @brief 在单一事务中提交步骤输出与经证据校验的候选。 */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> commitExtractionCandidates(
+        const std::string& command_id, const std::string& job_id, int step_ordinal, int expected_attempt,
+        const std::string& output_json, std::vector<xuyan::domain::ExtractionCandidate> candidates);
+    /** @brief 原子提交同一批候选并返回检查点，不读取前序步骤输出。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionJobState> commitExtractionCandidatesState(
         const std::string& command_id, const std::string& job_id, int step_ordinal, int expected_attempt,
         const std::string& output_json, std::vector<xuyan::domain::ExtractionCandidate> candidates);
     /** @brief 按审核状态列出抽取候选。 */
@@ -296,6 +313,17 @@ public:
     xuyan::domain::Result<int> recoverInterruptedSimulationSessions();
 
 private:
+    /** @brief 共用候选提交事务；结果类型仅决定返回完整快照或轻量检查点。 */
+    template<class JobResult> xuyan::domain::Result<JobResult> commitExtractionCandidatesImpl(
+        const std::string& command_id, const std::string& job_id, int step_ordinal, int expected_attempt,
+        const std::string& output_json, std::vector<xuyan::domain::ExtractionCandidate> candidates);
+    /** @brief 共用步骤结算事务，保证两种结果接口的幂等和修订语义一致。 */
+    template<class JobResult> xuyan::domain::Result<JobResult> finishExtractionStepImpl(
+        const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
+        const std::string& terminal_status, const std::string& output_json, const std::string& error_message);
+    /** @brief 共用取消事务，返回结果的范围不改变取消行为或命令日志。 */
+    template<class JobResult> xuyan::domain::Result<JobResult> cancelExtractionJobImpl(
+        const std::string& command_id, const std::string& job_id, int expected_revision);
     sqlite3* database_{nullptr};
 
     /** @brief 创建或升级数据库结构，并保持旧工作区可读取。 */
