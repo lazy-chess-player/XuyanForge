@@ -176,11 +176,12 @@ Result<xuyan::domain::RelationEndpointMatchPage> CandidateService::matchRelation
     }
 }
 
-/** @brief 保存人工审核，保留实体逐字别名，按来源性质生成条目和事件投影并原子提交。 */
+/** @brief 按作者明确的端点选择和来源性质生成条目/事件/关系/地点投影，统一由仓储原子提交。 */
 Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
     const std::string& command_id, const std::string& candidate_id, int expected_revision,
     const std::string& review_status, const std::string& name,
-    const std::string& fields_json, const std::string& provenance_type) {
+    const std::string& fields_json, const std::string& provenance_type,
+    std::optional<xuyan::domain::RelationEndpointSelection> endpoint_selection) {
     auto fields = xuyan::package::parseJson(fields_json, 16, 2000);
     if (!fields.ok() || !fields.value->isObject()) return Result<xuyan::domain::ExtractionCandidate>::failure(
         {ErrorCode::validation_failed, "候选 fields 必须是有效 JSON 对象", false, "修正字段后重试"});
@@ -197,6 +198,12 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
         }
         std::optional<xuyan::domain::WorldEntity> entity;
         std::optional<xuyan::domain::TimelineEvent> timeline;
+        std::optional<xuyan::domain::CandidateGraphProjection> graph;
+        const bool typed_relation = candidate.schema_version == typedCandidateSchemaVersion
+            && candidate.candidate_type == "relation" && review_status == "accepted";
+        if (typed_relation != endpoint_selection.has_value())
+            return Result<xuyan::domain::ExtractionCandidate>::failure({ErrorCode::validation_failed,
+                "接受类型化关系须明确选择两个已确认端点；其他审核不携带端点", false, "校对主语、宾语及当前条目修订"});
         // 接受候选时仍按来源类型区分事实、原文人物说法和模型假设。
         if (review_status == "accepted") {
             auto source = repository.loadSource(candidate.source_id);
@@ -236,10 +243,29 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
                 // 文本切片序号仅表示本来源的叙述位置，不生成绝对故事时间或前因后果边。
                 timeline = std::move(event);
             }
+            if (typed_relation) {
+                xuyan::domain::DirectedRelation relation;
+                relation.id = value.id; relation.world_id = value.world_id;
+                relation.from_entity_id = endpoint_selection->from_entity_id;
+                relation.to_entity_id = endpoint_selection->to_entity_id;
+                relation.dimension = fields.value->find("predicate")->string();
+                relation.bidirectional = !fields.value->find("directed")->boolean();
+                relation.strength = std::nullopt; relation.visibility = "author";
+                relation.truth_status = truth_status; relation.evidence_status = std::string_view(truth_status) == "fact" ? "evidence" : "assumption";
+                // 小说陈述不推定关系强度、有效日期或任何人物的知情权限。
+                graph = xuyan::domain::CandidateGraphProjection{std::move(relation), std::nullopt, std::move(endpoint_selection)};
+            } else if (candidate.schema_version == typedCandidateSchemaVersion && candidate.candidate_type == "entity"
+                       && fields.value->find("kind")->string() == "location") {
+                xuyan::domain::LocationPlacement location;
+                location.location_id = value.id; location.truth_status = truth_status;
+                location.evidence_status = std::string_view(truth_status) == "fact" ? "evidence" : "assumption";
+                // 名称/别名候选不含地理位置或拓扑，保持坐标、父地点、底图和路线未知。
+                graph = xuyan::domain::CandidateGraphProjection{std::nullopt, std::move(location), std::nullopt};
+            }
             entity = std::move(value);
         }
         return repository.reviewExtractionCandidate(command_id, std::move(candidate), expected_revision,
-                                                      std::move(entity), std::move(timeline));
+                                                      std::move(entity), std::move(timeline), std::move(graph));
     } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionCandidate>::failure(
         {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }

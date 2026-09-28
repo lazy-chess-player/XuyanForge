@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xuyan/domain/scenario.h"
+#include "xuyan/domain/world_graph.h"
 
 #include <cstddef>
 #include <cstdint>

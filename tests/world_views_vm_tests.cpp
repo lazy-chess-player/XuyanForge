@@ -145,6 +145,65 @@ void seedWorlds(const std::filesystem::path& database) {
     }
 }
 
+/** @brief 验证关系/地点到界面数据的映射保留未知值、已知零、方向及真实性，不修改可见控件。 */
+void testGraphSemanticMapping() {
+    TemporaryWorkspace workspace;
+    xuyan::storage::WorkspaceRepository repository(workspace.database());
+    require(repository.createWorldTemplate("semantic-vm-world", "语义映射回归").ok(), "semantic view world must create");
+    for (int index = 0; index < 4; ++index) {
+        xuyan::domain::WorldEntity entity;
+        entity.id = "semantic-vm-entity-" + std::to_string(index); entity.world_id = "semantic-vm-world";
+        entity.name = "界面语义条目" + std::to_string(index); entity.kind = index < 2 ? "character" : "location";
+        require(repository.createEntity("semantic-vm-create-" + std::to_string(index), entity).ok(), "semantic view entity must create");
+    }
+    xuyan::domain::DirectedRelation known;
+    known.id = "semantic-vm-known"; known.world_id = "semantic-vm-world";
+    known.from_entity_id = "semantic-vm-entity-0"; known.to_entity_id = "semantic-vm-entity-1";
+    known.dimension = "明确零值"; known.strength = 0;
+    require(repository.saveDirectedRelation("semantic-vm-known-save", known, 0).ok(), "known zero relation must save");
+    auto unknown = known;
+    unknown.id = "semantic-vm-unknown"; unknown.strength.reset(); unknown.bidirectional = true;
+    unknown.truth_status = "claim"; unknown.evidence_status = "assumption";
+    require(repository.saveDirectedRelation("semantic-vm-unknown-save", unknown, 0).ok(), "unknown bidirectional claim must save");
+    xuyan::domain::LocationPlacement unplaced;
+    unplaced.location_id = "semantic-vm-entity-2";
+    require(repository.saveLocationPlacement("semantic-vm-unplaced-save", unplaced, 0).ok(), "unplaced location must save");
+    auto placed = unplaced;
+    placed.location_id = "semantic-vm-entity-3"; placed.image_x = 0; placed.image_y = 0;
+    placed.truth_status = "hypothesis"; placed.evidence_status = "assumption";
+    require(repository.saveLocationPlacement("semantic-vm-placed-save", placed, 0).ok(), "zero coordinate hypothesis must save");
+
+    WorldViewsViewModel model(workspace.database());
+    model.setWorldId("semantic-vm-world"); waitUntilIdle(model);
+    require(model.errorText().isEmpty() && model.relations().size() == 2 && model.locations().size() == 2,
+            "semantic view mapping must load both relation and location pairs");
+    QVariantMap known_item, unknown_item, unplaced_item, placed_item;
+    for (const auto& item : model.relations()) {
+        auto values = item.toMap();
+        if (values.value("id").toString() == "semantic-vm-known") known_item = std::move(values);
+        else if (values.value("id").toString() == "semantic-vm-unknown") unknown_item = std::move(values);
+    }
+    for (const auto& item : model.locations()) {
+        auto values = item.toMap();
+        if (values.value("id").toString() == "semantic-vm-entity-2") unplaced_item = std::move(values);
+        else if (values.value("id").toString() == "semantic-vm-entity-3") placed_item = std::move(values);
+    }
+    // 不对未知强度执行 toInt：空 QVariant 与已知的整数零必须在传给 QML 时仍可区分。
+    require(!known_item.isEmpty() && known_item.value("strength").isValid() && known_item.value("strength").toInt() == 0
+            && !known_item.value("bidirectional").toBool() && known_item.value("truthStatus").toString() == "fact",
+            "known zero and single-direction fact must remain explicit");
+    require(!unknown_item.isEmpty() && unknown_item.contains("strength") && !unknown_item.value("strength").isValid()
+            && unknown_item.value("bidirectional").toBool() && unknown_item.value("truthStatus").toString() == "claim",
+            "unknown strength must not become zero or lose bidirectional claim state");
+    require(!unplaced_item.isEmpty() && unplaced_item.value("x").toString() == QStringLiteral("未知")
+            && unplaced_item.value("y").toString() == QStringLiteral("未知") && unplaced_item.value("truthStatus").toString() == "fact",
+            "unknown coordinate pair must stay unknown");
+    require(!placed_item.isEmpty() && placed_item.value("x").toString() == "0" && placed_item.value("y").toString() == "0"
+            && placed_item.value("truthStatus").toString() == "hypothesis", "known zero coordinates must keep hypothesis state");
+    model.setWorldId({});
+    require(model.relations().isEmpty() && model.locations().isEmpty(), "clearing world must clear graph semantic values");
+}
+
 /** @brief 检查空选择不回退首个世界，以及 A→B→A 切换不串数据。 */
 void testSelectionAndIsolation(const std::filesystem::path& database) {
     WorldViewsViewModel view_model(database);
@@ -923,6 +982,7 @@ int main(int argc, char* argv[]) {
         TemporaryWorkspace workspace;
         seedWorlds(workspace.database());
         seedCandidates(workspace.database());
+        testGraphSemanticMapping();
         testSelectionAndIsolation(workspace.database());
         testLateCallbackIsolation(workspace.database());
         testCandidatePaging(workspace.database());

@@ -2449,7 +2449,7 @@ COMMIT;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> verification(upgraded_database, &sqlite3_close);
     require(reopened_result == SQLITE_OK && verification != nullptr,
             "upgraded candidate fixture database must reopen");
-    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 28
+    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 29
                 && sqliteScalar(verification.get(),
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_candidate_scope_page'") == 1
                 && sqliteScalar(verification.get(), "SELECT COUNT(*) FROM candidate_review_history") == 9,
@@ -2525,6 +2525,439 @@ COMMIT;
     const auto removed_last = service.listPage("world-a", "", "candidate", 2, 4);
     require(removed_last.ok() && removed_last.value->total == 4 && removed_last.value->items.empty(),
             "deleted last page must return an empty page with updated total for pagination recovery");
+}
+
+/** @brief 验证图语义迁移保留旧数值/位置，新格式区分未知，损坏或未来格式不被偷偷修复。 */
+void testGraphSemanticsMigrationAndExplicitWrites() {
+    using namespace xuyan::domain;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-graph-migration-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
+            "graph migration must own its temporary directory");
+    struct Cleanup {
+        std::filesystem::path directory;
+        std::filesystem::path parent;
+        /** @brief 只移除本测试独占目录，不递归操作用户目录或其他工作区。 */
+        ~Cleanup() {
+            if (directory.parent_path() == parent) {
+                std::error_code ignored; std::filesystem::remove_all(directory, ignored);
+            }
+        }
+    } cleanup{directory, parent};
+    const auto database = directory / "workspace.sqlite";
+    {
+        xuyan::storage::WorkspaceRepository repository(database);
+        require(repository.createWorldTemplate("graph-migration-world", "图语义迁移测试").ok(), "migration world must create explicitly");
+        for (int index = 0; index < 3; ++index) {
+            WorldEntity entity;
+            entity.id = "graph-migration-entity-" + std::to_string(index); entity.world_id = "graph-migration-world";
+            entity.name = "显式迁移条目" + std::to_string(index); entity.kind = index == 2 ? "location" : "character";
+            require(repository.createEntity("graph-migration-create-" + std::to_string(index), entity).ok(),
+                    "migration endpoints must create explicitly");
+        }
+        DirectedRelation relation;
+        relation.id = "graph-migration-relation"; relation.world_id = "graph-migration-world";
+        relation.from_entity_id = "graph-migration-entity-0"; relation.to_entity_id = "graph-migration-entity-1";
+        relation.dimension = "人工关系"; relation.strength = 0; relation.evidence_status = "assumption";
+        require(repository.saveDirectedRelation("graph-migration-relation-save", relation, 0).ok(),
+                "old-style manual relationship must preserve known zero strength");
+        LocationPlacement location;
+        location.location_id = "graph-migration-entity-2"; location.image_x = 0; location.image_y = 0;
+        require(repository.saveLocationPlacement("graph-migration-location-save", location, 0).ok(),
+                "old-style zero coordinate pair must remain known coordinates");
+    }
+    sqlite3* opened = nullptr;
+    const auto status = sqlite3_open(database.string().c_str(), &opened);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(opened, &sqlite3_close);
+    require(status == SQLITE_OK && sql, "migration fixture must open its owned database");
+    require(sqlite3_exec(sql.get(), "DROP TABLE relation_semantics; DROP TABLE location_semantics; PRAGMA user_version=28;",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "migration fixture must restore only its owned pre-semantic schema");
+    {
+        xuyan::storage::WorkspaceRepository migrated(database);
+        const auto relations = migrated.listDirectedRelations("graph-migration-world", {}, std::nullopt, {}, true);
+        const auto map = migrated.loadMapView("graph-migration-world");
+        require(sqliteScalar(sql.get(), "PRAGMA user_version") == 29 && relations.ok() && relations.value->size() == 1
+                    && relations.value->front().strength == std::optional<int>{0} && !relations.value->front().bidirectional
+                    && relations.value->front().truth_status == "hypothesis" && map.ok() && map.value->locations.size() == 1
+                    && map.value->locations.front().image_x == std::optional<int>{0}
+                    && map.value->locations.front().image_y == std::optional<int>{0}
+                    && map.value->locations.front().truth_status == "fact",
+                "28-to-29 migration must retain known zero, single direction and existing coordinate pairs");
+        auto edited = relations.value->front(); edited.strength = std::nullopt; edited.bidirectional = true;
+        edited.truth_status = "claim";
+        auto saved = migrated.saveDirectedRelation("graph-new-semantics", edited, 1);
+        require(saved.ok() && !saved.value->strength && saved.value->bidirectional && saved.value->truth_status == "claim",
+                "manual edits must atomically save new semantic fields");
+        auto replay = migrated.saveDirectedRelation("graph-new-semantics", edited, 1);
+        require(replay.ok() && replay.value->revision == 2, "manual graph semantic command replay must be idempotent");
+        auto conflicting = edited; conflicting.strength = 0;
+        require(!migrated.saveDirectedRelation("graph-new-semantics", conflicting, 1).ok(),
+                "unknown and known zero must produce different manual command payloads");
+        conflicting = edited; conflicting.bidirectional = false;
+        require(!migrated.saveDirectedRelation("graph-new-semantics", conflicting, 1).ok(),
+                "direction changes must not be hidden by command replay");
+        conflicting = edited; conflicting.truth_status = "hypothesis";
+        require(!migrated.saveDirectedRelation("graph-new-semantics", conflicting, 1).ok(),
+                "claim and hypothesis must remain distinct command semantics");
+        conflicting = edited; conflicting.truth_status = "fact";
+        require(!migrated.saveDirectedRelation("graph-invalid-evidence", conflicting, 2).ok(),
+                "assumption evidence must not be combined with fact truth");
+        auto location = map.value->locations.front(); location.image_x.reset(); location.image_y.reset();
+        location.evidence_status = "assumption"; location.truth_status = "claim";
+        auto location_saved = migrated.saveLocationPlacement("graph-location-semantics", location, 1);
+        require(location_saved.ok() && !location_saved.value->image_x && !location_saved.value->image_y
+                    && location_saved.value->truth_status == "claim", "manual map edits must retain unknown position and claim truth");
+        auto changed = location; changed.truth_status = "hypothesis";
+        require(!migrated.saveLocationPlacement("graph-location-semantics", changed, 1).ok(),
+                "manual location truth changes must conflict under a reused command");
+    }
+    // 降回28但保留已有新语义，迁移不能覆盖作者已经保存的双向/未知/说法值。
+    require(sqlite3_exec(sql.get(), "PRAGMA user_version=28", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "semantic preservation fixture must mark its owned migration version");
+    {
+        xuyan::storage::WorkspaceRepository preserved(database);
+        const auto relations = preserved.listDirectedRelations("graph-migration-world", {}, std::nullopt, {}, true);
+        require(relations.ok() && !relations.value->front().strength && relations.value->front().bidirectional
+                    && relations.value->front().truth_status == "claim", "repeated migration must not overwrite existing semantic rows");
+    }
+    require(sqlite3_exec(sql.get(), "DELETE FROM relation_semantics; PRAGMA user_version=28; "
+        "CREATE TRIGGER fail_graph_migration BEFORE INSERT ON relation_semantics BEGIN SELECT RAISE(ABORT,'migration failure'); END;",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "migration rollback fixture must install");
+    bool rejected = false;
+    try { xuyan::storage::WorkspaceRepository failed(database); } catch (const std::exception&) { rejected = true; }
+    require(rejected && sqliteScalar(sql.get(), "PRAGMA user_version") == 28
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM relation_semantics") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM directed_relation") == 1
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity") == 3,
+            "failed migration must roll back its version and additions without removing existing graph or entities");
+    require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_graph_migration", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "migration rollback fixture must remove its fault trigger");
+    { xuyan::storage::WorkspaceRepository retry(database); }
+    require(sqliteScalar(sql.get(), "PRAGMA user_version") == 29, "migration must retry after failure");
+    require(sqlite3_exec(sql.get(), "DELETE FROM relation_semantics", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "current-version missing semantics fixture must remove only its owned row");
+    {
+        xuyan::storage::WorkspaceRepository current(database);
+        require(!current.listDirectedRelations("graph-migration-world", {}, std::nullopt, {}, true).ok()
+                    && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM relation_semantics") == 0,
+                "current-version missing semantics must fail closed without guessing known zero or repairing rows");
+    }
+    require(sqlite3_exec(sql.get(), "PRAGMA user_version=30", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "future-version fixture must change only its owned marker");
+    rejected = false;
+    try { xuyan::storage::WorkspaceRepository future(database); } catch (const std::exception&) { rejected = true; }
+    require(rejected && sqliteScalar(sql.get(), "PRAGMA user_version") == 30
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM directed_relation") == 1,
+            "future schema must be rejected without modifying existing records");
+}
+
+/** @brief 验证关系明确绑定与地点未知位置在同一审核事务落库，故障/重放不会产生部分资料。 */
+void testAcceptedRelationAndLocationProjection() {
+    using namespace xuyan::application;
+    using xuyan::domain::ErrorCode;
+    using xuyan::package::JsonValue;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-graph-review-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
+            "graph review must own an isolated temporary workspace");
+    struct Cleanup {
+        std::filesystem::path directory;
+        std::filesystem::path parent;
+        /** @brief 仅移除本次独占的临时目录；数据库连接先于本守卫释放。 */
+        ~Cleanup() {
+            if (directory.parent_path() == parent) {
+                std::error_code ignored; std::filesystem::remove_all(directory, ignored);
+            }
+        }
+    } cleanup{directory, parent};
+    const auto database = directory / "workspace.sqlite";
+    xuyan::storage::WorkspaceRepository repository(database);
+    auto world = repository.createWorldTemplate("graph-review-world", "专用图审核测试");
+    auto other_world = repository.createWorldTemplate("graph-review-other", "其他测试世界");
+    require(world.ok() && other_world.ok(), "graph review worlds must be created explicitly");
+    /** @brief 只在隔离测试工作区显式创建作者确认的端点，不用小说名称自动选中。 */
+    const auto person = [&](const std::string& id, const std::string& world_id, const std::string& name,
+                            const std::string& kind = "character") {
+        xuyan::domain::WorldEntity value;
+        value.id = id; value.world_id = world_id; value.name = name; value.kind = kind;
+        if (name == "林舟") value.aliases = {"阿舟"};
+        auto created = repository.createEntity("create-" + id, value);
+        require(created.ok(), "graph review endpoint fixture must create explicitly");
+        return *created.value;
+    };
+    auto first_person = person("graph-review-person-a", world.value->id, "林舟");
+    const auto same_name = person("graph-review-person-b", world.value->id, "林舟");
+    const auto target = person("graph-review-person-c", world.value->id, "沈棠");
+    const auto cross_world = person("graph-review-cross-world", other_world.value->id, "林舟");
+    const auto not_noun = person("graph-review-event", world.value->id, "林舟", "event");
+    const auto file = directory / "private-runtime.md";
+    {
+        std::ofstream output(file, std::ios::binary);
+        output << "# 第一章\n林舟又称阿舟。沈棠守门。旧塔又名古楼。林舟和沈棠共同守门。\n";
+        require(output.good(), "graph review runtime text must be written");
+    }
+    SourceImportService sources(database);
+    auto source = sources.importTextFile("graph-review-source", file, "1", world.value->id);
+    require(source.ok(), "graph review source must import");
+    InMemoryCredentialStore credentials;
+    ProviderConnectionService connections(database, credentials);
+    xuyan::domain::ProviderConnection connection;
+    connection.id = "graph-review-provider"; connection.name = "无网络测试连接";
+    connection.kind = "deepseek"; connection.endpoint = "https://api.deepseek.com";
+    connection.default_model = "deepseek-flash"; connection.data_policy = "remote_allowed";
+    require(connections.save("graph-review-connection", connection, 0, std::string{"synthetic-test-secret"}).ok(),
+            "graph review credentials must remain in memory without sending requests");
+    ExtractionJobService jobs(database);
+    auto job = jobs.create("graph-review-job", source.value->id, 6000, 0, 0, 1200, connection.id);
+    require(job.ok(), "graph review typed job must create");
+    auto step = jobs.claimNext("graph-review-claim", job.value->id, job.value->revision);
+    require(step.ok(), "graph review chapter must be claimable");
+    auto quote = sources.evidenceText(source.value->id, step.value->start_codepoint, step.value->end_codepoint);
+    require(quote.ok(), "graph review quote must be readable");
+    JsonValue::Array items;
+    for (int index = 0; index < 5; ++index) {
+        const bool relation = index < 2;
+        const JsonValue fields = relation
+            ? JsonValue(JsonValue::Object{{"subject", "阿舟"}, {"object", "沈棠"}, {"directed", index == 1},
+                {"predicate", index == 0 ? std::string(256, 'p') : std::string{"共同守门"}}})
+            : JsonValue(JsonValue::Object{{"kind", "location"}, {"aliases", JsonValue::Array{"古楼"}}});
+        items.emplace_back(JsonValue::Object{{"type", relation ? "relation" : "entity"}, {"name", relation ? "共同守门" : "旧塔"},
+            {"fields", fields}, {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
+            {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)}, {"quote", *quote.value},
+            {"provenance_type", "model_inference"}});
+    }
+    CandidateService service(database);
+    const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v2"},
+        {"prompt_version", "extract-v2"}, {"candidates", std::move(items)}});
+    require(service.ingestStepOutput("graph-review-output", job.value->id, step.value->ordinal,
+                step.value->attempt, output).ok(), "typed graph candidates must ingest");
+    auto page = service.listPage(world.value->id, source.value->id, "candidate", 20, 0);
+    require(page.ok() && page.value->total == 5, "graph candidates must await review");
+    std::vector<xuyan::domain::ExtractionCandidate> locations;
+    xuyan::domain::ExtractionCandidate bidirectional_candidate, directed_candidate;
+    for (const auto& candidate : page.value->items) {
+        if (candidate.candidate_type == "entity") locations.push_back(candidate);
+        else {
+            const auto fields = xuyan::package::parseJson(candidate.fields_json);
+            require(fields.ok(), "graph fixture fields must parse");
+            (fields.value->find("directed")->boolean() ? directed_candidate : bidirectional_candidate) = candidate;
+        }
+    }
+    require(locations.size() == 3 && !bidirectional_candidate.id.empty() && !directed_candidate.id.empty(),
+            "graph fixture must contain both directions and three locations");
+    sqlite3* opened = nullptr;
+    const auto open_status = sqlite3_open(database.string().c_str(), &opened);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(opened, &sqlite3_close);
+    require(open_status == SQLITE_OK && sql, "graph fault fixture must open its owned database");
+    const auto baseline_entities = sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity");
+    const auto empty_map = repository.loadMapView(world.value->id);
+    require(empty_map.ok() && empty_map.value->locations.empty(), "unreviewed locations must not enter the map");
+    // 最后的语义表写入失败时，已经执行的条目、别名、证据及地图本体必须一起回滚。
+    require(sqlite3_exec(sql.get(), "CREATE TRIGGER fail_graph_location BEFORE INSERT ON location_semantics "
+        "BEGIN SELECT RAISE(ABORT,'location semantic failure'); END", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "location projection fault trigger must install");
+    const auto failed_location = service.review("graph-location-0", locations[0].id, 1, "accepted", locations[0].name,
+                                                locations[0].fields_json, "author_setting");
+    require(!failed_location.ok(), "a failed location semantic write must reject the whole review");
+    const auto still_pending = repository.loadExtractionCandidate(locations[0].id);
+    require(still_pending.ok() && still_pending.value->revision == 1 && still_pending.value->review_status == "candidate"
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity") == baseline_entities
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM location_placement") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM evidence_reference") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 5
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_command_log") == 0,
+            "location projection failure must leave no partial accepted data or audit history");
+    require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_graph_location", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "location projection fault trigger must be removed");
+    const std::array<std::string, 3> provenance{"author_setting", "in_text_claim", "model_inference"};
+    const std::array<std::string, 3> truths{"fact", "claim", "hypothesis"};
+    for (std::size_t index = 0; index < locations.size(); ++index) {
+        const auto& candidate = locations[index]; const auto command = "graph-location-" + std::to_string(index);
+        require(service.review(command, candidate.id, 1, "accepted", candidate.name, candidate.fields_json, provenance[index]).ok(),
+                "location projection must accept atomically");
+        require(service.review(command, candidate.id, 1, "accepted", candidate.name, candidate.fields_json, provenance[index]).ok(),
+                "location projection replay must not duplicate the map");
+        auto map = repository.loadMapView(world.value->id);
+        require(map.ok() && map.value->locations.size() == index + 1 && map.value->routes.empty(),
+                "same-name locations must remain separate and must not invent routes");
+        const auto placement = std::find_if(map.value->locations.begin(), map.value->locations.end(),
+            [&](const auto& value) { return value.location_id == "entity-from-" + candidate.id; });
+        require(placement != map.value->locations.end() && placement->truth_status == truths[index]
+                    && placement->evidence_status == (index == 0 ? "evidence" : "assumption") && placement->revision == 1
+                    && !placement->image_x && !placement->image_y && placement->parent_location_id.empty()
+                    && placement->background_asset_ref.empty(), "location projection must preserve truth and all unknown position fields");
+        const auto entity = repository.loadEntity(placement->location_id);
+        require(entity.ok() && entity.value->kind == (index == 0 ? "location" : "other"),
+                "map claims and hypotheses must not promote generic entities to world facts");
+    }
+    first_person.description = "作者修改端点说明";
+    auto edited = repository.saveEntity("graph-endpoint-revision", first_person, 1);
+    require(edited.ok() && edited.value->revision == 2, "endpoint revision fixture must save");
+    const xuyan::domain::RelationEndpointSelection selected{first_person.id, 2, target.id, 1};
+    /** @brief 使用显式端点尝试接受同一待审关系；所有无效选择不得提前推进审核修订。 */
+    const auto reject_selection = [&](const xuyan::domain::RelationEndpointSelection& selection, const std::string& command) {
+        auto result = service.review(command, bidirectional_candidate.id, 1, "accepted", bidirectional_candidate.name,
+                                     bidirectional_candidate.fields_json, "original_fact", selection);
+        require(!result.ok(), "invalid explicit endpoint selection must reject review");
+        auto candidate = repository.loadExtractionCandidate(bidirectional_candidate.id);
+        require(candidate.ok() && candidate.value->revision == 1 && candidate.value->review_status == "candidate",
+                "endpoint validation failure must not change candidate state");
+    };
+    require(!service.review("graph-no-endpoints", bidirectional_candidate.id, 1, "accepted", bidirectional_candidate.name,
+                bidirectional_candidate.fields_json, "original_fact").ok(), "typed relations must not bind by name without explicit endpoint choices");
+    reject_selection({first_person.id, 1, target.id, 1}, "graph-stale-endpoint");
+    reject_selection({cross_world.id, 1, target.id, 1}, "graph-cross-world-endpoint");
+    reject_selection({not_noun.id, 1, target.id, 1}, "graph-event-endpoint");
+    reject_selection({first_person.id, 2, first_person.id, 2}, "graph-self-endpoint");
+    reject_selection({first_person.id, 0, target.id, 1}, "graph-zero-revision");
+    reject_selection({first_person.id, 2, same_name.id, 1}, "graph-object-name-mismatch");
+    const auto inference = repository.loadEntity("entity-from-" + locations[2].id);
+    require(inference.ok(), "hypothesis endpoint fixture must load");
+    auto disguised = *inference.value; disguised.name = "阿舟"; disguised.kind = "character"; disguised.attributes_json = "{}";
+    require(repository.saveEntity("graph-disguise-hypothesis", disguised, 1).ok(), "hypothesis disguise fixture must save");
+    reject_selection({disguised.id, 2, target.id, 1}, "graph-hypothesis-endpoint");
+    require(sqlite3_exec(sql.get(), "CREATE TRIGGER fail_graph_relation BEFORE INSERT ON relation_semantics "
+        "BEGIN SELECT RAISE(ABORT,'relation semantic failure'); END", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "relation projection fault trigger must install");
+    reject_selection(selected, "graph-relation-fact");
+    require(sqliteScalar(sql.get(), "SELECT COUNT(*) FROM directed_relation") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance") == 3
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM evidence_reference") == 3
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 8,
+            "relation semantic failure must roll back graph, acceptance, evidence and new history together");
+    require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_graph_relation", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "relation projection fault trigger must be removed");
+    require(service.review("graph-relation-fact", bidirectional_candidate.id, 1, "accepted", bidirectional_candidate.name,
+                bidirectional_candidate.fields_json, "original_fact", selected).ok(), "same failed command must retry after rollback");
+    require(repository.deleteEntity("graph-delete-chosen-endpoint", first_person.id, 2).ok(), "chosen endpoint must be deletable after acceptance");
+    require(service.review("graph-relation-fact", bidirectional_candidate.id, 1, "accepted", bidirectional_candidate.name,
+                bidirectional_candidate.fields_json, "original_fact", selected).ok(),
+            "committed relation replay must return the original result before rechecking a deleted endpoint");
+    const xuyan::domain::RelationEndpointSelection alternate{same_name.id, 1, target.id, 1};
+    auto conflict = service.review("graph-relation-fact", bidirectional_candidate.id, 1, "accepted", bidirectional_candidate.name,
+                                   bidirectional_candidate.fields_json, "original_fact", alternate);
+    require(!conflict.ok() && conflict.error->code == xuyan::domain::ErrorCode::command_conflict,
+            "changing an explicit endpoint under the same command must conflict, not silently rebind");
+    require(!service.review("graph-deleted-new-selection", directed_candidate.id, 1, "accepted", directed_candidate.name,
+                directed_candidate.fields_json, "in_text_claim", selected).ok(), "new reviews must reject a deleted endpoint");
+    require(service.review("graph-relation-claim", directed_candidate.id, 1, "accepted", directed_candidate.name,
+                directed_candidate.fields_json, "in_text_claim", alternate).ok(), "explicit alternate same-name choice must accept independently");
+    auto relations = repository.listDirectedRelations(world.value->id, {}, std::nullopt, {}, true);
+    auto actor_view = repository.listDirectedRelations(world.value->id, {}, std::nullopt, "unaware-actor", false);
+    require(relations.ok() && relations.value->size() == 2 && actor_view.ok() && actor_view.value->empty(),
+            "novel relationship review must not automatically grant character knowledge");
+    for (const auto& relation : *relations.value) {
+        const bool fact = relation.id == "entity-from-" + bidirectional_candidate.id;
+        require(relation.to_entity_id == target.id && relation.from_entity_id == (fact ? first_person.id : same_name.id)
+                    && relation.bidirectional == fact && !relation.strength && !relation.valid_from && !relation.valid_to
+                    && relation.truth_status == (fact ? "fact" : "claim") && relation.evidence_status == (fact ? "evidence" : "assumption")
+                    && relation.visibility == "author" && relation.actor_grants.empty() && relation.revision == 1
+                    && relation.dimension == (fact ? std::string(256, 'p') : std::string{"共同守门"}),
+                "relationship projection must retain direction, exact endpoints, unknown strength/time and provenance");
+    }
+    const auto evidence = EvidenceService(database).listForSource(source.value->id);
+    require(evidence.ok() && evidence.value->size() == 5, "all graph projections must share accepted-entity evidence IDs");
+    for (const auto& value : *evidence.value)
+        require(value.quote == *quote.value && value.quote_hash == xuyan::domain::sha256(*quote.value)
+                    && value.start_codepoint == step.value->start_codepoint && value.end_codepoint == step.value->end_codepoint,
+                "projection evidence must retain immutable original codepoint ranges and quote hashes");
+    const auto accepted_relation = repository.loadExtractionCandidate(bidirectional_candidate.id);
+    const auto accepted_entity = repository.loadEntity("entity-from-" + bidirectional_candidate.id);
+    require(accepted_relation.ok() && accepted_entity.ok(), "projection bypass fixture must load accepted relation and entity");
+    auto fact_record = std::find_if(relations.value->begin(), relations.value->end(),
+        [&](const auto& value) { return value.id == accepted_entity.value->id; });
+    require(fact_record != relations.value->end(), "projection bypass fixture must find the stable relation record");
+    xuyan::domain::CandidateGraphProjection projection;
+    projection.relation = *fact_record; projection.relation->revision = 0; projection.endpoints = selected;
+    /** @brief 绕过应用入口尝试伪造专用投影，仓储必须在写入审核前拒绝。 */
+    const auto reject_projection = [&](xuyan::domain::CandidateGraphProjection forged, const std::string& command) {
+        const auto result = repository.reviewExtractionCandidate(command, *accepted_relation.value, 1, *accepted_entity.value,
+                    std::nullopt, std::move(forged));
+        // 明确要求投影校验错误；不能借候选已经终结的修订冲突让伪造测试假通过。
+        require(!result.ok() && result.error->code == ErrorCode::validation_failed,
+                "repository must reject forged relationship projection before checking terminal revision");
+    };
+    auto forged = projection; forged.relation->strength = 0; reject_projection(forged, "graph-forged-strength");
+    forged = projection; forged.relation->bidirectional = false; reject_projection(forged, "graph-forged-direction");
+    forged = projection; forged.relation->valid_from = 0; reject_projection(forged, "graph-forged-date");
+    forged = projection; forged.relation->visibility = "public"; reject_projection(forged, "graph-forged-knowledge");
+    forged = projection; forged.relation->truth_status = "hypothesis"; reject_projection(forged, "graph-forged-truth");
+    forged = projection; forged.relation->world_id = other_world.value->id; reject_projection(forged, "graph-forged-world");
+    forged = projection; forged.endpoints.reset(); reject_projection(forged, "graph-no-selection");
+    forged = projection; forged.endpoints->from_revision = 0; reject_projection(forged, "graph-zero-endpoint-revision");
+    auto forged_entity = *accepted_entity.value; forged_entity.aliases = {"无证据关系别名"};
+    const auto alias_result = repository.reviewExtractionCandidate("graph-forged-relation-alias", *accepted_relation.value, 1,
+        forged_entity, std::nullopt, projection);
+    require(!alias_result.ok() && alias_result.error->code == ErrorCode::validation_failed,
+            "typed relation fields must not invent entity aliases");
+    require(!repository.reviewExtractionCandidate("graph-missing-projection", *accepted_relation.value, 1,
+                *accepted_entity.value).ok(), "repository must reject typed relation review without its required projection");
+    const auto accepted_location = repository.loadExtractionCandidate(locations[0].id);
+    const auto location_entity = repository.loadEntity("entity-from-" + locations[0].id);
+    require(accepted_location.ok() && location_entity.ok(), "location bypass fixture must load");
+    xuyan::domain::CandidateGraphProjection location_projection;
+    xuyan::domain::LocationPlacement location_record;
+    location_record.location_id = location_entity.value->id; location_record.truth_status = "fact";
+    location_projection.location = location_record;
+    /** @brief 验证仓储不接受类型化地点中没有证据的坐标、层级、底图或混合类型。 */
+    const auto reject_location = [&](xuyan::domain::CandidateGraphProjection value) {
+        const auto result = repository.reviewExtractionCandidate("graph-forged-location", *accepted_location.value, 1, *location_entity.value,
+                    std::nullopt, std::move(value));
+        require(!result.ok() && result.error->code == ErrorCode::validation_failed,
+                "repository must reject invented location fields before checking terminal revision");
+    };
+    forged = location_projection; forged.location->image_x = 0; forged.location->image_y = 0; reject_location(forged);
+    forged = location_projection; forged.location->parent_location_id = target.id; reject_location(forged);
+    forged = location_projection; forged.location->background_asset_ref = "invented-background"; reject_location(forged);
+    forged = location_projection; forged.location->truth_status = "claim"; reject_location(forged);
+    forged = location_projection; forged.relation = projection.relation; reject_location(forged);
+    require(!repository.reviewExtractionCandidate("graph-location-no-projection", *accepted_location.value, 1,
+                *location_entity.value).ok(), "typed location review must not silently omit the map projection");
+    // 复现上一阶段实体审核摘要：历史接受记录重放只读，不自动补写过去不存在的地图记录。
+    const auto location_fields = xuyan::package::parseJson(accepted_location.value->fields_json);
+    const auto location_attributes = xuyan::package::parseJson(location_entity.value->attributes_json);
+    require(location_fields.ok() && location_attributes.ok(), "historical typed location fixture must parse");
+    JsonValue::Array historic_aliases, historic_tags;
+    for (const auto& alias : location_entity.value->aliases) historic_aliases.emplace_back(alias);
+    for (const auto& tag : location_entity.value->tags) historic_tags.emplace_back(tag);
+    const auto historic_payload = "entity-review-v1:" + xuyan::domain::sha256(xuyan::package::writeJson(JsonValue::Object{
+        {"candidate_id", accepted_location.value->id}, {"expected_revision", 1}, {"name", accepted_location.value->name},
+        {"fields", *location_fields.value}, {"provenance", "author_setting"}, {"entity_id", location_entity.value->id},
+        {"world_id", world.value->id}, {"description", location_entity.value->description}, {"attributes", *location_attributes.value},
+        {"aliases", std::move(historic_aliases)}, {"tags", std::move(historic_tags)}}));
+    sqlite3_stmt* prepared = nullptr;
+    require(sqlite3_prepare_v2(sql.get(), "UPDATE candidate_review_command_log SET payload_hash=? WHERE command_id='graph-location-0'",
+        -1, &prepared, nullptr) == SQLITE_OK, "historic location log fixture must prepare");
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(prepared, &sqlite3_finalize);
+    require(sqlite3_bind_text(statement.get(), 1, historic_payload.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK
+                && sqlite3_step(statement.get()) == SQLITE_DONE && sqlite3_changes(sql.get()) == 1,
+            "historic location fixture must replace exactly one owned command");
+    statement.reset();
+    for (const auto* query : {"DELETE FROM location_semantics WHERE location_id=?", "DELETE FROM location_placement WHERE location_id=?"}) {
+        prepared = nullptr;
+        require(sqlite3_prepare_v2(sql.get(), query, -1, &prepared, nullptr) == SQLITE_OK, "historic projection deletion must prepare");
+        statement.reset(prepared);
+        require(sqlite3_bind_text(statement.get(), 1, location_entity.value->id.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK
+                    && sqlite3_step(statement.get()) == SQLITE_DONE && sqlite3_changes(sql.get()) == 1,
+                "historic projection fixture must delete only its owned record");
+        statement.reset();
+    }
+    require(service.review("graph-location-0", locations[0].id, 1, "accepted", locations[0].name,
+                locations[0].fields_json, "author_setting").ok(), "historic location command must still replay read-only");
+    auto historic_map = repository.loadMapView(world.value->id);
+    require(historic_map.ok() && historic_map.value->locations.size() == 2,
+            "historic replay must not fill in old map records implicitly");
+    require(repository.saveLocationPlacement("graph-explicit-historic-location", location_record, 0).ok(),
+            "a separate explicit author operation may add an old confirmed location to the map");
+    xuyan::storage::WorkspaceRepository reopened(database);
+    const auto persisted_map = reopened.loadMapView(world.value->id);
+    const auto persisted_relations = reopened.listDirectedRelations(world.value->id, {}, std::nullopt, {}, true);
+    require(persisted_map.ok() && persisted_map.value->locations.size() == 3
+                && persisted_relations.ok() && persisted_relations.value->size() == 2,
+            "location and relationship semantic records must survive reopening");
 }
 
 /** @brief 验证实体审核保留逐字别名，关系端点只提供当前世界的精确、已确认匹配建议。 */
@@ -2707,9 +3140,15 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
     auto renamed = service.matchRelationEndpoints(world.value->id, "新别名");
     require(renamed.ok() && renamed.value->items.front().revision == 2
                 && renamed.value->items.front().name == edited.name, "suggestions must expose the current revision for later binding");
-    // 即使旧通用关系条目被编辑成名词分类，也不能冒充已确认实体端点。
+    // 关系接受现在必须明确选择；新通用投影被改成名词分类也不能冒充已确认实体端点。
+    xuyan::domain::WorldEntity endpoint_object;
+    endpoint_object.id = "endpoint-current-object"; endpoint_object.world_id = world.value->id;
+    endpoint_object.kind = "character"; endpoint_object.name = "沈棠";
+    require(repository.createEntity("endpoint-current-object-create", endpoint_object).ok(),
+            "explicit relation object fixture must create");
+    const xuyan::domain::RelationEndpointSelection selected_endpoints{"entity-from-" + entities[0].id, 1, endpoint_object.id, 1};
     require(service.review("endpoint-accept-relation", relation.id, 1, "accepted", relation.name,
-                relation.fields_json, "original_fact").ok(), "generic relation fixture must accept without automatic binding");
+                relation.fields_json, "original_fact", selected_endpoints).ok(), "relation fixture must accept only after explicit binding");
     auto relation_entity = repository.loadEntity("entity-from-" + relation.id);
     require(relation_entity.ok(), "accepted relation fixture must have a generic entity");
     relation_entity.value->name = "阿舟"; relation_entity.value->kind = "character";
@@ -2760,8 +3199,8 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
             "new typed entity command must bind accepted entity contents, not merely the candidate fields");
     auto relation_after = repository.loadExtractionCandidate(relation.id);
     auto relations = repository.listDirectedRelations(world.value->id, {}, std::nullopt, {}, true);
-    require(relation_after.ok() && relation_after.value->revision == 2 && relations.ok() && relations.value->empty(),
-            "read-only suggestions must never bind an endpoint, create a graph edge or advance candidate review");
+    require(relation_after.ok() && relation_after.value->revision == 2 && relations.ok() && relations.value->size() == 1,
+            "read-only suggestions must not add edges or advance the already explicitly accepted relation");
     xuyan::storage::WorkspaceRepository reopened(database);
     auto persisted = reopened.matchRelationEndpoints(world.value->id, long_alias, 20, 0);
     require(persisted.ok() && persisted.value->total == 2,
@@ -4129,6 +4568,8 @@ int main() {
         testOfflineBatchCheckpoints();
         testPersistentExtractionQueue();
         testScopedCandidatePaging();
+        testGraphSemanticsMigrationAndExplicitWrites();
+        testAcceptedRelationAndLocationProjection();
         testAcceptedEntityAliasesAndEndpointMatches();
         testAcceptedEventTimelineProjection();
         testNarrativeBackbonePreviewAndEvidenceMapping();

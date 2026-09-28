@@ -29,13 +29,17 @@ struct DirectedRelation {
     std::string from_entity_id;
     std::string to_entity_id;
     std::string dimension;
-    int strength{0};
+    // 人工旧记录的零值保持已知零；小说提取未给出数值时显式置为空。
+    std::optional<int> strength{0};
     std::optional<std::int64_t> valid_from;
     std::optional<std::int64_t> valid_to;
     std::string visibility{"public"};
     std::vector<std::string> actor_grants;
     std::string evidence_status{"evidence"};
     int revision{0};
+    bool bidirectional{false};
+    // 空值仅用于人工旧调用，校验时按证据状态规范化，持久化时始终写明确状态。
+    std::string truth_status{};
 };
 
 struct LocationPlacement {
@@ -46,6 +50,7 @@ struct LocationPlacement {
     std::string background_asset_ref;
     std::string evidence_status{"evidence"};
     int revision{0};
+    std::string truth_status{};
 };
 
 struct TravelRoute {
@@ -61,6 +66,21 @@ struct TravelRoute {
 struct MapView {
     std::vector<LocationPlacement> locations;
     std::vector<TravelRoute> routes;
+};
+
+/** @brief 保存作者明确选择的两个关系端点及预期修订，不接受仅有名称的自动对应。 */
+struct RelationEndpointSelection {
+    std::string from_entity_id;
+    int from_revision{0};
+    std::string to_entity_id;
+    int to_revision{0};
+};
+
+/** @brief 携带一种专用图投影；关系必须带端点选择，地点不得携带关系或端点。 */
+struct CandidateGraphProjection {
+    std::optional<DirectedRelation> relation;
+    std::optional<LocationPlacement> location;
+    std::optional<RelationEndpointSelection> endpoints;
 };
 
 /** @brief 校验时间线事件及其前因后果引用。 */

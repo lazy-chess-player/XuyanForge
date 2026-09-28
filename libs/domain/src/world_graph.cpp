@@ -7,6 +7,12 @@ namespace xuyan::domain {
 namespace {
 /** @brief 判断地图或关系证据状态是否属于允许值。 */
 bool validEvidence(std::string_view value) { return value == "evidence" || value == "assumption"; }
+/** @brief 规范化人工旧调用的真实性，拒绝把说法/假设与事实证据状态混用。 */
+bool normalizeTruth(std::string& truth, std::string_view evidence) {
+    if (truth.empty()) truth = evidence == "evidence" ? "fact" : "hypothesis";
+    return (truth == "fact" && evidence == "evidence")
+        || ((truth == "claim" || truth == "hypothesis") && evidence == "assumption");
+}
 /** @brief 对关系与事件的多值引用删除空项并去重。 */
 void normalize(std::vector<std::string>& values) {
     values.erase(std::remove_if(values.begin(), values.end(), [](const auto& v) { return v.empty(); }), values.end());
@@ -26,11 +32,13 @@ Result<TimelineEvent> validateTimelineEvent(TimelineEvent event) {
     return Result<TimelineEvent>::success(std::move(event));
 }
 
+/** @brief 校验关系端点、可选强度、时间、方向与可见范围，并保留明确的事实/说法/假设状态。 */
 Result<DirectedRelation> validateDirectedRelation(DirectedRelation relation) {
     constexpr std::array visibility{std::string_view{"public"}, std::string_view{"author"}, std::string_view{"restricted"}};
     if (relation.id.empty() || relation.world_id.empty() || relation.from_entity_id.empty() || relation.to_entity_id.empty()
-        || relation.from_entity_id == relation.to_entity_id || relation.dimension.empty() || relation.dimension.size() > 128
-        || relation.strength < -100 || relation.strength > 100 || !validEvidence(relation.evidence_status)
+        || relation.from_entity_id == relation.to_entity_id || relation.dimension.empty() || relation.dimension.size() > 256
+        || (relation.strength && (*relation.strength < -100 || *relation.strength > 100)) || !validEvidence(relation.evidence_status)
+        || !normalizeTruth(relation.truth_status, relation.evidence_status)
         || std::find(visibility.begin(), visibility.end(), relation.visibility) == visibility.end()
         || (relation.valid_from && relation.valid_to && *relation.valid_from > *relation.valid_to))
         return Result<DirectedRelation>::failure(
@@ -43,11 +51,13 @@ Result<DirectedRelation> validateDirectedRelation(DirectedRelation relation) {
     return Result<DirectedRelation>::success(std::move(relation));
 }
 
+/** @brief 校验地点层级、成对的可选坐标和真实性，不用零坐标代替未知位置。 */
 Result<LocationPlacement> validateLocationPlacement(LocationPlacement placement) {
     if (placement.location_id.empty() || placement.location_id == placement.parent_location_id
         || placement.image_x.has_value() != placement.image_y.has_value()
         || (placement.image_x && (*placement.image_x < 0 || *placement.image_y < 0))
-        || placement.background_asset_ref.size() > 1024 || !validEvidence(placement.evidence_status))
+        || placement.background_asset_ref.size() > 1024 || !validEvidence(placement.evidence_status)
+        || !normalizeTruth(placement.truth_status, placement.evidence_status))
         return Result<LocationPlacement>::failure(
             {ErrorCode::validation_failed, "地点层级、底图坐标或证据状态无效", false, "修正地点标注"});
     return Result<LocationPlacement>::success(std::move(placement));

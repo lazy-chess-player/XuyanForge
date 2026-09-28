@@ -37,6 +37,7 @@ void WorldViewsViewModel::setWorldId(QString world_id) {
     if (!world_id_.isEmpty()) refresh();
 }
 
+/** @brief 异步读取当前世界视图，保留未知值及真实性，并丢弃切世界后的旧回调。 */
 void WorldViewsViewModel::refresh() {
     if (busy_ || world_id_.isEmpty()) return;
     const auto generation = ++generation_;
@@ -54,10 +55,10 @@ void WorldViewsViewModel::refresh() {
         if (error.isEmpty() && !timeline.ok()) error = q(timeline.error->message);
         else if (timeline.ok()) for (const auto& value : *timeline.value) timeline_items.push_back(QVariantMap{{"id", q(value.id)}, {"name", q(value.name)}, {"storyTime", value.story_time ? QString::number(*value.story_time) : QStringLiteral("未知")}, {"narrativeOrder", value.narrative_order}, {"relativeTime", q(value.relative_time)}, {"truthStatus", q(value.truth_status)}, {"causes", static_cast<int>(value.causes.size())}, {"results", static_cast<int>(value.results.size())}});
         if (error.isEmpty() && !relations.ok()) error = q(relations.error->message);
-        else if (relations.ok()) for (const auto& value : *relations.value) relation_items.push_back(QVariantMap{{"id", q(value.id)}, {"from", q(value.from_entity_id)}, {"to", q(value.to_entity_id)}, {"dimension", q(value.dimension)}, {"strength", value.strength}, {"visibility", q(value.visibility)}, {"evidenceStatus", q(value.evidence_status)}});
+        else if (relations.ok()) for (const auto& value : *relations.value) relation_items.push_back(QVariantMap{{"id", q(value.id)}, {"from", q(value.from_entity_id)}, {"to", q(value.to_entity_id)}, {"dimension", q(value.dimension)}, {"strength", value.strength ? QVariant(*value.strength) : QVariant{}}, {"visibility", q(value.visibility)}, {"evidenceStatus", q(value.evidence_status)}, {"bidirectional", value.bidirectional}, {"truthStatus", q(value.truth_status)}});
         if (error.isEmpty() && !map.ok()) error = q(map.error->message);
         else if (map.ok()) {
-            for (const auto& value : map.value->locations) location_items.push_back(QVariantMap{{"id", q(value.location_id)}, {"parent", q(value.parent_location_id)}, {"x", value.image_x ? QString::number(*value.image_x) : QStringLiteral("未知")}, {"y", value.image_y ? QString::number(*value.image_y) : QStringLiteral("未知")}, {"evidenceStatus", q(value.evidence_status)}});
+            for (const auto& value : map.value->locations) location_items.push_back(QVariantMap{{"id", q(value.location_id)}, {"parent", q(value.parent_location_id)}, {"x", value.image_x ? QString::number(*value.image_x) : QStringLiteral("未知")}, {"y", value.image_y ? QString::number(*value.image_y) : QStringLiteral("未知")}, {"evidenceStatus", q(value.evidence_status)}, {"truthStatus", q(value.truth_status)}});
             for (const auto& value : map.value->routes) route_items.push_back(QVariantMap{{"id", q(value.id)}, {"from", q(value.from_location_id)}, {"to", q(value.to_location_id)}, {"minutes", value.travel_minutes ? QString::number(*value.travel_minutes) : QStringLiteral("未知")}, {"bidirectional", value.bidirectional}, {"evidenceStatus", q(value.evidence_status)}});
         }
         if (error.isEmpty() && versions.ok() && !versions.value->empty()) {

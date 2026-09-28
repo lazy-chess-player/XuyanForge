@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <vector>
 
 namespace xuyan::application {
@@ -31,11 +32,12 @@ public:
     /** @brief 提供当前世界已确认实体的精确名称/别名建议，分页返回稳定ID，不自动绑定或合并。 */
     xuyan::domain::Result<xuyan::domain::RelationEndpointMatchPage> matchRelationEndpoints(
         const std::string& world_id, const std::string& mention, int limit = 20, std::int64_t offset = 0);
-    /** @brief 以乐观锁审核候选；保留实体逐字别名，事件原子创建带证据时间线，不推定日期或因果。 */
+    /** @brief 原子审核及投影；关系需明确选择端点及修订，保留未知强度/坐标与来源性质。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> review(
         const std::string& command_id, const std::string& candidate_id, int expected_revision,
         const std::string& review_status, const std::string& name,
-        const std::string& fields_json, const std::string& provenance_type);
+        const std::string& fields_json, const std::string& provenance_type,
+        std::optional<xuyan::domain::RelationEndpointSelection> endpoint_selection = std::nullopt);
 private:
     /** @brief 共用候选校验实现，结果类型决定提交后的快照范围，不放松证据条件。 */
     template<class JobResult> xuyan::domain::Result<JobResult> ingestStepOutputImpl(

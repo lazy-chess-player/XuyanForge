@@ -227,11 +227,12 @@ public:
     /** @brief 读取单个抽取候选及其原文证据元数据。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> loadExtractionCandidate(
         const std::string& candidate_id);
-    /** @brief 按修订原子保存审核、条目及证据；类型化实体别名和事件时间线必须与候选一致。 */
+    /** @brief 原子保存审核、证据及专用投影；关系端点在事务内按明确ID和预期修订校验。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> reviewExtractionCandidate(
         const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,
         std::optional<xuyan::domain::WorldEntity> accepted_entity,
-        std::optional<xuyan::domain::TimelineEvent> accepted_timeline = std::nullopt);
+        std::optional<xuyan::domain::TimelineEvent> accepted_timeline = std::nullopt,
+        std::optional<xuyan::domain::CandidateGraphProjection> accepted_graph = std::nullopt);
     /** @brief 按修订保存实体的时间与人物可见范围。 */
     xuyan::domain::Result<xuyan::domain::EntityRetrievalScope> saveEntityRetrievalScope(
         const std::string& command_id, xuyan::domain::EntityRetrievalScope scope, int expected_revision);
