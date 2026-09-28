@@ -29,6 +29,14 @@
 #include <string>
 #include <atomic>
 
+/** @brief 仅在测试程序内等待工作线程结束，刻意保留尚未执行的界面结束回调。 */
+struct ExtractionJobViewModelTestAccess {
+    /** @brief 等待已排队的自有线程，不处理Qt事件，以稳定复现检查点末尾竞态。 */
+    static void joinWorker(ExtractionJobViewModel& model) {
+        if (!model.worker_pool_.waitForDone(10000)) throw std::runtime_error("worker join timed out");
+    }
+};
+
 namespace {
 
 /** @brief 在断言失败时给出具体的回归场景。 */
@@ -864,6 +872,48 @@ void testRemoteBatchControls() {
             "remote resume must send only remaining slices");
 }
 
+/** @brief 后台已让出而结束通知仍排队时，取消不能被最终状态刷新吞掉。 */
+void testLateCheckpointCancellation() {
+    TemporaryWorkspace workspace;
+    const auto job = createBatchFixture(workspace.database());
+    ExtractionJobViewModel model(workspace.database(), nullptr, [](const auto& path, const auto& id, const auto& options) {
+        auto one_step = options;
+        one_step.maximum_steps = 1;
+        return xuyan::application::MockExtractionProcessor(path).processBatch(id, one_step);
+    });
+    waitUntilIdle(model); model.setWorldId("world-a"); waitUntilIdle(model);
+    const auto id = QString::fromStdString(job.id);
+    model.startJob(id);
+    ExtractionJobViewModelTestAccess::joinWorker(model);
+    require(model.running(), "queued completion callback must not have run during thread join");
+    model.cancelJob(id, 0);
+    waitUntilBatchStopped(model);
+    auto cancelled = xuyan::application::ExtractionJobService(workspace.database()).load(job.id);
+    require(cancelled.ok() && cancelled.value->status == "cancelled" && cancelled.value->completed_steps == 1,
+            "late checkpoint cancellation must persist without losing committed output");
+}
+
+/** @brief 明确取消后立即关闭视图模型，尚未处理的结束回调不应丢失取消意图。 */
+void testLateCancellationBeforeExit() {
+    TemporaryWorkspace workspace;
+    const auto job = createBatchFixture(workspace.database());
+    auto model = std::make_unique<ExtractionJobViewModel>(workspace.database(), nullptr,
+        [](const auto& path, const auto& id, const auto& options) {
+            auto one_step = options; one_step.maximum_steps = 1;
+            return xuyan::application::MockExtractionProcessor(path).processBatch(id, one_step);
+        });
+    waitUntilIdle(*model); model->setWorldId("world-a"); waitUntilIdle(*model);
+    const auto id = QString::fromStdString(job.id);
+    model->startJob(id);
+    ExtractionJobViewModelTestAccess::joinWorker(*model);
+    model->cancelJob(id, 0);
+    model.reset();
+    auto cancelled = xuyan::application::ExtractionJobService(workspace.database()).load(job.id);
+    require(cancelled.ok() && cancelled.value->status == "cancelled" && cancelled.value->completed_steps == 1,
+            "closing immediately after late cancel must persist cancellation");
+    QCoreApplication::processEvents();
+}
+
 } // namespace
 
 /** @brief 运行世界视图模型的异步选择与回调隔离回归。 */
@@ -890,6 +940,8 @@ int main(int argc, char* argv[]) {
         testBatchFailureRecovery();
         testBatchDestructionJoinsWorker();
         testRemoteBatchControls();
+        testLateCheckpointCancellation();
+        testLateCancellationBeforeExit();
         {
             TemporaryWorkspace empty_page_workspace;
             seedWorlds(empty_page_workspace.database());

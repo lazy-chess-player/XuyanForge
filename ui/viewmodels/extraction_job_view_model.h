@@ -71,9 +71,15 @@ public:
 signals:
     void changed();
 private:
+    // 仅允许确定性回归等待自有线程完成；不向QML暴露线程池或新的执行权限。
+    friend struct ExtractionJobViewModelTestAccess;
     struct RunControl;
     /** @brief 在自有串行线程池执行指定上限的批次，统一隔离异常与跨世界回调。 */
     void launchBatch(QString job_id, int maximum_steps, bool require_remote);
+    /** @brief 在界面线程处理结束通知，并将检查点末尾迟到的取消补作持久化结算。 */
+    void finishBatch(xuyan::domain::Result<xuyan::application::OfflineBatchResult> result,
+                     std::uint64_t session, QString job_id, QString operation_world,
+                     bool cancellation_settled = false);
     /** @brief 把最近一次检查点计数覆盖到列表，避免刷新时短暂倒退。 */
     void overlayProgress();
     /** @brief 将已由数据库按世界过滤的任务映射为当前列表。 */

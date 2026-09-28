@@ -154,6 +154,16 @@ ExtractionJobViewModel::ExtractionJobViewModel(std::filesystem::path database_pa
 ExtractionJobViewModel::~ExtractionJobViewModel() {
     if (run_control_) run_control_->stop.request_stop();
     worker_pool_.waitForDone();
+    // 关闭窗口会丢弃排队的结束回调；此前明确点击的取消仍须在退出前持久化。
+    if (run_control_ && run_control_->action.load() == xuyan::application::OfflineBatchAction::cancel) {
+        try {
+            xuyan::application::ExtractionJobService service(database_path_);
+            const auto id = active_job_id_.toStdString();
+            auto state = service.loadState(id);
+            if (state.ok() && state.value->status != "completed" && state.value->status != "cancelled")
+                service.cancel(QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString(), id, state.value->revision);
+        } catch (...) { /* 析构不抛异常；无法落盘时仍保留原数据库检查点供下次检查。 */ }
+    }
 }
 
 /** @brief 查询共享意图，不把等待当前 HTTP 请求结束伪装成即时中断。 */
@@ -451,29 +461,67 @@ void ExtractionJobViewModel::launchBatch(QString job_id, int maximum_steps, bool
                 "后台解析发生内部错误；已提交片段保留", true, "刷新任务后从检查点继续"});
         }
         QMetaObject::invokeMethod(this, [this, result = std::move(result), session, job_id, operation_world]() mutable {
-            if (session != run_generation_) return;
-            running_ = false; active_job_id_.clear(); active_world_id_.clear(); run_control_.reset();
-            if (result.ok() && result.value->reason == OfflineBatchStopReason::paused) paused_jobs_.insert(job_id);
-            if (world_id_ == operation_world) {
-                if (!result.ok()) {
-                    error_text_ = QString::fromStdString(result.error->message);
-                    retain_error_on_refresh_ = true;
-                }
-                else {
-                    switch (result.value->reason) {
-                    case OfflineBatchStopReason::completed: status_text_ = QStringLiteral("解析完成；候选已进入人工校对，未自动写入世界"); break;
-                    case OfflineBatchStopReason::paused: status_text_ = QStringLiteral("已暂停；可以从检查点继续"); break;
-                    case OfflineBatchStopReason::cancelled: status_text_ = QStringLiteral("已取消剩余片段；已提交候选保留"); break;
-                    case OfflineBatchStopReason::step_limit: status_text_ = QStringLiteral("本批次结束；可继续处理剩余片段"); break;
-                    default: status_text_ = QStringLiteral("解析已停止，请核对问题片段或调用上限；不会自动重发"); break;
-                    }
-                }
-            }
-            overlayProgress(); emit changed();
-            refresh_after_world_change_ = true;
-            refreshAfterWorldChange();
+            finishBatch(std::move(result), session, job_id, operation_world);
         }, Qt::QueuedConnection);
     });
+}
+
+/** @brief 在界面线程最终结算批次；工作线程已退出但结束通知尚未到达时仍接受取消意图。 */
+void ExtractionJobViewModel::finishBatch(
+    xuyan::domain::Result<xuyan::application::OfflineBatchResult> result, std::uint64_t session,
+    QString job_id, QString operation_world, bool cancellation_settled) {
+    using namespace xuyan::application;
+    if (session != run_generation_) return;
+    const bool terminal = result.ok() && (result.value->job.status == "completed" || result.value->job.status == "cancelled");
+    if (!cancellation_settled && !terminal && run_control_
+        && run_control_->action.load() == OfflineBatchAction::cancel) {
+        // 弥补最后进度通知与结束通知之间的取消窗口；此时仍保留运行态，不允许另起批次。
+        const auto path = database_path_;
+        worker_pool_.start([this, path, session, job_id, operation_world] {
+            using Result = xuyan::domain::Result<OfflineBatchResult>;
+            auto settled = Result::failure({xuyan::domain::ErrorCode::storage_error,
+                "取消请求无法保存；检查点保留，请刷新后重试", true, "重试取消"});
+            try {
+                ExtractionJobService service(path);
+                auto state = service.loadState(job_id.toStdString());
+                if (!state.ok()) settled = Result::failure(*state.error);
+                else {
+                    auto job = state.value->status == "completed" || state.value->status == "cancelled"
+                        ? service.load(job_id.toStdString())
+                        : service.cancel(QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString(),
+                                         job_id.toStdString(), state.value->revision);
+                    if (!job.ok()) settled = Result::failure(*job.error);
+                    else {
+                        const auto reason = job.value->status == "completed" ? OfflineBatchStopReason::completed : OfflineBatchStopReason::cancelled;
+                        settled = Result::success({std::move(*job.value), 0, reason});
+                    }
+                }
+            } catch (...) { /* 保留统一中文错误，不在结束回调中抛异常或泄露私人内容。 */ }
+            QMetaObject::invokeMethod(this, [this, settled = std::move(settled), session, job_id, operation_world]() mutable {
+                finishBatch(std::move(settled), session, job_id, operation_world, true);
+            }, Qt::QueuedConnection);
+        });
+        return;
+    }
+    running_ = false; active_job_id_.clear(); active_world_id_.clear(); run_control_.reset();
+    if (result.ok() && result.value->reason == OfflineBatchStopReason::paused) paused_jobs_.insert(job_id);
+    if (world_id_ == operation_world) {
+        if (!result.ok()) {
+            error_text_ = QString::fromStdString(result.error->message);
+            retain_error_on_refresh_ = true;
+        } else {
+            switch (result.value->reason) {
+            case OfflineBatchStopReason::completed: status_text_ = QStringLiteral("解析完成；候选已进入人工校对，未自动写入世界"); break;
+            case OfflineBatchStopReason::paused: status_text_ = QStringLiteral("已暂停；可以从检查点继续"); break;
+            case OfflineBatchStopReason::cancelled: status_text_ = QStringLiteral("已取消剩余片段；已提交候选保留"); break;
+            case OfflineBatchStopReason::step_limit: status_text_ = QStringLiteral("本批次结束；可继续处理剩余片段"); break;
+            default: status_text_ = QStringLiteral("解析已停止，请核对问题片段或调用上限；不会自动重发"); break;
+            }
+        }
+    }
+    overlayProgress(); emit changed();
+    refresh_after_world_change_ = true;
+    refreshAfterWorldChange();
 }
 
 void ExtractionJobViewModel::auditJob(QString job_id) {
