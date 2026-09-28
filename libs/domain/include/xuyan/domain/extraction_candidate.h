@@ -43,7 +43,7 @@ struct CandidateEntitySelection {
     int expected_revision{0};
 };
 
-/** @brief 表示当前已确认实体的轻量端点建议；稳定ID和修订必须由作者明确选择。 */
+/** @brief 表示当前已确认实体的轻量身份建议；稳定ID和修订必须由作者明确选择。 */
 struct RelationEndpointMatch {
     std::string entity_id;
     std::string name;
@@ -58,6 +58,18 @@ struct RelationEndpointMatch {
 struct RelationEndpointMatchPage {
     std::string world_id;
     std::string mention;
+    std::vector<RelationEndpointMatch> items;
+    std::uint64_t total{0};
+    int limit{0};
+    std::int64_t offset{0};
+};
+
+/** @brief 保存按候选完整身份集合匹配的同世界同类型实体页，不作排序推断或自动关联。 */
+struct CandidateEntityMatchPage {
+    std::string candidate_id;
+    int candidate_revision{0};
+    std::string world_id;
+    std::string kind;
     std::vector<RelationEndpointMatch> items;
     std::uint64_t total{0};
     int limit{0};

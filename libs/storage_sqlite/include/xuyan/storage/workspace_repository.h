@@ -221,6 +221,9 @@ public:
     /** @brief 在同一只读快照中精确匹配当前世界已确认端点，排除事件、规则、说法和模型假设。 */
     xuyan::domain::Result<xuyan::domain::RelationEndpointMatchPage> matchRelationEndpoints(
         const std::string& world_id, const std::string& mention, int limit, std::int64_t offset);
+    /** @brief 在同一只读快照中按候选名称和别名匹配同世界同类型实体，保留全部同名结果。 */
+    xuyan::domain::Result<xuyan::domain::CandidateEntityMatchPage> matchCandidateEntities(
+        const std::string& candidate_id, int expected_candidate_revision, int limit, std::int64_t offset);
     /** @brief 限量读取某解析任务产生的候选。 */
     xuyan::domain::Result<std::vector<xuyan::domain::ExtractionCandidate>> listExtractionCandidatesForJob(
         const std::string& job_id, int limit);

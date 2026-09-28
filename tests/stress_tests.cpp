@@ -1,4 +1,5 @@
 #include "xuyan/storage/workspace_repository.h"
+#include "xuyan/domain/hash.h"
 
 #include <sqlite3.h>
 
@@ -32,7 +33,7 @@ struct DatabaseCleanup final {
     ~DatabaseCleanup() { removeDatabase(path); }
 };
 
-/** @brief 只在压力测试数据库中生成一万条候选和一个异世界候选。 */
+/** @brief 只在压力测试数据库中生成一万条候选、一个类型化身份候选和一个异世界候选。 */
 void seedCandidateLoad(const std::filesystem::path& path) {
     sqlite3* opened = nullptr;
     require(sqlite3_open(path.string().c_str(), &opened) == SQLITE_OK && opened != nullptr,
@@ -41,6 +42,8 @@ void seedCandidateLoad(const std::filesystem::path& path) {
     constexpr auto fixture = R"SQL(
 PRAGMA foreign_keys=ON;
 BEGIN;
+INSERT OR IGNORE INTO world_template(id,name,source_id,created_at)
+VALUES('world-stress','压力世界','','2026-09-27'),('world-other','其他世界','','2026-09-27');
 INSERT INTO source_document VALUES('stress-source','world-stress','压力来源','sha-stress','','','1','2026-09-27');
 INSERT INTO source_document VALUES('other-source','world-other','其他来源','sha-other','','','1','2026-09-27');
 INSERT INTO extraction_job(id,source_id,status,schema_version,prompt_version,provider_connection_id,model_id,
@@ -64,11 +67,26 @@ COMMIT;
     const auto status = sqlite3_exec(database.get(), fixture, nullptr, nullptr, nullptr);
     if (status != SQLITE_OK) throw std::runtime_error(std::string{"candidate stress fixture failed: "}
         + sqlite3_errmsg(database.get()));
+    const std::string quote = "长篇条目9999又称别名9999。";
+    sqlite3_stmt* raw_update = nullptr;
+    require(sqlite3_prepare_v2(database.get(),
+        "UPDATE extraction_candidate SET name=?,fields_json=?,quote=?,quote_hash=?,"
+        "schema_version='candidate-v3',prompt_version='extract-v3' WHERE id='stress-candidate-10000'",
+        -1, &raw_update, nullptr) == SQLITE_OK, "typed stress candidate update must prepare");
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> update(raw_update, &sqlite3_finalize);
+    const std::string fields = R"({"kind":"character","aliases":["别名9999"]})";
+    const auto quote_hash = xuyan::domain::sha256(quote);
+    sqlite3_bind_text(update.get(), 1, "长篇条目9999", -1, SQLITE_STATIC);
+    sqlite3_bind_text(update.get(), 2, fields.data(), static_cast<int>(fields.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(update.get(), 3, quote.data(), static_cast<int>(quote.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(update.get(), 4, quote_hash.data(), static_cast<int>(quote_hash.size()), SQLITE_TRANSIENT);
+    require(sqlite3_step(update.get()) == SQLITE_DONE && sqlite3_changes(database.get()) == 1,
+            "typed stress candidate must replace one synthetic row");
 }
 
 } // namespace
 
-/** @brief 导入一万条合成实体并验证首、中、末三页检索仍受分页限制。 */
+/** @brief 导入一万条合成实体并验证分页检索及候选身份建议仍保持精确有界。 */
 int main() {
     try {
         const auto path = std::filesystem::temp_directory_path() / "xuyanforge-tests" / "stress.sqlite";
@@ -111,6 +129,13 @@ int main() {
                     && last_candidates.value->items.back().id == "stress-candidate-10000"
                     && other_candidates.value->items.front().id == "other-candidate",
                 "10k candidate pagination must bound every page and isolate worlds");
+        const auto identity_matches = repository.matchCandidateEntities("stress-candidate-10000", 1, 25, 0);
+        require(identity_matches.ok() && identity_matches.value->total == 1
+                    && identity_matches.value->items.size() == 1
+                    && identity_matches.value->items.front().entity_id == "stress-entity-9999"
+                    && identity_matches.value->items.front().name_match
+                    && identity_matches.value->items.front().alias_match,
+                "candidate identity matching must stay exact and bounded across ten thousand current entities");
         const auto reopen_started = std::chrono::steady_clock::now();
         for (int repeat = 0; repeat < 10; ++repeat) {
             // 模拟界面每次翻页重新打开工作区，检查连接初始化不会主导分页成本。

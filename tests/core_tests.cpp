@@ -3338,6 +3338,13 @@ void testCandidateAcceptanceIntoExistingEntity() {
     const auto same_name = create("entity-link-distinct", world.value->id, "accepted");
     const auto foreign = create("entity-link-foreign", other.value->id, "accepted");
     const auto pending = create("entity-link-pending", world.value->id, "candidate");
+    xuyan::domain::WorldEntity alias_name_input;
+    alias_name_input.id = "entity-link-alias-name"; alias_name_input.world_id = world.value->id;
+    alias_name_input.kind = "character"; alias_name_input.name = "北行者";
+    alias_name_input.aliases = {"另一个逐字别名"}; alias_name_input.review_status = "accepted";
+    auto alias_name_created = repository.createEntity("create-entity-link-alias-name", alias_name_input);
+    require(alias_name_created.ok(), "candidate alias-name fixture must create explicitly");
+    const auto alias_name = *alias_name_created.value;
     auto full_aliases = create("entity-link-full-aliases", world.value->id, "accepted");
     for (int index = 1; index < 128; ++index) full_aliases.aliases.push_back("alias-" + std::to_string(index));
     auto full_saved = repository.saveEntity("entity-link-fill-aliases", full_aliases, 1);
@@ -3396,6 +3403,40 @@ void testCandidateAcceptanceIntoExistingEntity() {
         else candidates.push_back(candidate);
     }
     require(candidates.size() == 3, "link fixture must retain one repeated mention per chapter");
+    auto suggestions = service.matchCandidateEntities(candidates.front().id, candidates.front().revision, 2, 0);
+    require(suggestions.ok() && suggestions.value->candidate_id == candidates.front().id
+                && suggestions.value->candidate_revision == 1 && suggestions.value->world_id == world.value->id
+                && suggestions.value->kind == "character" && suggestions.value->total == 4
+                && suggestions.value->items.size() == 2 && suggestions.value->limit == 2
+                && suggestions.value->offset == 0,
+            "candidate suggestions must bind the current candidate revision and return a bounded first page");
+    auto suggestion_tail = service.matchCandidateEntities(candidates.front().id, 1, 2, 2);
+    require(suggestion_tail.ok() && suggestion_tail.value->total == 4
+                && suggestion_tail.value->items.size() == 2
+                && suggestion_tail.value->items.front().entity_id != suggestions.value->items.front().entity_id,
+            "same-name suggestions must remain distinct and deterministic across pages");
+    auto all_suggestions = service.matchCandidateEntities(candidates.front().id, 1, 20, 0);
+    require(all_suggestions.ok() && all_suggestions.value->items.size() == 4,
+            "candidate name and aliases must match every eligible exact identity without automatic selection");
+    const auto alias_named_match = std::find_if(all_suggestions.value->items.begin(), all_suggestions.value->items.end(),
+        [&](const auto& item) { return item.entity_id == alias_name.id; });
+    const auto target_match = std::find_if(all_suggestions.value->items.begin(), all_suggestions.value->items.end(),
+        [&](const auto& item) { return item.entity_id == target.id; });
+    require(alias_named_match != all_suggestions.value->items.end() && alias_named_match->name_match
+                && !alias_named_match->alias_match && target_match != all_suggestions.value->items.end()
+                && !target_match->name_match && target_match->alias_match,
+            "match flags must distinguish target-name and target-alias hits against the candidate identity set");
+    auto wrong_kind_suggestions = service.matchCandidateEntities(mismatch_kind.id, mismatch_kind.revision, 20, 0);
+    require(wrong_kind_suggestions.ok() && wrong_kind_suggestions.value->kind == "faction"
+                && wrong_kind_suggestions.value->total == 0,
+            "candidate suggestions must never cross entity kinds even when a literal name matches");
+    require(!service.matchCandidateEntities("missing", 1, 20, 0).ok()
+                && !service.matchCandidateEntities(candidates.front().id, 0, 20, 0).ok()
+                && !service.matchCandidateEntities(candidates.front().id, 2, 20, 0).ok()
+                && !service.matchCandidateEntities(candidates.front().id, 1, 0, 0).ok()
+                && !service.matchCandidateEntities(candidates.front().id, 1, 51, 0).ok()
+                && !service.matchCandidateEntities(candidates.front().id, 1, 20, -1).ok(),
+            "candidate suggestions must reject missing, stale and out-of-bound requests");
     sqlite3* raw = nullptr;
     const auto opened = sqlite3_open(database.string().c_str(), &raw);
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(raw, &sqlite3_close);
@@ -3489,6 +3530,8 @@ void testCandidateAcceptanceIntoExistingEntity() {
                 && tombstone.ok() && tombstone.value->deleted && tombstone.value->revision == 4
                 && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance WHERE entity_id='entity-link-target'") == 3,
             "reopened replay must preserve historical associations without resurrecting a deleted target");
+    require(!service.matchCandidateEntities(candidate.id, accepted.value->revision, 20, 0).ok(),
+            "accepted candidates must leave the suggestion queue instead of proposing another identity link");
 }
 
 /** @brief 验证实体审核保留逐字别名，关系端点只提供当前世界的精确、已确认匹配建议。 */
@@ -3548,6 +3591,11 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
             {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
             {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
             {"quote", *quote.value}, {"provenance_type", "model_inference"}});
+    items.emplace_back(JsonValue::Object{{"type", "entity"}, {"name", "阿舟"},
+        {"fields", JsonValue::Object{{"kind", "other"}, {"aliases", JsonValue::Array{}}}},
+        {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
+        {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
+        {"quote", *quote.value}, {"provenance_type", "model_inference"}});
     items.emplace_back(JsonValue::Object{{"type", "relation"}, {"name", "共同守门"},
         {"fields", JsonValue::Object{{"subject", "阿舟"}, {"predicate", "共同守门"}, {"object", "沈棠"}, {"directed", false}}},
         {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
@@ -3559,14 +3607,17 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
     require(service.ingestStepOutput("endpoint-review-output", job.value->id, step.value->ordinal,
                 step.value->attempt, output).ok(), "typed endpoint candidates must ingest");
     auto page = service.listPage(world.value->id, source.value->id, "candidate", 20, 0);
-    require(page.ok() && page.value->total == 5, "endpoint candidates must await explicit review");
+    require(page.ok() && page.value->total == 6, "endpoint candidates must await explicit review");
     std::vector<xuyan::domain::ExtractionCandidate> entities;
+    xuyan::domain::ExtractionCandidate unsafe_probe;
     xuyan::domain::ExtractionCandidate relation;
     for (const auto& candidate : page.value->items) {
-        if (candidate.candidate_type == "entity") entities.push_back(candidate);
+        if (candidate.candidate_type == "entity" && candidate.name == "阿舟") unsafe_probe = candidate;
+        else if (candidate.candidate_type == "entity") entities.push_back(candidate);
         else relation = candidate;
     }
-    require(entities.size() == 4 && !relation.id.empty(), "endpoint fixture must contain typed entities and a relation");
+    require(entities.size() == 4 && !unsafe_probe.id.empty() && !relation.id.empty(),
+            "endpoint fixture must contain typed entities, an unsafe-target probe and a relation");
     const std::array<std::string, 4> provenance{"original_fact", "author_setting", "in_text_claim", "model_inference"};
     sqlite3* opened = nullptr;
     const auto open_status = sqlite3_open(database.string().c_str(), &opened);
@@ -3586,7 +3637,7 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
                         && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity") == 0
                         && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance") == 0
                         && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_command_log") == 0
-                        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 5,
+                        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 6,
                     "failed acceptance must leave no aliases, entities, acceptances, audit commands or new candidate history");
             require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_endpoint_evidence", nullptr, nullptr, nullptr) == SQLITE_OK,
                     "endpoint evidence failure trigger must be removed before retrying the same command");
@@ -3603,6 +3654,9 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
         require(service.review(command, candidate.id, 1, "accepted", candidate.name,
                     candidate.fields_json, provenance[index]).ok(), "entity alias review replay must be idempotent");
     }
+    auto unsafe_identity = service.matchCandidateEntities(unsafe_probe.id, unsafe_probe.revision, 20, 0);
+    require(unsafe_identity.ok() && unsafe_identity.value->kind == "other" && unsafe_identity.value->total == 0,
+            "candidate suggestions must exclude matching entities created from claims or model hypotheses");
     /** @brief 查询当前世界的匹配总数，先检查错误再读取结果，避免测试失败变成空指针访问。 */
     const auto match_total = [&](const std::string& mention) {
         const auto matches = service.matchRelationEndpoints(world.value->id, mention);

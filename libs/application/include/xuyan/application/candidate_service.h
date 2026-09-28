@@ -32,6 +32,10 @@ public:
     /** @brief 提供当前世界已确认实体的精确名称/别名建议，分页返回稳定ID，不自动绑定或合并。 */
     xuyan::domain::Result<xuyan::domain::RelationEndpointMatchPage> matchRelationEndpoints(
         const std::string& world_id, const std::string& mention, int limit = 20, std::int64_t offset = 0);
+    /** @brief 按候选当前修订的逐字名称和别名建议同世界同类型实体，不自动选择或合并。 */
+    xuyan::domain::Result<xuyan::domain::CandidateEntityMatchPage> matchCandidateEntities(
+        const std::string& candidate_id, int expected_candidate_revision,
+        int limit = 20, std::int64_t offset = 0);
     /** @brief 将明确确认的实体候选关联已有同世界同类型条目，累计逐字证据和别名，不覆盖作者字段。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> acceptIntoEntity(
         const std::string& command_id, const std::string& candidate_id, int expected_candidate_revision,

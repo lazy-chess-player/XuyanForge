@@ -3236,8 +3236,9 @@ Result<xuyan::domain::RelationEndpointMatchPage> WorkspaceRepository::matchRelat
         const std::string scope =
             " FROM world_entity e JOIN entity_revision r ON r.entity_id=e.id AND r.revision=e.head_revision"
             " WHERE e.world_id=? AND e.deleted=0 AND r.review_status='accepted' AND r.kind NOT IN('event','rule')"
-            " AND e.id NOT IN(SELECT a.entity_id FROM candidate_acceptance a JOIN extraction_candidate c ON c.id=a.candidate_id"
-            " WHERE c.candidate_type<>'entity' OR c.review_status<>'accepted' OR c.provenance_type NOT IN('original_fact','author_setting'))"
+            " AND NOT EXISTS(SELECT 1 FROM candidate_acceptance a JOIN extraction_candidate c ON c.id=a.candidate_id"
+            " WHERE a.entity_id=e.id AND (c.candidate_type<>'entity' OR c.review_status<>'accepted'"
+            " OR c.provenance_type NOT IN('original_fact','author_setting')))"
             " AND (r.name=? OR instr(char(31)||r.aliases||char(31),char(31)||?||char(31))>0)";
         /** @brief 为总数和分页查询绑定同一世界及逐字标识，不拼接用户输入到SQL。 */
         const auto bind_scope = [&](sqlite3_stmt* statement) {
@@ -3270,6 +3271,130 @@ Result<xuyan::domain::RelationEndpointMatchPage> WorkspaceRepository::matchRelat
         snapshot.commit();
         return Result<Page>::success(std::move(page));
     } catch (const std::exception& exception) { return Result<Page>::failure(storageError(exception)); }
+}
+
+/** @brief 按待审实体候选的名称和逐字别名匹配同世界同类型已确认条目，同名结果全部保留。 */
+Result<xuyan::domain::CandidateEntityMatchPage> WorkspaceRepository::matchCandidateEntities(
+    const std::string& candidate_id, int expected_candidate_revision, int limit, std::int64_t offset) {
+    using Page = xuyan::domain::CandidateEntityMatchPage;
+    /** @brief 拒绝空标识、控制字符和过长标识，保持数据库边界与候选契约一致。 */
+    const auto invalid_id = [](const std::string& text) {
+        return text.empty() || text.size() > 512 || std::any_of(text.begin(), text.end(), [](unsigned char value) {
+            return value < 0x20 || value == 0x7f;
+        });
+    };
+    if (invalid_id(candidate_id) || expected_candidate_revision < 1
+        || expected_candidate_revision >= std::numeric_limits<int>::max()
+        || limit < 1 || limit > 50 || offset < 0)
+        return Result<Page>::failure({ErrorCode::validation_failed,
+            "候选匹配的标识、预期修订或分页参数无效", false, "刷新候选并将每页限制为1—50项"});
+    try {
+        ReadTransaction snapshot(database_);
+        Statement candidate_query(database_,
+            "SELECT c.id,c.job_id,c.step_ordinal,c.source_id,c.candidate_type,c.name,c.fields_json,"
+            "c.start_codepoint,c.end_codepoint,c.quote,c.quote_hash,c.provenance_type,c.review_status,"
+            "c.schema_version,c.prompt_version,c.revision,w.id FROM extraction_candidate c "
+            "LEFT JOIN source_document s ON s.id=c.source_id LEFT JOIN world_template w ON w.id=s.world_id WHERE c.id=?");
+        bindText(candidate_query.get(), 1, candidate_id);
+        const auto candidate_step = sqlite3_step(candidate_query.get());
+        if (candidate_step == SQLITE_DONE)
+            return Result<Page>::failure({ErrorCode::missing_context, "找不到待匹配的提取候选", false, "刷新校对列表"});
+        if (candidate_step != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+        auto candidate = readCandidate(candidate_query.get());
+        const auto world_id = columnText(candidate_query.get(), 16);
+        auto valid_candidate = xuyan::domain::validateExtractionCandidate(candidate);
+        if (!valid_candidate.ok()) return Result<Page>::failure(*valid_candidate.error);
+        candidate = std::move(*valid_candidate.value);
+        if (candidate.revision != expected_candidate_revision
+            || (candidate.review_status != "candidate" && candidate.review_status != "conflicted"))
+            return Result<Page>::failure({ErrorCode::revision_conflict,
+                "候选修订已变化或审核已终结", false, "刷新校对列表后重新获取建议"});
+        if (world_id.empty()) return Result<Page>::failure(
+            {ErrorCode::missing_context, "候选来源世界不存在", false, "重新导入来源或修复工作区"});
+        if (!isTypedCandidateProtocol(candidate) || candidate.candidate_type != "entity")
+            return Result<Page>::failure({ErrorCode::validation_failed,
+                "已有实体建议只支持类型化实体候选", false, "选择人物、地点或其他实体候选"});
+        auto fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
+        const auto* kind = fields.ok() ? fields.value->find("kind") : nullptr;
+        const auto* aliases = fields.ok() ? fields.value->find("aliases") : nullptr;
+        if (!fields.ok() || !fields.value->isObject() || fields.value->object().size() != 2
+            || !kind || !kind->isString() || !xuyan::domain::isSupportedEntityKind(kind->string())
+            || kind->string() == "event" || kind->string() == "rule" || !aliases || !aliases->isArray()
+            || aliases->array().size() > 16 || candidate.quote.find(candidate.name) == std::string::npos)
+            return Result<Page>::failure({ErrorCode::validation_failed,
+                "候选缺少合法分类或逐字实体标识", false, "重新生成或校对候选"});
+        std::set<std::string> mentions{candidate.name};
+        std::set<std::string> unique_aliases;
+        WorldEntity literal;
+        literal.name = candidate.name;
+        literal.kind = kind->string();
+        for (const auto& alias : aliases->array()) {
+            if (!alias.isString() || alias.string().empty() || candidate.quote.find(alias.string()) == std::string::npos
+                || !unique_aliases.insert(alias.string()).second)
+                return Result<Page>::failure({ErrorCode::validation_failed,
+                    "候选别名必须唯一并有当前引文的逐字证据", false, "重新生成或校对候选"});
+            literal.aliases.push_back(alias.string());
+            mentions.insert(alias.string());
+        }
+        auto valid_literal = xuyan::domain::validateEntity(std::move(literal));
+        if (!valid_literal.ok()) return Result<Page>::failure(*valid_literal.error);
+
+        // CTE只按已验证标识数量生成占位符，标识内容始终参数绑定；EXISTS避免同一实体重复入页。
+        std::string mention_rows;
+        for (std::size_t index = 0; index < mentions.size(); ++index)
+            mention_rows += index == 0 ? "(?)" : ",(?)";
+        const std::string cte = "WITH candidate_mention(value) AS (VALUES" + mention_rows + ")";
+        const std::string scope =
+            " FROM world_entity e JOIN entity_revision r ON r.entity_id=e.id AND r.revision=e.head_revision"
+            " WHERE e.world_id=? AND e.deleted=0 AND r.review_status='accepted' AND r.kind=?"
+            " AND e.id NOT IN(SELECT a.entity_id FROM candidate_acceptance a JOIN extraction_candidate c ON c.id=a.candidate_id"
+            " WHERE c.candidate_type<>'entity' OR c.review_status<>'accepted' OR c.provenance_type NOT IN('original_fact','author_setting'))"
+            " AND EXISTS(SELECT 1 FROM candidate_mention m WHERE r.name=m.value"
+            " OR instr(char(31)||r.aliases||char(31),char(31)||m.value||char(31))>0)";
+        /** @brief 为总数与页面查询绑定相同的候选标识集合、世界和分类。 */
+        const auto bind_scope = [&](sqlite3_stmt* statement) {
+            int next = 1;
+            for (const auto& mention : mentions) bindText(statement, next++, mention);
+            bindText(statement, next++, world_id);
+            bindText(statement, next++, kind->string());
+            return next;
+        };
+        Page page;
+        page.candidate_id = candidate.id; page.candidate_revision = candidate.revision;
+        page.world_id = world_id; page.kind = kind->string(); page.limit = limit; page.offset = offset;
+        {
+            const auto sql = cte + " SELECT COUNT(*)" + scope;
+            Statement count(database_, sql.c_str());
+            bind_scope(count.get());
+            if (sqlite3_step(count.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+            page.total = static_cast<std::uint64_t>(sqlite3_column_int64(count.get(), 0));
+        }
+        {
+            const auto sql = cte + " SELECT e.id,r.name,r.kind,r.aliases,r.revision" + scope
+                + " ORDER BY e.id LIMIT ? OFFSET ?";
+            Statement query(database_, sql.c_str());
+            int next = bind_scope(query.get());
+            sqlite3_bind_int(query.get(), next++, limit);
+            sqlite3_bind_int64(query.get(), next, offset);
+            while (true) {
+                const auto step = sqlite3_step(query.get());
+                if (step == SQLITE_DONE) break;
+                if (step != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+                xuyan::domain::RelationEndpointMatch item;
+                item.entity_id = columnText(query.get(), 0); item.name = columnText(query.get(), 1);
+                item.kind = columnText(query.get(), 2); item.aliases = splitValues(columnText(query.get(), 3));
+                item.revision = sqlite3_column_int(query.get(), 4);
+                item.name_match = mentions.contains(item.name);
+                item.alias_match = std::any_of(item.aliases.begin(), item.aliases.end(),
+                    [&](const std::string& alias) { return mentions.contains(alias); });
+                page.items.push_back(std::move(item));
+            }
+        }
+        snapshot.commit();
+        return Result<Page>::success(std::move(page));
+    } catch (const std::exception& exception) {
+        return Result<Page>::failure(storageError(exception));
+    }
 }
 
 Result<std::vector<xuyan::domain::ExtractionCandidate>> WorkspaceRepository::listExtractionCandidatesForJob(

@@ -184,6 +184,18 @@ Result<xuyan::domain::RelationEndpointMatchPage> CandidateService::matchRelation
     }
 }
 
+/** @brief 查询候选完整逐字身份对应的已有实体，只返回可供作者明确选择的轻量结果。 */
+Result<xuyan::domain::CandidateEntityMatchPage> CandidateService::matchCandidateEntities(
+    const std::string& candidate_id, int expected_candidate_revision, int limit, std::int64_t offset) {
+    try {
+        return xuyan::storage::WorkspaceRepository(database_path_).matchCandidateEntities(
+            candidate_id, expected_candidate_revision, limit, offset);
+    } catch (const std::exception& exception) {
+        return Result<xuyan::domain::CandidateEntityMatchPage>::failure(
+            {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"});
+    }
+}
+
 /** @brief 转交明确的跨章实体关联，不根据同名结果替作者选择目标，不进行网络请求。 */
 Result<xuyan::domain::ExtractionCandidate> CandidateService::acceptIntoEntity(
     const std::string& command_id, const std::string& candidate_id, int expected_candidate_revision,
