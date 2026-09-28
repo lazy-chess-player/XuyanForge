@@ -586,7 +586,7 @@ void testProviderGenerationGatewayAndCredentialIsolation() {
 xuyan::package::JsonValue typedResponseFixture() {
     using xuyan::package::JsonValue;
     return JsonValue::Object{
-        {"schema_version", "candidate-v2"}, {"prompt_version", "extract-v2"},
+        {"schema_version", "candidate-v3"}, {"prompt_version", "extract-v3"},
         {"entities", JsonValue::Array{JsonValue::Object{{"name", "青岚"}, {"quote", "青岚又名小青。"},
             {"fields", JsonValue::Object{{"kind", "character"}, {"aliases", JsonValue::Array{"小青"}}}}}}},
         {"events", JsonValue::Array{JsonValue::Object{{"name", "找到钥匙"}, {"quote", "清晨，青岚在北苑找到钥匙。"},
@@ -603,74 +603,90 @@ void testTypedExtractionOutputContract() {
     using xuyan::package::JsonValue;
     using xuyan::package::writeJson;
     using xuyan::application::parseTypedExtractionResponse;
+    require(xuyan::application::isSupportedTypedCandidateProtocol("candidate-v2", "extract-v2")
+                && xuyan::application::typedCandidateMaximumFor("candidate-v2", "extract-v2") == 5
+                && xuyan::application::typedCandidateMaximumFor("candidate-v3", "extract-v3") == 48
+                && !xuyan::application::isSupportedTypedCandidateProtocol("candidate-v2", "extract-v3"),
+            "typed protocol compatibility must preserve only matching historical and current version pairs");
     auto fixture = typedResponseFixture();
     auto valid = parseTypedExtractionResponse(writeJson(fixture));
     require(valid.ok() && valid.value->size() == 4
                 && valid.value->at(0).type == "entity" && valid.value->at(1).type == "event"
                 && valid.value->at(2).type == "relation" && valid.value->at(3).type == "rule",
             "typed contract must preserve four distinct candidate types and fields");
+    auto fenced = parseTypedExtractionResponse("```json\n" + writeJson(fixture) + "\n```");
+    require(fenced.ok() && fenced.value->size() == 4,
+            "one whole-response JSON fence may be removed before strict typed validation");
     std::size_t field_index = 0;
     for (auto group : {"entities", "events", "relations", "rules"}) {
         require(writeJson(valid.value->at(field_index++).fields)
                     == writeJson(*fixture.find(group)->array()[0].find("fields")),
                 "typed parser must retain every type-specific field rather than only title and quote");
     }
+    /** @brief 验证根协议或整份输出错误被拒绝，且错误信息不回显测试原文。 */
     const auto rejects = [&](JsonValue modified, const std::string& reason) {
         auto rejected = parseTypedExtractionResponse(writeJson(modified));
         require(!rejected.ok() && rejected.error->message.find("青岚") == std::string::npos,
                 "invalid typed output must fail without echoing source data: " + reason);
     };
+    /** @brief 验证一条语义无效候选被隔离，同时保留夹具中的三条合法候选。 */
+    const auto filters = [&](JsonValue modified, const std::string& reason) {
+        std::size_t rejected_count = 0;
+        auto accepted = parseTypedExtractionResponse(writeJson(modified), &rejected_count);
+        require(accepted.ok() && accepted.value->size() == 3 && rejected_count == 1,
+                "one invalid candidate must be isolated without discarding three valid candidates: " + reason);
+    };
     auto modified = fixture;
     modified.object()["entities"].array()[0].object()["fields"].object().erase("kind");
-    rejects(modified, "missing entity kind");
+    filters(modified, "missing entity kind");
     modified = fixture;
     modified.object()["entities"].array()[0].object()["fields"].object()["kind"] = "event";
-    rejects(modified, "action category cannot be used as entity kind");
+    filters(modified, "action category cannot be used as entity kind");
     modified = fixture;
     modified.object()["entities"].array()[0].object()["name"] = "找到钥匙";
-    rejects(modified, "entity identity absent from its quote");
+    filters(modified, "entity identity absent from its quote");
     modified = fixture;
     modified.object()["events"].array()[0].object()["fields"].object()["participants"] = JsonValue::Array{"未出现的标识"};
-    rejects(modified, "unquoted participant");
+    filters(modified, "unquoted participant");
     modified = fixture;
     modified.object()["events"].array()[0].object()["fields"].object()["location"] = "未出现的地点";
-    rejects(modified, "invented event location");
+    filters(modified, "invented event location");
     modified = fixture;
     modified.object()["events"].array()[0].object()["fields"].object()["time_text"] = "未出现的时间";
-    rejects(modified, "invented event time");
+    filters(modified, "invented event time");
     modified = fixture;
     modified.object()["events"].array()[0].object()["fields"].object()["action"] = "   ";
-    rejects(modified, "blank event action");
+    filters(modified, "blank event action");
     modified = fixture;
     modified.object()["events"].array()[0].object()["fields"].object()["action"] = "　　";
-    rejects(modified, "Unicode whitespace is not an event action");
+    filters(modified, "Unicode whitespace is not an event action");
     modified = fixture;
     modified.object()["events"].array()[0].object()["fields"].object()["action"] = std::string(1, static_cast<char>(0xff));
     rejects(modified, "malformed UTF-8 must not enter typed string fields");
     modified = fixture;
     modified.object()["events"].array()[0].object()["fields"].object()["action"] = std::string(1025, 'x');
-    rejects(modified, "unbounded action");
+    filters(modified, "unbounded action");
     modified = fixture;
     modified.object()["entities"].array()[0].object()["fields"].object()["aliases"] = JsonValue::Array{"小青", "小青"};
-    rejects(modified, "duplicate aliases");
+    filters(modified, "duplicate aliases");
     modified = fixture;
     modified.object()["relations"].array()[0].object()["fields"].object().erase("object");
-    rejects(modified, "relation without both endpoints");
+    filters(modified, "relation without both endpoints");
     modified = fixture;
     modified.object()["relations"].array()[0].object()["fields"].object()["directed"] = "true";
-    rejects(modified, "relation direction must be boolean");
+    filters(modified, "relation direction must be boolean");
     modified = fixture;
     modified.object()["relations"].array()[0].object()["fields"].object()["object"] = "青岚";
-    rejects(modified, "unresolved self relation");
+    filters(modified, "unresolved self relation");
     modified = fixture;
     modified.object()["rules"].array()[0].object()["fields"].object()["scope"] = "";
-    rejects(modified, "rule without evidence-supported scope");
+    filters(modified, "rule without evidence-supported scope");
     modified = fixture;
     modified.object()["rules"].array()[0].object()["fields"].object()["modality"] = "temporary_command";
-    rejects(modified, "unsupported rule modality");
+    filters(modified, "unsupported rule modality");
     modified = fixture;
     modified.object()["rules"].array()[0].object()["fields"].object()["secret_metadata"] = "untrusted";
-    rejects(modified, "extra type fields");
+    filters(modified, "extra type fields");
     modified = fixture;
     modified.object()["events"].array()[0].object()["provenance_type"] = "original_fact";
     rejects(modified, "model cannot select trusted provenance");
@@ -688,10 +704,49 @@ void testTypedExtractionOutputContract() {
     rejects(modified, "missing required group");
     modified = fixture;
     modified.object()["events"].array().push_back(modified.object()["events"].array()[0]);
-    rejects(modified, "duplicate candidate identity");
+    std::size_t duplicate_rejected_count = 0;
+    auto duplicate_filtered = parseTypedExtractionResponse(writeJson(modified), &duplicate_rejected_count);
+    require(duplicate_filtered.ok() && duplicate_filtered.value->size() == 4 && duplicate_rejected_count == 1,
+            "duplicate candidate identity must be counted and removed without discarding unique candidates");
     modified = fixture;
-    modified.object()["events"] = JsonValue::Array(6, fixture.object()["events"].array()[0]);
+    for (auto group : {"entities", "events", "relations", "rules"}) modified.object()[group] = JsonValue::Array{};
+    for (int index = 0; index < 24; ++index) {
+        const auto name = "候选" + std::to_string(index);
+        modified.object()["entities"].array().emplace_back(JsonValue::Object{
+            {"name", name}, {"quote", name},
+            {"fields", JsonValue::Object{{"kind", "other"}, {"aliases", JsonValue::Array{}}}}});
+    }
+    require(parseTypedExtractionResponse(writeJson(modified)).ok(),
+            "current typed protocol must preserve up to twenty-four distinct high-information candidates");
+    modified.object()["entities"].array().emplace_back(JsonValue::Object{
+        {"name", "候选24"}, {"quote", "候选24"},
+        {"fields", JsonValue::Object{{"kind", "other"}, {"aliases", JsonValue::Array{}}}}});
     rejects(modified, "aggregate candidate limit");
+    modified = fixture;
+    for (auto group : {"entities", "events", "relations", "rules"}) modified.object()[group] = JsonValue::Array{};
+    for (int index = 0; index < 24; ++index) {
+        const auto entity_name = "实体" + std::to_string(index);
+        modified.object()["entities"].array().emplace_back(JsonValue::Object{{"name", entity_name}, {"quote", entity_name},
+            {"fields", JsonValue::Object{{"kind", "other"}, {"aliases", JsonValue::Array{}}}}});
+        const auto event_name = "事件" + std::to_string(index);
+        modified.object()["events"].array().emplace_back(JsonValue::Object{{"name", event_name}, {"quote", event_name},
+            {"fields", JsonValue::Object{{"action", event_name}, {"participants", JsonValue::Array{}},
+                {"location", ""}, {"time_text", ""}}}});
+    }
+    require(parseTypedExtractionResponse(writeJson(modified)).ok(),
+            "current typed protocol must preserve forty-eight bounded candidates across groups");
+    modified.object()["relations"].array().emplace_back(JsonValue::Object{{"name", "额外关系"}, {"quote", "甲乙"},
+        {"fields", JsonValue::Object{{"subject", "甲"}, {"predicate", "联系"}, {"object", "乙"}, {"directed", true}}}});
+    rejects(modified, "cross-group aggregate candidate limit");
+    modified = fixture;
+    for (auto group : {"entities", "events", "relations", "rules"}) modified.object()[group] = JsonValue::Array{};
+    modified.object()["entities"].array().emplace_back(JsonValue::Object{{"name", "未被引文支持"}, {"quote", "其他内容"},
+        {"fields", JsonValue::Object{{"kind", "other"}, {"aliases", JsonValue::Array{}}}}});
+    std::size_t all_rejected_count = 0;
+    auto all_rejected = parseTypedExtractionResponse(writeJson(modified), &all_rejected_count);
+    require(!all_rejected.ok() && all_rejected_count == 1
+                && all_rejected.error->message.find("未被引文支持") == std::string::npos,
+            "a non-empty response with no valid candidates must fail without exposing model fields");
     modified = fixture;
     auto& event_fields = modified.object()["events"].array()[0].object()["fields"].object();
     event_fields["participants"] = JsonValue::Array{}; event_fields["location"] = ""; event_fields["time_text"] = "";
@@ -716,7 +771,7 @@ void testTypedExtractionOutputContract() {
                 && schema.value->find("properties")->find("relations") != nullptr,
             "wire schema must expose typed groups rather than one untyped candidate list");
     const auto manifest_path = std::filesystem::path(__FILE__).parent_path().parent_path()
-        / "contracts" / "extraction-response-v2.schema.json";
+        / "contracts" / "extraction-response-v3.schema.json";
     std::ifstream manifest(manifest_path, std::ios::binary);
     require(manifest.good(), "published extraction schema must be available to the contract test");
     auto published = xuyan::package::parseJson(std::string{std::istreambuf_iterator<char>(manifest),
@@ -830,7 +885,7 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
     require(items.ok() && items.value->size() == 5, "one generic plus four typed candidates must persist");
     for (const auto& item : *items.value) {
         if (item.job_id != new_version.value->id) continue;
-        require(item.schema_version == "candidate-v2" && item.prompt_version == "extract-v2"
+        require(item.schema_version == "candidate-v3" && item.prompt_version == "extract-v3"
                     && item.provenance_type == "model_inference" && item.review_status == "candidate"
                     && item.quote_hash == xuyan::domain::sha256(item.quote),
                 "typed fields and exact evidence must remain untrusted review candidates");
@@ -891,7 +946,7 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
                 && candidates.list().value->size() == direct_count + 4,
             "direct typed command replay must retain one candidate set");
 
-    // 一份响应的最后一类失败时，前面三类也不能部分入库；失败不自动重发。
+    // 一份响应的最后一类字段无效时，仅隔离该条；其余三类仍作为同一原子批次入库且记录淘汰数。
     const auto bad_novel = directory / "bad-response.txt";
     { std::ofstream file(bad_novel, std::ios::binary); file << manuscript << "尾段使切片摘要不同。"; }
     auto bad_source = sources.importTextFile("typed-bad-source", bad_novel, "1", world.value->id);
@@ -900,13 +955,59 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
     require(bad_job.ok() && bad_job.value->completed_steps == 0, "invalid-response task must not be a cache hit");
     transport.output.object()["rules"].array()[0].object()["fields"].object().erase("scope");
     const auto count_before_bad = candidates.list().value->size();
-    auto failed = processor.processNext(bad_job.value->id);
-    require(failed.ok() && failed.value->steps[0].status == "failed" && failed.value->completed_steps == 0
-                && failed.value->budget.consumed_requests == 1 && candidates.list().value->size() == count_before_bad,
-            "mixed invalid response must consume only its attempt and commit no partial candidates");
+    auto partially_valid = processor.processNext(bad_job.value->id);
+    auto partial_output = partially_valid.ok()
+        ? xuyan::package::parseJson(partially_valid.value->steps[0].output_json) : xuyan::package::parseJson("null");
+    require(partially_valid.ok() && partially_valid.value->steps[0].status == "completed"
+                && partially_valid.value->completed_steps == 1 && partially_valid.value->budget.consumed_requests == 1
+                && candidates.list().value->size() == count_before_bad + 3 && partial_output.ok()
+                && partial_output.value->find("rejected_candidates") != nullptr
+                && partial_output.value->find("rejected_candidates")->integer() == 1,
+            "mixed invalid response must isolate one item and atomically preserve three valid candidates");
     const auto calls_before_retry = transport.calls;
     require(!processor.processNext(bad_job.value->id).ok() && transport.calls == calls_before_retry,
-            "failed typed output must not be automatically resent");
+            "completed partially valid output must not be sent again");
+    // 字段合法但引文不存在时也只隔离该条，不能把前三类已经定位的候选一起丢弃。
+    transport.output = typedResponseFixture();
+    auto& unmapped_rule = transport.output.object()["rules"].array()[0].object();
+    unmapped_rule["quote"] = "学徒必须完成额外考核才能入门。";
+    unmapped_rule["fields"].object()["statement"] = "完成额外考核才能入门";
+    const auto unmapped_novel = directory / "unmapped-response.txt";
+    { std::ofstream file(unmapped_novel, std::ios::binary); file << manuscript << "另一尾段用于隔离缓存。"; }
+    auto unmapped_source = sources.importTextFile("typed-unmapped-source", unmapped_novel, "1", world.value->id);
+    require(unmapped_source.ok(), "unmapped-response test requires a fresh source hash");
+    auto unmapped_job = jobs.create("typed-unmapped-job", unmapped_source.value->id, 500, 0, 1, 1200, connection.id);
+    require(unmapped_job.ok() && unmapped_job.value->completed_steps == 0,
+            "unmapped-response task must not reuse a previous completed cache entry");
+    const auto count_before_unmapped = candidates.list().value->size();
+    auto mapped_subset = processor.processNext(unmapped_job.value->id);
+    auto mapped_output = mapped_subset.ok()
+        ? xuyan::package::parseJson(mapped_subset.value->steps[0].output_json) : xuyan::package::parseJson("null");
+    require(mapped_subset.ok() && mapped_subset.value->status == "completed"
+                && candidates.list().value->size() == count_before_unmapped + 3 && mapped_output.ok()
+                && mapped_output.value->find("rejected_candidates")->integer() == 1,
+            "one unmappable quote must be counted while three uniquely mapped candidates commit atomically");
+    const auto forged_stats_novel = directory / "forged-stats.txt";
+    { std::ofstream file(forged_stats_novel, std::ios::binary); file << manuscript << "统计边界使用独立来源。"; }
+    auto forged_stats_source = sources.importTextFile("typed-forged-stats-source", forged_stats_novel, "1", world.value->id);
+    require(forged_stats_source.ok(), "forged statistics test requires a fresh source hash");
+    auto forged_stats_job = jobs.create("typed-forged-stats-job", forged_stats_source.value->id,
+                                        500, 0, 1, 1200, connection.id);
+    require(forged_stats_job.ok() && forged_stats_job.value->completed_steps == 0,
+            "forged statistics task must start without a cache hit");
+    auto forged_stats_step = jobs.claimNext("typed-forged-stats-claim", forged_stats_job.value->id,
+                                            forged_stats_job.value->revision);
+    require(forged_stats_step.ok(), "forged statistics task must claim one isolated step");
+    const auto forged_stats_output = writeJson(JsonValue::Object{{"schema_version", "candidate-v3"},
+        {"prompt_version", "extract-v3"}, {"rejected_candidates", 49}, {"candidates", JsonValue::Array{}}});
+    const auto count_before_forged_stats = candidates.list().value->size();
+    auto forged_stats = candidates.ingestStepOutput("typed-forged-stats-output", forged_stats_job.value->id,
+        forged_stats_step.value->ordinal, forged_stats_step.value->attempt, forged_stats_output);
+    auto forged_stats_state = jobs.load(forged_stats_job.value->id);
+    require(!forged_stats.ok() && forged_stats_state.ok()
+                && forged_stats_state.value->steps[0].status == "running"
+                && candidates.list().value->size() == count_before_forged_stats,
+            "direct submission must reject forged v3 rejection counts without partial candidates");
     auto historical_items = repository.listExtractionCandidatesForJob(historical.id, 100);
     require(historical_items.ok() && historical_items.value->size() == 1, "historical generic candidate must remain readable");
     const auto& generic = historical_items.value->front();
@@ -966,7 +1067,7 @@ void testFrozenBackboneExtractionInput() {
             require(request.body.find(quote) != std::string::npos, "backbone transport must preserve event quote");
             if (on_send) on_send();
             const auto typed = xuyan::package::writeJson(JsonValue::Object{
-                {"schema_version", "candidate-v2"}, {"prompt_version", "extract-v2"},
+                {"schema_version", "candidate-v3"}, {"prompt_version", "extract-v3"},
                 {"entities", JsonValue::Array{}}, {"relations", JsonValue::Array{}}, {"rules", JsonValue::Array{}},
                 {"events", JsonValue::Array{JsonValue::Object{{"name", "打开匣子"}, {"quote", quote},
                     {"fields", JsonValue::Object{{"action", "打开"}, {"participants", JsonValue::Array{"记录者"}},
@@ -1041,7 +1142,8 @@ void testFrozenBackboneExtractionInput() {
     const std::string omitted = "天空蔚蓝，微风柔和。";
     const auto omitted_cp = xuyan::domain::utf8CodepointCount(std::string_view(text).substr(0, text.find(omitted)));
     const auto forged = xuyan::package::writeJson(JsonValue::Object{
-        {"schema_version", "candidate-v2"}, {"prompt_version", "extract-v2"},
+        {"schema_version", "candidate-v3"}, {"prompt_version", "extract-v3"},
+        {"rejected_candidates", 0},
         {"candidates", JsonValue::Array{JsonValue::Object{{"type", "event"}, {"name", "描写"}, {"quote", omitted},
             {"fields", JsonValue::Object{{"action", "描写"}, {"participants", JsonValue::Array{}}, {"location", ""}, {"time_text", ""}}},
             {"start_codepoint", static_cast<std::int64_t>(omitted_cp)},
@@ -1126,14 +1228,14 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
                     "only the claimed source chunk must be sent after explicit execution");
             require(request.body.find(credential) == std::string::npos,
                     "remote request body must not contain the secret");
-            require(request.body.find("candidate-v2") != std::string::npos
+            require(request.body.find("candidate-v3") != std::string::npos
                         && request.body.find("participants") != std::string::npos,
                     "remote request must include typed fields and fixed output versions");
             if (throw_after_validation) throw std::runtime_error("transport leaked synthetic-test-secret");
             if (on_send) on_send();
             return xuyan::domain::Result<xuyan::application::ProviderTransportResponse>::success({
                 200, false, false,
-                R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v2\",\"prompt_version\":\"extract-v2\",\"entities\":[],\"relations\":[],\"rules\":[],\"events\":[{\"name\":\"找到钥匙\",\"quote\":\"林舟找到了失落的钥匙\",\"fields\":{\"action\":\"找到钥匙\",\"participants\":[\"林舟\"],\"location\":\"\",\"time_text\":\"\"}}]}"}]}],"usage":{"input_tokens":80,"output_tokens":28}})"});
+                R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v3\",\"prompt_version\":\"extract-v3\",\"entities\":[],\"relations\":[],\"rules\":[],\"events\":[{\"name\":\"找到钥匙\",\"quote\":\"林舟找到了失落的钥匙\",\"fields\":{\"action\":\"找到钥匙\",\"participants\":[\"林舟\"],\"location\":\"\",\"time_text\":\"\"}}]}"}]}],"usage":{"input_tokens":80,"output_tokens":28}})"});
         }
         int calls{0};
         bool throw_after_validation{false};
@@ -1165,7 +1267,7 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
     require(job.ok() && job.value->total_steps > 1 && job.value->budget.consumed_requests == 0
                 && job.value->provider_connection_fingerprint.size() == 64,
             "creating a remote job must not call or reserve a model request");
-    require(job.value->schema_version == "candidate-v2" && job.value->prompt_version == "extract-v2",
+    require(job.value->schema_version == "candidate-v3" && job.value->prompt_version == "extract-v3",
             "new remote jobs must persist the typed output contract before any request");
     FakeTransport transport;
     require(transport.calls == 0, "model transport must be untouched until explicit sample action");
@@ -1407,7 +1509,7 @@ void testRemoteBatchCheckpoints() {
             if (timed_out || cancelled || http_status != 200)
                 return Response::success({http_status, timed_out, cancelled, ""});
             const auto typed = xuyan::package::writeJson(JsonValue::Object{
-                {"schema_version", "candidate-v2"}, {"prompt_version", "extract-v2"},
+                {"schema_version", "candidate-v3"}, {"prompt_version", "extract-v3"},
                 {"entities", JsonValue::Array{}}, {"relations", JsonValue::Array{}}, {"rules", JsonValue::Array{}},
                 {"events", JsonValue::Array{JsonValue::Object{
                     {"name", "完成核对"}, {"quote", quote}, {"fields", JsonValue::Object{
@@ -2710,8 +2812,17 @@ void testAcceptedRelationAndLocationProjection() {
     require(connections.save("graph-review-connection", connection, 0, std::string{"synthetic-test-secret"}).ok(),
             "graph review credentials must remain in memory without sending requests");
     ExtractionJobService jobs(database);
-    auto job = jobs.create("graph-review-job", source.value->id, 6000, 0, 0, 1200, connection.id);
-    require(job.ok(), "graph review typed job must create");
+    auto current_job = jobs.create("graph-review-current-job", source.value->id, 6000, 0, 0, 1200, connection.id);
+    require(current_job.ok(), "graph review typed job must create");
+    auto previous_job = *current_job.value;
+    previous_job.id = "graph-review-v2-job";
+    previous_job.schema_version = "candidate-v2"; previous_job.prompt_version = "extract-v2";
+    for (auto& previous_step : previous_job.steps) {
+        previous_step.id = previous_job.id + "-step-" + std::to_string(previous_step.ordinal);
+        previous_step.job_id = previous_job.id;
+    }
+    auto job = repository.createExtractionJob("graph-review-v2-create", previous_job);
+    require(job.ok(), "previous typed review job must remain readable without becoming sendable");
     auto step = jobs.claimNext("graph-review-claim", job.value->id, job.value->revision);
     require(step.ok(), "graph review chapter must be claimable");
     auto quote = sources.evidenceText(source.value->id, step.value->start_codepoint, step.value->end_codepoint);
@@ -3271,8 +3382,8 @@ void testCandidateAcceptanceIntoExistingEntity() {
                 {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
                 {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
                 {"quote", *quote.value}, {"provenance_type", "model_inference"}});
-        const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v2"},
-            {"prompt_version", "extract-v2"}, {"candidates", std::move(items)}});
+        const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v3"},
+            {"prompt_version", "extract-v3"}, {"rejected_candidates", 0}, {"candidates", std::move(items)}});
         require(service.ingestStepOutput("entity-link-output-" + std::to_string(ordinal), job.value->id,
                     ordinal, step.value->attempt, output).ok(), "link candidates must ingest");
     }
@@ -3443,8 +3554,8 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
         {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
         {"quote", *quote.value}, {"provenance_type", "model_inference"}});
     CandidateService service(database);
-    const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v2"},
-        {"prompt_version", "extract-v2"}, {"candidates", std::move(items)}});
+    const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v3"},
+        {"prompt_version", "extract-v3"}, {"rejected_candidates", 0}, {"candidates", std::move(items)}});
     require(service.ingestStepOutput("endpoint-review-output", job.value->id, step.value->ordinal,
                 step.value->attempt, output).ok(), "typed endpoint candidates must ingest");
     auto page = service.listPage(world.value->id, source.value->id, "candidate", 20, 0);
@@ -3707,7 +3818,7 @@ void testAcceptedEventTimelineProjection() {
     auto first = jobs.claimNext("event-review-first", job.value->id, job.value->revision);
     require(first.ok(), "first event review chapter must be claimable");
     auto empty = service.ingestStepOutput("event-review-empty", job.value->id, first.value->ordinal,
-        first.value->attempt, R"({"schema_version":"candidate-v2","prompt_version":"extract-v2","candidates":[]})");
+        first.value->attempt, R"({"schema_version":"candidate-v3","prompt_version":"extract-v3","rejected_candidates":0,"candidates":[]})");
     require(empty.ok(), "empty first chapter must commit");
     auto step = jobs.claimNext("event-review-second", job.value->id, empty.value->revision);
     require(step.ok(), "second event review chapter must be claimable");
@@ -3723,8 +3834,8 @@ void testAcceptedEventTimelineProjection() {
             {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
             {"quote", *quote.value}, {"provenance_type", "model_inference"}});
     }
-    const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v2"},
-        {"prompt_version", "extract-v2"}, {"candidates", std::move(items)}});
+    const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v3"},
+        {"prompt_version", "extract-v3"}, {"rejected_candidates", 0}, {"candidates", std::move(items)}});
     require(service.ingestStepOutput("event-review-output", job.value->id, step.value->ordinal,
                 step.value->attempt, output).ok(), "typed event candidates must ingest");
     auto page = service.listPage(world.value->id, source.value->id, "candidate", 20, 0);

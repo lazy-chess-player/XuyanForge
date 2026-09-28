@@ -243,14 +243,18 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
                 ? "unknown" : "failed";
             return finishFailure(status, "模型请求未完成：" + generated.value->failure_kind);
         }
-        auto parsed = parseTypedExtractionResponse(generated.value->text);
+        std::size_t rejected_candidates = 0;
+        auto parsed = parseTypedExtractionResponse(generated.value->text, &rejected_candidates);
         if (!parsed.ok()) return finishFailure("failed", parsed.error->message);
         // 每条逐字引文重新映射到不可变原文，随后由候选服务再次做哈希和范围校验。
         JsonValue::Array candidates;
         for (const auto& item : *parsed.value) {
             // 在连续保留的原文中定位，省略标记不是证据，不允许把不连续句段拼成引文。
             const auto range = locateNarrativeQuote(*input.value, item.quote);
-            if (!range.ok()) return finishFailure("failed", "模型引文不在唯一连续保留的原文中");
+            if (!range.ok()) {
+                ++rejected_candidates;
+                continue;
+            }
             candidates.emplace_back(JsonValue::Object{
                 {"type", item.type}, {"name", item.name}, {"quote", item.quote},
                 {"start_codepoint", static_cast<std::int64_t>(range.value->start_codepoint)},
@@ -258,8 +262,11 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
                 {"fields", item.fields},
                 {"provenance_type", "model_inference"}});
         }
+        if (!parsed.value->empty() && candidates.empty())
+            return finishFailure("failed", "模型候选的引文全部无法唯一映射到保留原文");
         const auto output = xuyan::package::writeJson(JsonValue::Object{
             {"schema_version", job.value->schema_version}, {"prompt_version", job.value->prompt_version},
+            {"rejected_candidates", static_cast<std::int64_t>(rejected_candidates)},
             {"candidates", std::move(candidates)}});
         CandidateService ingestion(database_path_);
         const auto commit = [&] {

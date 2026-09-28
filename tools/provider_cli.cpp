@@ -16,9 +16,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -86,12 +88,12 @@ int testProvider(const std::filesystem::path& database, const std::string& conne
     return report.value->status == "completed" && report.value->json_valid ? 0 : 6;
 }
 
-/** @brief 为人工授权的两次小说抽样限制发送次数、输入字节与输出上限，不保存或输出凭据。 */
+/** @brief 为人工授权的小说抽样限制发送次数、输入字节与输出上限，不保存或输出凭据。 */
 class SampleTransport final : public xuyan::application::IProviderTransport {
 public:
     /** @brief 指定本次人工验证剩余请求数，不以失败或超时为理由增加额度。 */
     explicit SampleTransport(int maximum_requests) : maximum_requests_(maximum_requests) {}
-    /** @brief 仅允许官方低价模型端点、两次请求、每次20,000请求字节及1200输出token。 */
+    /** @brief 仅允许官方低价模型端点、约定请求次数、每次20,000请求字节及2400输出token。 */
     xuyan::domain::Result<xuyan::application::ProviderTransportResponse> send(
         const xuyan::providers::ProviderHttpRequest& request,
         const std::string& credential, int timeout_ms) override {
@@ -101,13 +103,12 @@ public:
         if (attempts_ >= maximum_requests_ || request.url != "https://api.deepseek.com/responses"
             || request.body.size() > 20000 || model == nullptr || !model->isString()
             || model->string() != "deepseek-flash" || limit == nullptr || !limit->isInteger()
-            || limit->integer() != 1200) {
+            || limit->integer() != 2400) {
             return xuyan::domain::Result<xuyan::application::ProviderTransportResponse>::failure(
                 {xuyan::domain::ErrorCode::validation_failed, "抽样请求超出授权次数、模型或长度限制", false,
                  "不要自动重试，重新核对授权范围"});
         }
-        // 高峰价按输入缓存全未命中计：两次输入各20,000 token和输出各1200 token约0.10元。
-        // 字节上限是保守请求大小约束，不冒充厂商精确分词；最终按实际返回用量记录估算。
+        // 请求体字节上限是保守边界，不冒充精确分词；费用按提供商返回的实际用量估算。
         // 只在此抽样工具明确关闭思考，避免把有限输出预算都用于思考；不暗改正式任务配置。
         auto sample_request = request;
         body.value->object()["reasoning"] = xuyan::package::JsonValue::Object{{"effort", "none"}};
@@ -179,10 +180,11 @@ xuyan::domain::Result<xuyan::domain::ProviderConnection> readSampleConnection(
     return xuyan::domain::validateProviderConnection(std::move(connection));
 }
 
-/** @brief 在全新本机目录对外部小说第二区间和中段各抽样最多2000码点，最多发送两次。 */
+/** @brief 在全新本机目录抽取外部小说指定章节或默认两处，每个样本最多发送一次2000码点。 */
 int verifyNovel(const std::filesystem::path& output_directory,
                 const std::filesystem::path& connection_database,
-                const std::filesystem::path& novel_path, std::size_t first_sample) {
+                const std::filesystem::path& novel_path, std::size_t first_sample,
+                std::optional<std::size_t> explicit_chapter = std::nullopt) {
     if (std::filesystem::exists(output_directory) || !std::filesystem::is_regular_file(novel_path)
         || !std::filesystem::is_regular_file(connection_database)) {
         std::cerr << "验证需要全新输出目录、已有模型连接工作区和外部小说文件。\n";
@@ -213,7 +215,16 @@ int verifyNovel(const std::filesystem::path& output_directory,
     }
     if (source.value->chapters.empty()) return 8;
     const auto count = source.value->chapters.size();
-    const std::array<std::size_t, 2> selected{std::min<std::size_t>(1, count - 1), count / 2};
+    const std::vector<std::size_t> selected = explicit_chapter
+        ? std::vector<std::size_t>{*explicit_chapter}
+        : std::vector<std::size_t>{std::min<std::size_t>(1, count - 1), count / 2};
+    /** @brief 判断人工选择的零起始章节索引是否落在已导入来源之外。 */
+    const auto outside_source = [count](std::size_t index) { return index >= count; };
+    if (first_sample >= selected.size()
+        || std::any_of(selected.begin(), selected.end(), outside_source)) {
+        std::cerr << "抽样章节超出本地小说章节范围；没有发送请求。\n";
+        return 8;
+    }
     SampleTransport transport(static_cast<int>(selected.size() - first_sample));
     xuyan::application::ExtractionJobService jobs(database);
     xuyan::application::RemoteExtractionProcessor processor(database, credentials, transport);
@@ -230,7 +241,7 @@ int verifyNovel(const std::filesystem::path& output_directory,
           if (!output) return 8; }
         auto sample = sources.importTextFile(name, path, "1", "paid-validation");
         if (!sample.ok()) return 8;
-        auto job = jobs.create(name + "-job", sample.value->id, 2000, 0, 1, 1200, "provider-deepseek");
+        auto job = jobs.create(name + "-job", sample.value->id, 2000, 0, 1, 2400, "provider-deepseek");
         if (!job.ok()) return 8;
         auto processed = processor.processNext(job.value->id);
         auto report = jobs.qualityReport(job.value->id, 100);
@@ -260,7 +271,7 @@ int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
     const auto arguments = app.arguments();
     if (arguments.size() < 3) {
-        std::cerr << "Usage: xuyanforge_provider_cli <configure-deepseek|test> <workspace> [connection-id]\n";
+        std::cerr << "用法：xuyanforge_provider_cli <配置连接|测试连接|小说抽样命令> <工作区> [参数]\n";
         return 1;
     }
     const auto database = std::filesystem::path(arguments.at(2).toStdWString());
@@ -272,6 +283,22 @@ int main(int argc, char* argv[]) {
                                arguments.at(1) == QStringLiteral("verify-novel-second") ? 1 : 0);
         } catch (const std::exception&) {
             std::cerr << "小说抽样发生内部错误，已停止；不自动重试或输出私人详情。\n";
+            return 9;
+        }
+    }
+    if (arguments.at(1) == QStringLiteral("verify-novel-chapter") && arguments.size() == 6) {
+        bool parsed = false;
+        const auto chapter = arguments.at(5).toULongLong(&parsed);
+        if (!parsed || chapter < 1 || chapter > std::numeric_limits<std::size_t>::max()) {
+            std::cerr << "章节序号必须是从1开始的正整数；没有发送请求。\n";
+            return 7;
+        }
+        try {
+            return verifyNovel(database, std::filesystem::path(arguments.at(3).toStdWString()),
+                               std::filesystem::path(arguments.at(4).toStdWString()), 0,
+                               static_cast<std::size_t>(chapter - 1));
+        } catch (const std::exception&) {
+            std::cerr << "小说章节抽样发生内部错误，已停止；不自动重试或输出私人详情。\n";
             return 9;
         }
     }

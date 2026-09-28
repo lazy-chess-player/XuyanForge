@@ -154,6 +154,12 @@ Error storageError(const std::exception& exception) {
     return Error{ErrorCode::storage_error, exception.what(), true, "检查工作区路径和磁盘空间后重试"};
 }
 
+/** @brief 判断候选是否使用仍受审核事务支持的类型化协议版本。 */
+bool isTypedCandidateProtocol(const xuyan::domain::ExtractionCandidate& candidate) {
+    return (candidate.schema_version == "candidate-v2" && candidate.prompt_version == "extract-v2")
+        || (candidate.schema_version == "candidate-v3" && candidate.prompt_version == "extract-v3");
+}
+
 /** @brief 序列化完整情景状态及全部人物，作为版本化快照正文。 */
 std::string stateJson(const ScenarioState& state) {
     using xuyan::package::JsonValue;
@@ -3313,7 +3319,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::acceptCandidateI
         candidate.provenance_type = provenance_type;
         auto valid = xuyan::domain::validateExtractionCandidate(candidate);
         if (!valid.ok()) return valid;
-        if (candidate.schema_version != "candidate-v2" || candidate.candidate_type != "entity")
+        if (!isTypedCandidateProtocol(candidate) || candidate.candidate_type != "entity")
             return reject(ErrorCode::validation_failed, "已有条目关联只支持当前类型化实体候选，不合并事件、关系或规则");
         auto fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
         const auto* kind = fields.ok() ? fields.value->find("kind") : nullptr;
@@ -3435,7 +3441,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
         accepted_entity = std::move(*checked.value);
     }
     const bool requires_timeline = candidate.review_status == "accepted"
-        && candidate.schema_version == "candidate-v2" && candidate.candidate_type == "event";
+        && isTypedCandidateProtocol(candidate) && candidate.candidate_type == "event";
     if (requires_timeline != accepted_timeline.has_value())
         return Result<xuyan::domain::ExtractionCandidate>::failure(
             {ErrorCode::validation_failed, "类型化事件接受必须携带时间线投影，其他审核不能携带投影", false, "重新提交审核"});
@@ -3444,7 +3450,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
     auto payload = legacy_payload;
     std::string previous_typed_payload;
     const bool typed_entity_acceptance = candidate.review_status == "accepted"
-        && candidate.schema_version == "candidate-v2" && candidate.candidate_type == "entity";
+        && isTypedCandidateProtocol(candidate) && candidate.candidate_type == "entity";
     if (typed_entity_acceptance) {
         using xuyan::package::JsonValue;
         auto fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
@@ -3491,7 +3497,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
     }
     const auto graph_fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
     const auto* candidate_kind = graph_fields.ok() ? graph_fields.value->find("kind") : nullptr;
-    const bool requires_relation = candidate.review_status == "accepted" && candidate.schema_version == "candidate-v2"
+    const bool requires_relation = candidate.review_status == "accepted" && isTypedCandidateProtocol(candidate)
         && candidate.candidate_type == "relation";
     const bool requires_location = typed_entity_acceptance && candidate_kind && candidate_kind->isString()
         && candidate_kind->string() == "location";

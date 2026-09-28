@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xuyanforge.local/contracts/extraction-response-v3.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["entities", "events", "prompt_version", "relations", "rules", "schema_version"],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["candidate-v3"]},
+    "prompt_version": {"type": "string", "enum": ["extract-v3"]},
+    "entities": {
+      "type": "array", "maxItems": 24,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["fields", "name", "quote"],
+        "properties": {
+          "name": {"type": "string"}, "quote": {"type": "string"},
+          "fields": {
+            "type": "object", "additionalProperties": false, "required": ["aliases", "kind"],
+            "properties": {
+              "aliases": {"type": "array", "items": {"type": "string"}},
+              "kind": {"type": "string", "enum": ["character", "location", "faction", "item", "culture", "technology", "other"]}
+            }
+          }
+        }
+      }
+    },
+    "events": {
+      "type": "array", "maxItems": 24,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["fields", "name", "quote"],
+        "properties": {
+          "name": {"type": "string"}, "quote": {"type": "string"},
+          "fields": {
+            "type": "object", "additionalProperties": false, "required": ["action", "location", "participants", "time_text"],
+            "properties": {
+              "action": {"type": "string"}, "location": {"type": "string"},
+              "participants": {"type": "array", "items": {"type": "string"}}, "time_text": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "relations": {
+      "type": "array", "maxItems": 24,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["fields", "name", "quote"],
+        "properties": {
+          "name": {"type": "string"}, "quote": {"type": "string"},
+          "fields": {
+            "type": "object", "additionalProperties": false, "required": ["directed", "object", "predicate", "subject"],
+            "properties": {
+              "directed": {"type": "boolean"}, "object": {"type": "string"},
+              "predicate": {"type": "string"}, "subject": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "rules": {
+      "type": "array", "maxItems": 24,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["fields", "name", "quote"],
+        "properties": {
+          "name": {"type": "string"}, "quote": {"type": "string"},
+          "fields": {
+            "type": "object", "additionalProperties": false, "required": ["modality", "scope", "statement"],
+            "properties": {
+              "modality": {"type": "string", "enum": ["ability", "prohibition", "obligation", "constraint"]},
+              "scope": {"type": "string"}, "statement": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

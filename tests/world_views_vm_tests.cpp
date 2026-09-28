@@ -893,7 +893,7 @@ void testRemoteBatchControls() {
                 require(gate_.tryAcquire(1, 10000), "remote send gate timed out");
             }
             return xuyan::domain::Result<ProviderTransportResponse>::success({200, false, false,
-                R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v2\",\"prompt_version\":\"extract-v2\",\"entities\":[],\"events\":[],\"relations\":[],\"rules\":[]}"}]}]})"});
+                R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v3\",\"prompt_version\":\"extract-v3\",\"entities\":[],\"events\":[],\"relations\":[],\"rules\":[]}"}]}]})"});
         }
         std::atomic<int> calls{0};
     private:

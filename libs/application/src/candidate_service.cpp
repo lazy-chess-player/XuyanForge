@@ -56,14 +56,22 @@ Result<JobResult> CandidateService::ingestStepOutputImpl(
     const auto* schema = required(*parsed.value, "schema_version");
     const auto* prompt = required(*parsed.value, "prompt_version");
     const auto* items = required(*parsed.value, "candidates");
+    const auto* rejected = required(*parsed.value, "rejected_candidates");
     if (schema == nullptr || !schema->isString() || prompt == nullptr || !prompt->isString()
         || !((schema->string() == "candidate-v1" && prompt->string() == "extract-v1")
-            || (schema->string() == typedCandidateSchemaVersion && prompt->string() == typedCandidatePromptVersion))
-        || parsed.value->object().size() != 3
+            || isSupportedTypedCandidateProtocol(schema->string(), prompt->string()))
         || items == nullptr || !items->isArray() || items->array().size() > 256)
         return protocolError<JobResult>("候选输出版本或 candidates 数组无效");
-    if (schema->string() == typedCandidateSchemaVersion && items->array().size() > 5)
-        return protocolError<JobResult>("类型化单步输出超过 5 条候选上限");
+    const auto typed_maximum = typedCandidateMaximumFor(schema->string(), prompt->string());
+    const bool current_typed = schema->string() == typedCandidateSchemaVersion
+        && prompt->string() == typedCandidatePromptVersion;
+    if ((current_typed && (parsed.value->object().size() != 4 || rejected == nullptr || !rejected->isInteger()
+            || rejected->integer() < 0 || rejected->integer() > static_cast<std::int64_t>(typed_maximum)
+            || items->array().size() + static_cast<std::size_t>(rejected->integer()) > typed_maximum))
+        || (!current_typed && (parsed.value->object().size() != 3 || rejected != nullptr)))
+        return protocolError<JobResult>("候选输出的逐条校验统计与协议版本不一致");
+    if (typed_maximum > 0 && items->array().size() > typed_maximum)
+        return protocolError<JobResult>("类型化单步输出超过当前协议的候选上限");
     try {
         xuyan::storage::WorkspaceRepository repository(database_path_);
         auto job = repository.loadExtractionJobState(job_id);
@@ -106,7 +114,7 @@ Result<JobResult> CandidateService::ingestStepOutputImpl(
                 || provenance == nullptr || !provenance->isString() || start->integer() < 0 || end->integer() < 0)
                 return protocolError<JobResult>("候选字段缺失或类型错误");
             if (item.object().size() != 7) return protocolError<JobResult>("候选含有协议以外的属性");
-            if (schema->string() == typedCandidateSchemaVersion) {
+            if (typed_maximum > 0) {
                 // 模型不能绕过远程解析器，提交缺字段候选或自称人工确认事实。
                 auto typed = validateTypedCandidateFields(type->string(), *fields, quote->string(), name->string());
                 if (!typed.ok()) return Result<JobResult>::failure(*typed.error);
@@ -206,14 +214,16 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
         auto candidate = std::move(*loaded.value);
         candidate.name = name; candidate.fields_json = xuyan::package::writeJson(*fields.value);
         candidate.provenance_type = provenance_type; candidate.review_status = review_status;
-        if (candidate.schema_version == typedCandidateSchemaVersion) {
+        const bool typed_candidate = isSupportedTypedCandidateProtocol(
+            candidate.schema_version, candidate.prompt_version);
+        if (typed_candidate) {
             auto valid = validateTypedCandidateFields(candidate.candidate_type, *fields.value, candidate.quote, candidate.name);
             if (!valid.ok()) return Result<xuyan::domain::ExtractionCandidate>::failure(*valid.error);
         }
         std::optional<xuyan::domain::WorldEntity> entity;
         std::optional<xuyan::domain::TimelineEvent> timeline;
         std::optional<xuyan::domain::CandidateGraphProjection> graph;
-        const bool typed_relation = candidate.schema_version == typedCandidateSchemaVersion
+        const bool typed_relation = typed_candidate
             && candidate.candidate_type == "relation" && review_status == "accepted";
         if (typed_relation != endpoint_selection.has_value())
             return Result<xuyan::domain::ExtractionCandidate>::failure({ErrorCode::validation_failed,
@@ -230,7 +240,7 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
             if (candidate.candidate_type == "entity") {
                 const auto* kind = fields.value->find("kind");
                 if (kind != nullptr && kind->isString() && xuyan::domain::isSupportedEntityKind(kind->string())) value.kind = kind->string();
-                if (candidate.schema_version == typedCandidateSchemaVersion) {
+                if (typed_candidate) {
                     // 别名已通过逐字证据校验；保存为正式别名用于消歧，但不据此合并同名条目。
                     for (const auto& alias : fields.value->find("aliases")->array()) value.aliases.push_back(alias.string());
                 }
@@ -247,7 +257,7 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
                     ? "作者保留的模型推断，仍是待验证假设。证据引文：" + candidate.quote
                     : "由提取候选审核接受的事实。证据引文：" + candidate.quote;
             value.attributes_json = xuyan::package::writeJson(enriched_fields); value.review_status = "accepted";
-            if (candidate.schema_version == typedCandidateSchemaVersion && candidate.candidate_type == "event") {
+            if (typed_candidate && candidate.candidate_type == "event") {
                 xuyan::domain::TimelineEvent event;
                 // 与接受条目共用稳定标识，现有证据查询可直接回到原文；说法和假设不升级为事实。
                 event.id = value.id; event.world_id = value.world_id; event.name = value.name;
@@ -268,7 +278,7 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
                 relation.truth_status = truth_status; relation.evidence_status = std::string_view(truth_status) == "fact" ? "evidence" : "assumption";
                 // 小说陈述不推定关系强度、有效日期或任何人物的知情权限。
                 graph = xuyan::domain::CandidateGraphProjection{std::move(relation), std::nullopt, std::move(endpoint_selection)};
-            } else if (candidate.schema_version == typedCandidateSchemaVersion && candidate.candidate_type == "entity"
+            } else if (typed_candidate && candidate.candidate_type == "entity"
                        && fields.value->find("kind")->string() == "location") {
                 xuyan::domain::LocationPlacement location;
                 location.location_id = value.id; location.truth_status = truth_status;
