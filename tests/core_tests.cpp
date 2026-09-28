@@ -915,12 +915,14 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
                         && request.body.find("participants") != std::string::npos,
                     "remote request must include typed fields and fixed output versions");
             if (throw_after_validation) throw std::runtime_error("transport leaked synthetic-test-secret");
+            if (on_send) on_send();
             return xuyan::domain::Result<xuyan::application::ProviderTransportResponse>::success({
                 200, false, false,
                 R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v2\",\"prompt_version\":\"extract-v2\",\"entities\":[],\"relations\":[],\"rules\":[],\"events\":[{\"name\":\"找到钥匙\",\"quote\":\"林舟找到了失落的钥匙\",\"fields\":{\"action\":\"找到钥匙\",\"participants\":[\"林舟\"],\"location\":\"\",\"time_text\":\"\"}}]}"}]}],"usage":{"input_tokens":80,"output_tokens":28}})"});
         }
         int calls{0};
         bool throw_after_validation{false};
+        std::function<void()> on_send;
     };
     const auto directory = temporaryDatabase().parent_path() / "remote-extraction-synthetic";
     std::error_code ignored;
@@ -1016,6 +1018,24 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
     const std::string bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
     require(bytes.find("synthetic-test-secret") == std::string::npos,
             "remote extraction must not persist the provider secret");
+    // 请求已发出时取消：保留有效回报，但不得把已取消任务重新排队。
+    auto cancelling_job = jobs.create("remote-in-flight-cancel", source.value->id,
+                                      700, 0, 3, 512, connection.id);
+    require(cancelling_job.ok() && cancelling_job.value->total_steps > 1,
+            "in-flight cancellation fixture must have unsent steps");
+    transport.throw_after_validation = false;
+    transport.on_send = [&] {
+        auto current = jobs.load(cancelling_job.value->id);
+        require(current.ok() && jobs.cancel("remote-cancel-during-send", current.value->id,
+                                           current.value->revision).ok(),
+                "cancellation must commit while transport is in progress");
+    };
+    auto settled_cancel = processor.processNext(cancelling_job.value->id);
+    transport.on_send = {};
+    require(settled_cancel.ok() && settled_cancel.value->status == "cancelled"
+                && settled_cancel.value->completed_steps == 1 && settled_cancel.value->cancel_requested
+                && settled_cancel.value->steps.back().status == "cancelled",
+            "valid in-flight reply must retain its checkpoint without requeuing a cancelled job");
     sqlite3* legacy_database = nullptr;
     const auto opened = sqlite3_open(database.string().c_str(), &legacy_database);
     require(opened == SQLITE_OK && legacy_database != nullptr,
@@ -1031,9 +1051,297 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
     auto legacy_refused = processor.processNext(job.value->id);
     auto legacy_unchanged = jobs.load(job.value->id);
     require(!legacy_refused.ok() && legacy_unchanged.ok()
-                && legacy_unchanged.value->budget.consumed_requests == 0 && transport.calls == 3,
+                && legacy_unchanged.value->budget.consumed_requests == 0 && transport.calls == 4,
             "legacy jobs must not send source text or consume budget until recreated");
     std::filesystem::remove_all(directory, ignored);
+}
+
+/** @brief 验证原文远程批次遍历、持久化续跑、次数硬上限和所有停止边界；不访问真实网络。 */
+void testRemoteBatchCheckpoints() {
+    using namespace xuyan::application;
+    using xuyan::package::JsonValue;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-remote-batch-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
+            "remote batch test must own a fresh temporary directory");
+    struct Cleanup {
+        std::filesystem::path root;
+        std::filesystem::path parent;
+        /** @brief 仅清理本测试拥有的精确临时目录。 */
+        ~Cleanup() {
+            if (root.parent_path() == parent) {
+                std::error_code ignored;
+                std::filesystem::remove_all(root, ignored);
+            }
+        }
+    } cleanup{directory, parent};
+    const auto database = directory / "workspace.sqlite";
+    InMemoryCredentialStore credentials;
+    ProviderConnectionService connections(database, credentials);
+    xuyan::domain::ProviderConnection connection;
+    connection.id = "batch-owned-provider"; connection.name = "批次自有测试连接";
+    connection.kind = "deepseek"; connection.endpoint = "https://batch.example.invalid";
+    connection.default_model = "owned-model"; connection.data_policy = "remote_allowed";
+    require(connections.save("batch-owned-provider-save", connection, 0, std::string{"owned-test-secret"}).ok(),
+            "batch fake provider must save without transport");
+    ExtractionJobService jobs(database);
+    SourceImportService sources(database);
+    // 每个用例生成不同正文，避免前一个任务的已完成缓存替代本用例的实际发送。
+    const auto createJob = [&](const std::string& label, int chapters = 4, int requests = 50) {
+        const auto manuscript = directory / (label + ".txt");
+        {
+            std::ofstream output(manuscript, std::ios::binary);
+            require(output.good(), "runtime manuscript must be writable");
+            for (int chapter = 1; chapter <= chapters; ++chapter) {
+                output << "# 第" << chapter << "章\n记录者完成编号" << label << '-' << chapter << "的核对。\n";
+                for (int line = 0; line < 6; ++line) output << "远处的云层缓慢变换颜色。\n";
+            }
+        }
+        auto source = sources.importTextFile("batch-source-" + label, manuscript, "1", "owned-batch-world");
+        require(source.ok() && static_cast<int>(source.value->chapters.size()) == chapters,
+                "runtime source must retain every chapter");
+        auto job = jobs.create("batch-job-" + label, source.value->id, 500, 0, requests, 512, connection.id);
+        require(job.ok() && job.value->total_steps == chapters && job.value->completed_steps == 0,
+                "each owned chapter must create an uncached ready step");
+        return *job.value;
+    };
+    class FakeTransport final : public IProviderTransport {
+    public:
+        /** @brief 从当前请求的数据片段生成逐字事件；故障及发送钩子仅在测试中使用。 */
+        xuyan::domain::Result<ProviderTransportResponse> send(
+            const xuyan::providers::ProviderHttpRequest& request, const std::string& secret, int timeout) override {
+            using Response = xuyan::domain::Result<ProviderTransportResponse>;
+            ++calls;
+            require(secret == "owned-test-secret" && timeout == 60000
+                        && request.body.find(secret) == std::string::npos,
+                    "batch sends must preserve credential and timeout boundaries");
+            auto body = xuyan::package::parseJson(request.body);
+            require(body.ok() && body.value->find("input") != nullptr,
+                    "fake transport must receive a structured Responses request");
+            const auto& prompt = body.value->find("input")->array().front().find("content")->array().front()
+                .find("text")->string();
+            auto data = xuyan::package::parseJson(std::string_view(prompt).substr(prompt.rfind('\n') + 1));
+            require(data.ok() && data.value->find("novel_fragment") != nullptr,
+                    "novel fragment must remain an escaped data field");
+            const auto& fragment = data.value->find("novel_fragment")->string();
+            const auto start = fragment.find("记录者完成编号");
+            const auto end = fragment.find("。", start);
+            require(start != std::string::npos && end != std::string::npos,
+                    "each scheduled chapter must contain its owned event");
+            const auto quote = fragment.substr(start, end + std::string("。").size() - start);
+            quotes.push_back(quote);
+            if (on_send) on_send();
+            if (throw_after_send) throw std::runtime_error("private owned-test-secret");
+            if (timed_out || cancelled || http_status != 200)
+                return Response::success({http_status, timed_out, cancelled, ""});
+            const auto typed = xuyan::package::writeJson(JsonValue::Object{
+                {"schema_version", "candidate-v2"}, {"prompt_version", "extract-v2"},
+                {"entities", JsonValue::Array{}}, {"relations", JsonValue::Array{}}, {"rules", JsonValue::Array{}},
+                {"events", JsonValue::Array{JsonValue::Object{
+                    {"name", "完成核对"}, {"quote", quote}, {"fields", JsonValue::Object{
+                        {"action", "完成核对"}, {"participants", JsonValue::Array{"记录者"}},
+                        {"location", ""}, {"time_text", ""}}}}}}});
+            const auto response = xuyan::package::writeJson(JsonValue::Object{
+                {"status", "completed"}, {"output", JsonValue::Array{JsonValue::Object{
+                    {"content", JsonValue::Array{JsonValue::Object{
+                        {"type", "output_text"}, {"text", malformed ? "{}" : typed}}}}}}},
+                {"usage", JsonValue::Object{{"input_tokens", 100}, {"output_tokens", 80}}}});
+            return Response::success({200, false, false, response});
+        }
+        int calls{0};
+        int http_status{200};
+        bool timed_out{false};
+        bool cancelled{false};
+        bool malformed{false};
+        bool throw_after_send{false};
+        std::function<void()> on_send;
+        std::vector<std::string> quotes;
+    } transport;
+    RemoteExtractionProcessor processor(database, credentials, transport);
+    const auto full = createJob("full", 40);
+    RemoteBatchOptions pause;
+    pause.maximum_steps = 50;
+    int notifications = 0;
+    pause.on_progress = [&](const RemoteBatchProgress& progress) {
+        auto durable = jobs.load(progress.job_id);
+        require(durable.ok() && durable.value->revision == progress.revision
+                    && durable.value->completed_steps == progress.completed_steps
+                    && progress.consumed_requests == progress.completed_steps && progress.maximum_requests == 50,
+                "progress must report durable counts without raw data");
+        ++notifications;
+        return progress.processed_steps == 2 ? RemoteBatchAction::pause : RemoteBatchAction::proceed;
+    };
+    auto paused = processor.processBatch(full.id, pause);
+    require(paused.ok() && paused.value->reason == RemoteBatchStopReason::paused
+                && paused.value->processed_steps == 2 && notifications == 3 && transport.calls == 2,
+            "remote batch must pause after exactly two committed checkpoints");
+    RemoteExtractionProcessor reopened(database, credentials, transport);
+    RemoteBatchOptions one;
+    one.maximum_steps = 1;
+    auto yielded = reopened.processBatch(full.id, one);
+    require(yielded.ok() && yielded.value->reason == RemoteBatchStopReason::step_limit
+                && yielded.value->job.completed_steps == 3 && transport.calls == 3,
+            "reconstructed processor must resume without replay and honor the call limit");
+    RemoteBatchOptions all;
+    all.maximum_steps = 100000;
+    auto finished = reopened.processBatch(full.id, all);
+    require(finished.ok() && finished.value->reason == RemoteBatchStopReason::completed
+                && finished.value->processed_steps == 37 && finished.value->job.completed_steps == 40
+                && transport.calls == 40 && std::all_of(finished.value->job.steps.begin(), finished.value->job.steps.end(),
+                    [](const auto& step) { return step.status == "completed" && step.attempt == 1; }),
+            "every owned chapter must complete once across pause and reconstruction");
+    auto sorted_quotes = transport.quotes;
+    std::sort(sorted_quotes.begin(), sorted_quotes.end());
+    require(std::adjacent_find(sorted_quotes.begin(), sorted_quotes.end()) == sorted_quotes.end(),
+            "resuming must not resend a completed fragment");
+    auto candidates = CandidateService(database).list();
+    require(candidates.ok() && candidates.value->size() == 40,
+            "full fake batch must retain one pending candidate for each chapter");
+    for (const auto& candidate : *candidates.value) {
+        auto evidence = sources.evidenceText(candidate.source_id, candidate.start_codepoint, candidate.end_codepoint);
+        require(evidence.ok() && *evidence.value == candidate.quote
+                    && candidate.quote_hash == xuyan::domain::sha256(candidate.quote)
+                    && candidate.review_status == "candidate" && candidate.provenance_type == "model_inference",
+                "every persisted candidate must retain immutable evidence and await review");
+    }
+    auto completion_options = all;
+    completion_options.on_progress = [](const RemoteBatchProgress&) { return RemoteBatchAction::cancel; };
+    const auto replay = reopened.processBatch(full.id, completion_options);
+    require(replay.ok() && replay.value->reason == RemoteBatchStopReason::completed
+                && replay.value->processed_steps == 0 && transport.calls == 40,
+            "completed batches must return without sends or budget consumption");
+    RemoteBatchOptions invalid;
+    for (const auto limit : {0, -1, 100001}) {
+        invalid.maximum_steps = limit;
+        require(!processor.processBatch(full.id, invalid).ok() && transport.calls == 40,
+                "unspecified and invalid batch limits must fail before scheduling");
+    }
+    const auto capped = createJob("budget", 4, 2);
+    auto exhausted = processor.processBatch(capped.id, all);
+    require(exhausted.ok() && exhausted.value->reason == RemoteBatchStopReason::budget_exhausted
+                && exhausted.value->job.completed_steps == 2 && exhausted.value->job.budget.consumed_requests == 2,
+            "persistent request cap must stop a batch with remaining ready steps");
+    const auto calls_after_cap = transport.calls;
+    auto still_capped = reopened.processBatch(capped.id, all);
+    require(still_capped.ok() && still_capped.value->processed_steps == 0 && transport.calls == calls_after_cap,
+            "reconstruction must not reset exhausted request allowance");
+    const auto stopped_job = createJob("token");
+    std::stop_source stop;
+    stop.request_stop();
+    auto stopped_options = all;
+    stopped_options.stop_token = stop.get_token();
+    auto stopped = processor.processBatch(stopped_job.id, stopped_options);
+    require(stopped.ok() && stopped.value->reason == RemoteBatchStopReason::paused
+                && stopped.value->processed_steps == 0 && transport.calls == calls_after_cap,
+            "pre-requested stop must preserve all ready steps and send nothing");
+    std::stop_source during_send;
+    stopped_options.stop_token = during_send.get_token();
+    transport.on_send = [&] { during_send.request_stop(); };
+    auto stopped_in_flight = processor.processBatch(stopped_job.id, stopped_options);
+    transport.on_send = {};
+    require(stopped_in_flight.ok() && stopped_in_flight.value->reason == RemoteBatchStopReason::paused
+                && stopped_in_flight.value->job.completed_steps == 1
+                && stopped_in_flight.value->job.steps[1].status == "ready",
+            "stop during send must settle the valid reply and prevent the next request");
+    const auto nested = createJob("nested");
+    int nested_rejections = 0;
+    transport.on_send = [&] {
+        if (!reopened.processNext(nested.id).ok()) ++nested_rejections;
+        if (!reopened.processBatch(nested.id, all).ok()) ++nested_rejections;
+    };
+    const auto before_nested = transport.calls;
+    auto nested_options = one;
+    nested_options.on_progress = [&](const RemoteBatchProgress& progress) {
+        if (progress.processed_steps == 0) {
+            // 此时任务仍排队，拒绝必须来自共享租约，不能仅靠 running 状态判断。
+            if (!reopened.processNext(nested.id).ok()) ++nested_rejections;
+            if (!reopened.processBatch(nested.id, all).ok()) ++nested_rejections;
+        }
+        return RemoteBatchAction::proceed;
+    };
+    auto nested_result = processor.processBatch(nested.id, nested_options);
+    transport.on_send = {};
+    require(nested_result.ok() && nested_rejections == 4 && transport.calls == before_nested + 1,
+            "single-step and batch entry must share a nonblocking per-job execution lease");
+    const auto external_cancel = createJob("cancel-flight");
+    transport.on_send = [&] {
+        auto current = jobs.load(external_cancel.id);
+        require(current.ok() && jobs.cancel("batch-cancel-flight", current.value->id, current.value->revision).ok(),
+                "external cancel must not wait on a transaction held across transport");
+    };
+    auto cancelled = processor.processBatch(external_cancel.id, all);
+    transport.on_send = {};
+    require(cancelled.ok() && cancelled.value->reason == RemoteBatchStopReason::cancelled
+                && cancelled.value->job.completed_steps == 1 && cancelled.value->processed_steps == 1,
+            "in-flight cancellation must settle once and stop every later send");
+    const auto callback_cancel = createJob("cancel-callback");
+    auto cancel_options = all;
+    cancel_options.on_progress = [&](const RemoteBatchProgress& progress) {
+        require(jobs.cancel("batch-callback-external-cancel", progress.job_id, progress.revision).ok(),
+                "callback must be allowed to commit external cancellation");
+        return RemoteBatchAction::proceed;
+    };
+    const auto before_cancel = transport.calls;
+    auto callback_cancelled = processor.processBatch(callback_cancel.id, cancel_options);
+    require(callback_cancelled.ok() && callback_cancelled.value->reason == RemoteBatchStopReason::cancelled
+                && transport.calls == before_cancel,
+            "batch must reload callback mutations before claiming a step");
+    const auto action_cancel = createJob("cancel-action");
+    cancel_options.on_progress = [](const RemoteBatchProgress&) { return RemoteBatchAction::cancel; };
+    auto action_cancelled = processor.processBatch(action_cancel.id, cancel_options);
+    require(action_cancelled.ok() && action_cancelled.value->reason == RemoteBatchStopReason::cancelled
+                && action_cancelled.value->job.cancel_requested && transport.calls == before_cancel,
+            "cancel action must persist the cancellation without sending");
+    const auto callback_error = createJob("callback-error");
+    auto throwing = all;
+    throwing.on_progress = [](const RemoteBatchProgress& progress) {
+        if (progress.processed_steps == 1) throw std::runtime_error("private owned-test-secret");
+        return RemoteBatchAction::proceed;
+    };
+    auto callback_failed = processor.processBatch(callback_error.id, throwing);
+    require(!callback_failed.ok() && callback_failed.error->message.find("owned-test-secret") == std::string::npos
+                && jobs.load(callback_error.id).value->completed_steps == 1,
+            "callback exceptions must be redacted and preserve the committed checkpoint");
+    auto callback_resumed = reopened.processBatch(callback_error.id, all);
+    require(callback_resumed.ok() && callback_resumed.value->processed_steps == 3,
+            "callback exception must release the lease and permit explicit resume");
+    // 未知计费结果和确定失败都停止，不自动跳过失败片段调度剩余章节。
+    for (int mode = 0; mode < 6; ++mode) {
+        const auto failed_job = createJob("failure-" + std::to_string(mode));
+        transport.timed_out = mode == 0;
+        transport.cancelled = mode == 1;
+        transport.throw_after_send = mode == 2;
+        transport.http_status = mode == 3 ? 503 : mode == 5 ? 0 : 200;
+        transport.malformed = mode == 4;
+        const auto before = transport.calls;
+        auto failed = processor.processBatch(failed_job.id, all);
+        const auto expected = mode <= 2 || mode == 5 ? "unknown" : "failed";
+        require(failed.ok() && failed.value->reason == RemoteBatchStopReason::needs_attention
+                    && failed.value->processed_steps == 1 && failed.value->job.steps.front().status == expected
+                    && failed.value->job.budget.consumed_requests == 1 && transport.calls == before + 1,
+                "unknown or failed results must persist and stop after one attempt");
+        auto unchanged = reopened.processBatch(failed_job.id, all);
+        require(unchanged.ok() && unchanged.value->processed_steps == 0
+                    && !reopened.processNext(failed_job.id).ok() && transport.calls == before + 1,
+                "both entries must refuse to skip or auto-retry unresolved steps");
+        transport.timed_out = transport.cancelled = transport.throw_after_send = transport.malformed = false;
+        transport.http_status = 200;
+    }
+    const auto interrupted = createJob("interrupted");
+    require(jobs.claimNext("batch-interrupted-claim", interrupted.id, interrupted.revision).ok(),
+            "interrupted test must own an unsettled durable claim");
+    const auto before_interrupted = transport.calls;
+    auto blocked = processor.processBatch(interrupted.id, all);
+    require(blocked.ok() && blocked.value->reason == RemoteBatchStopReason::needs_attention
+                && jobs.recoverInterrupted().ok(), "running checkpoints must require explicit recovery");
+    auto recovered = reopened.processBatch(interrupted.id, all);
+    require(recovered.ok() && recovered.value->reason == RemoteBatchStopReason::needs_attention
+                && recovered.value->job.steps.front().status == "unknown" && transport.calls == before_interrupted,
+            "recovery must not turn unknown sends into automatic retries");
+    auto facts = xuyan::application::WorkspaceService(database).openAndList();
+    require(facts.ok() && facts.value->total == 0,
+            "fake model candidates must never create accepted world facts automatically");
 }
 
 /** @brief 检查世界条目增删改查、中文检索和过期修订冲突。 */
@@ -2986,6 +3294,7 @@ int main() {
         testTypedExtractionOutputContract();
         testTypedExtractionPersistenceAndVersionIsolation();
         testRemoteExtractionOneStepIsExplicitAndEvidenceBound();
+        testRemoteBatchCheckpoints();
         testEntityCrudSearchAndOptimisticLocking();
         testSourceImportAndCodepointEvidence();
         testOfflineMissingAssetRecovery();

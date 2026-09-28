@@ -11,6 +11,8 @@
 #include "xuyan/package/json.h"
 
 #include <algorithm>
+#include <mutex>
+#include <unordered_set>
 
 namespace xuyan::application {
 namespace {
@@ -18,6 +20,61 @@ namespace {
 using xuyan::domain::ExtractionJob;
 using xuyan::domain::Result;
 using xuyan::package::JsonValue;
+
+/** @brief 保存本进程正在执行的工作区/任务键；锁只保护集合，不跨越网络或回调。 */
+struct ExecutionRegistry {
+    std::mutex mutex;
+    std::unordered_set<std::string> active;
+};
+
+/** @brief 返回跨处理器实例共享的租约注册表。 */
+ExecutionRegistry& executionRegistry() {
+    static ExecutionRegistry registry;
+    return registry;
+}
+
+/** @brief 以规范 UTF-8 路径标识任务；Windows 的 ASCII 大小写别名归一化。 */
+std::string executionKey(const std::filesystem::path& database, const std::string& job_id) {
+    const auto path = std::filesystem::weakly_canonical(database).generic_u8string();
+    std::string encoded(path.begin(), path.end());
+#ifdef _WIN32
+    for (auto& byte : encoded) if (byte >= 'A' && byte <= 'Z') byte += 'a' - 'A';
+#endif
+    return xuyan::package::writeJson(JsonValue::Array{encoded, job_id});
+}
+
+/** @brief 通过作用域释放执行权，覆盖失败返回与异常；不拥有线程或传输端口。 */
+class ExecutionLease {
+public:
+    /** @brief 原子尝试登记任务，不等待已存在的执行者。 */
+    ExecutionLease(const std::filesystem::path& database, const std::string& job_id)
+        : key_(executionKey(database, job_id)) {
+        auto& registry = executionRegistry();
+        const std::lock_guard lock(registry.mutex);
+        acquired_ = registry.active.insert(key_).second;
+    }
+    /** @brief 仅释放本实例成功取得的执行权。 */
+    ~ExecutionLease() {
+        if (!acquired_) return;
+        auto& registry = executionRegistry();
+        const std::lock_guard lock(registry.mutex);
+        registry.active.erase(key_);
+    }
+    ExecutionLease(const ExecutionLease&) = delete;
+    ExecutionLease& operator=(const ExecutionLease&) = delete;
+    /** @brief 查询是否取得执行权，未取得时禁止领取或发送。 */
+    bool acquired() const noexcept { return acquired_; }
+private:
+    std::string key_;
+    bool acquired_{false};
+};
+
+/** @brief 检测必须由人工结算或恢复的步骤，防止跳过未知结果继续消耗预算。 */
+bool needsAttention(const ExtractionJob& job) {
+    return job.status == "needs_attention" || std::any_of(job.steps.begin(), job.steps.end(), [](const auto& step) {
+        return step.status == "running" || step.status == "failed" || step.status == "unknown";
+    });
+}
 
 /** @brief 为同一步骤/尝试生成稳定命令 ID，使领取与完成回报可安全重放。 */
 std::string commandId(std::string_view prefix, const std::string& job_id, int ordinal, int attempt) {
@@ -38,11 +95,88 @@ RemoteExtractionProcessor::RemoteExtractionProcessor(std::filesystem::path datab
     : database_path_(std::move(database_path)), credentials_(credentials), transport_(transport) {}
 
 Result<ExtractionJob> RemoteExtractionProcessor::processNext(const std::string& job_id) {
+    try {
+        ExecutionLease lease(database_path_, job_id);
+        if (!lease.acquired()) return error("此解析任务已有执行者；请等待当前调用停止");
+        return processNextUnchecked(job_id);
+    } catch (...) {
+        return error("远程解析发生内部错误；请检查持久化任务状态，详情已隐藏");
+    }
+}
+
+Result<RemoteBatchResult> RemoteExtractionProcessor::processBatch(
+    const std::string& job_id, const RemoteBatchOptions& options) {
+    using BatchResult = Result<RemoteBatchResult>;
+    if (options.maximum_steps < 1 || options.maximum_steps > 100000)
+        return BatchResult::failure({xuyan::domain::ErrorCode::validation_failed,
+            "远程批次必须明确指定有效步骤上限", false, "使用 1—100000"});
+    try {
+        ExecutionLease lease(database_path_, job_id);
+        if (!lease.acquired()) return BatchResult::failure({xuyan::domain::ErrorCode::rule_conflict,
+            "此解析任务已有执行者", false, "等待当前调用停止"});
+        ExtractionJobService jobs(database_path_);
+        auto current = jobs.load(job_id);
+        if (!current.ok()) return BatchResult::failure(*current.error);
+        if (current.value->provider_connection_id.empty()
+            || current.value->schema_version != typedCandidateSchemaVersion
+            || current.value->prompt_version != typedCandidatePromptVersion)
+            return BatchResult::failure({xuyan::domain::ErrorCode::validation_failed,
+                "批次仅支持绑定模型连接的当前原文提取协议", false, "重新创建任务并确认发送范围"});
+        int processed = 0;
+        for (;;) {
+            auto action = RemoteBatchAction::proceed;
+            if (options.on_progress) {
+                const auto& job = *current.value;
+                try {
+                    action = options.on_progress({job.id, job.total_steps, job.completed_steps,
+                        processed, job.revision, job.budget.consumed_requests, job.budget.max_requests});
+                } catch (...) {
+                    return BatchResult::failure({xuyan::domain::ErrorCode::validation_failed,
+                        "远程批次进度回调失败；已提交检查点保留，详情已隐藏", false, "检查回调后显式继续"});
+                }
+            }
+            // 回调可以取消任务；重新读取后才判断是否允许下一次发送。
+            current = jobs.load(job_id);
+            if (!current.ok()) return BatchResult::failure(*current.error);
+            const auto stopped = [&](RemoteBatchStopReason reason) {
+                return BatchResult::success({std::move(*current.value), processed, reason});
+            };
+            if (current.value->status == "completed") return stopped(RemoteBatchStopReason::completed);
+            if (current.value->status == "cancelled") return stopped(RemoteBatchStopReason::cancelled);
+            if (needsAttention(*current.value)) return stopped(RemoteBatchStopReason::needs_attention);
+            if (action == RemoteBatchAction::cancel || current.value->cancel_requested) {
+                current = jobs.cancel("remote-batch-cancel-" + xuyan::domain::sha256(
+                    job_id + '|' + std::to_string(current.value->revision)), job_id, current.value->revision);
+                if (!current.ok()) return BatchResult::failure(*current.error);
+                return stopped(RemoteBatchStopReason::cancelled);
+            }
+            if (options.stop_token.stop_requested() || action == RemoteBatchAction::pause)
+                return stopped(RemoteBatchStopReason::paused);
+            if (processed >= options.maximum_steps) return stopped(RemoteBatchStopReason::step_limit);
+            if (current.value->budget.consumed_requests >= current.value->budget.max_requests)
+                return stopped(RemoteBatchStopReason::budget_exhausted);
+            if (std::none_of(current.value->steps.begin(), current.value->steps.end(), [](const auto& step) {
+                    return step.status == "ready";
+                })) return stopped(RemoteBatchStopReason::needs_attention);
+            // 不持有注册表锁或数据库事务等待 HTTP；逐步提交后再通知轻量进度。
+            current = processNextUnchecked(job_id);
+            if (!current.ok()) return BatchResult::failure(*current.error);
+            ++processed;
+        }
+    } catch (...) {
+        return BatchResult::failure({xuyan::domain::ErrorCode::storage_error,
+            "远程批次发生内部错误；已提交检查点保留，详情已隐藏", false, "检查任务状态后显式继续"});
+    }
+}
+
+Result<ExtractionJob> RemoteExtractionProcessor::processNextUnchecked(const std::string& job_id) {
     ExtractionJobService jobs(database_path_);
     auto job = jobs.load(job_id);
     if (!job.ok()) return job;
     if (job.value->provider_connection_id.empty()) return error("此任务未绑定模型连接；请新建并选择连接");
     if (job.value->status == "cancelled" || job.value->status == "completed") return error("任务已经结束");
+    if (job.value->cancel_requested || needsAttention(*job.value))
+        return error("任务已请求取消或存在未结算步骤；请先人工核对状态");
     // 旧任务继续可读，但不能在未重新确认的情况下更换协议或消耗发送预算。
     if (job.value->schema_version != typedCandidateSchemaVersion
         || job.value->prompt_version != typedCandidatePromptVersion)
@@ -73,51 +207,58 @@ Result<ExtractionJob> RemoteExtractionProcessor::processNext(const std::string& 
         return jobs.finishStep(commandId("remote-finish", job_id, step.ordinal, step.attempt), job_id,
                                step.ordinal, step.attempt, status, {}, reason);
     };
-    // 四类输出分别要求不同字段；小说正文只作为不可信数据，无法指定写入事实。
-    const auto schema = typedExtractionResponseSchema();
-    const auto prompt = typedExtractionPrompt(*chunk.value);
-    ProviderGenerationService gateway(database_path_, credentials_, transport_);
-    auto generated = gateway.generate(job.value->provider_connection_id, prompt, schema,
-                                      job.value->budget.output_token_limit_per_request, 60000,
-                                      job.value->provider_connection_fingerprint);
-    if (!generated.ok()) {
-        // 传输异常可能发生在发送之后；未知请求不能被普通失败的重试路径自动重发。
-        const auto status = generated.error->code == xuyan::domain::ErrorCode::storage_error
-            ? "unknown" : "failed";
-        return finishFailure(status, "模型连接或请求未完成；请人工核对后处理");
+    try {
+        // 四类输出分别要求不同字段；小说正文只作为不可信数据，无法指定写入事实。
+        const auto schema = typedExtractionResponseSchema();
+        const auto prompt = typedExtractionPrompt(*chunk.value);
+        ProviderGenerationService gateway(database_path_, credentials_, transport_);
+        auto generated = gateway.generate(job.value->provider_connection_id, prompt, schema,
+                                          job.value->budget.output_token_limit_per_request, 60000,
+                                          job.value->provider_connection_fingerprint);
+        if (!generated.ok()) {
+            // 传输异常可能发生在发送之后；未知请求不能被普通失败的重试路径自动重发。
+            const auto status = generated.error->code == xuyan::domain::ErrorCode::storage_error
+                ? "unknown" : "failed";
+            return finishFailure(status, "模型连接或请求未完成；请人工核对后处理");
+        }
+        if (generated.value->status != "completed") {
+            const auto& kind = generated.value->failure_kind;
+            const auto status = kind == "timeout_unknown" || kind == "cancelled" || kind == "network"
+                ? "unknown" : "failed";
+            return finishFailure(status, "模型请求未完成：" + generated.value->failure_kind);
+        }
+        auto parsed = parseTypedExtractionResponse(generated.value->text);
+        if (!parsed.ok()) return finishFailure("failed", parsed.error->message);
+        // 每条逐字引文重新映射到不可变原文，随后由候选服务再次做哈希和范围校验。
+        JsonValue::Array candidates;
+        for (const auto& item : *parsed.value) {
+            const auto byte = chunk.value->find(item.quote);
+            if (byte == std::string::npos) return finishFailure("failed", "模型引文无法在原文中定位");
+            // 重复引文不能默认为第一次出现；这种证据锚点必须由人工补足上下文。
+            if (chunk.value->find(item.quote, byte + 1) != std::string::npos)
+                return finishFailure("failed", "模型引文在当前片段中出现多次，无法唯一定位");
+            const auto start = step.start_codepoint + xuyan::domain::utf8CodepointCount(
+                std::string_view(*chunk.value).substr(0, byte));
+            const auto end = start + xuyan::domain::utf8CodepointCount(item.quote);
+            candidates.emplace_back(JsonValue::Object{
+                {"type", item.type}, {"name", item.name}, {"quote", item.quote},
+                {"start_codepoint", static_cast<std::int64_t>(start)},
+                {"end_codepoint", static_cast<std::int64_t>(end)},
+                {"fields", item.fields},
+                {"provenance_type", "model_inference"}});
+        }
+        const auto output = xuyan::package::writeJson(JsonValue::Object{
+            {"schema_version", job.value->schema_version}, {"prompt_version", job.value->prompt_version},
+            {"candidates", std::move(candidates)}});
+        CandidateService ingestion(database_path_);
+        auto committed = ingestion.ingestStepOutput(commandId("remote-commit", job_id, step.ordinal, step.attempt),
+                                                    job_id, step.ordinal, step.attempt, output);
+        if (!committed.ok()) return finishFailure("failed", "模型候选未通过本地证据校验");
+        return committed;
+    } catch (...) {
+        // 领取之后的异常无法证明请求未发送，落盘为未知且禁止自动重发。
+        return finishFailure("unknown", "步骤发生内部错误；请人工核对请求与检查点，详情已隐藏");
     }
-    if (generated.value->status != "completed") {
-        const auto status = generated.value->failure_kind == "timeout_unknown" ? "unknown" : "failed";
-        return finishFailure(status, "模型请求未完成：" + generated.value->failure_kind);
-    }
-    auto parsed = parseTypedExtractionResponse(generated.value->text);
-    if (!parsed.ok()) return finishFailure("failed", parsed.error->message);
-    // 每条逐字引文重新映射到不可变原文，随后由候选服务再次做哈希和范围校验。
-    JsonValue::Array candidates;
-    for (const auto& item : *parsed.value) {
-        const auto byte = chunk.value->find(item.quote);
-        if (byte == std::string::npos) return finishFailure("failed", "模型引文无法在原文中定位");
-        // 重复引文不能默认为第一次出现；这种证据锚点必须由人工补足上下文。
-        if (chunk.value->find(item.quote, byte + 1) != std::string::npos)
-            return finishFailure("failed", "模型引文在当前片段中出现多次，无法唯一定位");
-        const auto start = step.start_codepoint + xuyan::domain::utf8CodepointCount(
-            std::string_view(*chunk.value).substr(0, byte));
-        const auto end = start + xuyan::domain::utf8CodepointCount(item.quote);
-        candidates.emplace_back(JsonValue::Object{
-            {"type", item.type}, {"name", item.name}, {"quote", item.quote},
-            {"start_codepoint", static_cast<std::int64_t>(start)},
-            {"end_codepoint", static_cast<std::int64_t>(end)},
-            {"fields", item.fields},
-            {"provenance_type", "model_inference"}});
-    }
-    const auto output = xuyan::package::writeJson(JsonValue::Object{
-        {"schema_version", job.value->schema_version}, {"prompt_version", job.value->prompt_version},
-        {"candidates", std::move(candidates)}});
-    CandidateService ingestion(database_path_);
-    auto committed = ingestion.ingestStepOutput(commandId("remote-commit", job_id, step.ordinal, step.attempt),
-                                                job_id, step.ordinal, step.attempt, output);
-    if (!committed.ok()) return finishFailure("failed", "模型候选未通过本地证据校验");
-    return committed;
 }
 
 } // namespace xuyan::application

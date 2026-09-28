@@ -2664,12 +2664,13 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::commitExtractionCandid
                 return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
             }
         }
-        Statement state(database_, "SELECT j.source_id,s.status,s.attempt FROM extraction_step s JOIN extraction_job j ON j.id=s.job_id WHERE s.job_id=? AND s.ordinal=?");
+        Statement state(database_, "SELECT j.source_id,s.status,s.attempt,j.cancel_requested FROM extraction_step s JOIN extraction_job j ON j.id=s.job_id WHERE s.job_id=? AND s.ordinal=?");
         bindText(state.get(), 1, job_id); sqlite3_bind_int(state.get(), 2, step_ordinal);
         if (sqlite3_step(state.get()) != SQLITE_ROW || columnText(state.get(), 1) != "running"
             || sqlite3_column_int(state.get(), 2) != expected_attempt) return Result<xuyan::domain::ExtractionJob>::failure(
                 {ErrorCode::revision_conflict, "候选步骤尝试已变化", false, "刷新任务后重试"});
         const auto source_id = columnText(state.get(), 0);
+        const bool cancel_requested = sqlite3_column_int(state.get(), 3) != 0;
         for (auto& candidate : candidates) {
             if (candidate.source_id != source_id) return Result<xuyan::domain::ExtractionJob>::failure(
                 {ErrorCode::validation_failed, "候选来源与任务不一致", false, "拒绝该输出"});
@@ -2697,12 +2698,18 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::commitExtractionCandid
         bindText(step.get(), 1, output_json); bindText(step.get(), 2, utcNow()); bindText(step.get(), 3, job_id);
         sqlite3_bind_int(step.get(), 4, step_ordinal); sqlite3_bind_int(step.get(), 5, expected_attempt);
         if (sqlite3_step(step.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1) throw std::runtime_error("候选步骤提交竞争失败");
-        Statement counts(database_, "SELECT COUNT(*),SUM(status='completed') FROM extraction_step WHERE job_id=?");
+        // 有效的在途回报仍保存；任务状态与取消/失败检查点在同一事务中结算。
+        Statement counts(database_, "SELECT COUNT(*),SUM(status='completed'),SUM(status='failed'),SUM(status='unknown'),SUM(status='running') FROM extraction_step WHERE job_id=?");
         bindText(counts.get(), 1, job_id);
         if (sqlite3_step(counts.get()) != SQLITE_ROW) throw std::runtime_error("无法汇总候选任务进度");
         const auto total = sqlite3_column_int(counts.get(), 0); const auto completed = sqlite3_column_int(counts.get(), 1);
+        const auto failed = sqlite3_column_int(counts.get(), 2);
+        const auto unknown = sqlite3_column_int(counts.get(), 3);
+        const auto running = sqlite3_column_int(counts.get(), 4);
+        const auto status = failed || unknown ? "needs_attention" : completed == total ? "completed"
+            : running > 0 ? "running" : cancel_requested ? "cancelled" : "queued";
         Statement update(database_, "UPDATE extraction_job SET status=?,completed_steps=?,revision=revision+1,updated_at=? WHERE id=?");
-        bindText(update.get(), 1, completed == total ? "completed" : "queued"); sqlite3_bind_int(update.get(), 2, completed);
+        bindText(update.get(), 1, status); sqlite3_bind_int(update.get(), 2, completed);
         bindText(update.get(), 3, utcNow()); bindText(update.get(), 4, job_id);
         if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1) throw std::runtime_error("无法更新候选任务进度");
         Statement log(database_, "INSERT INTO extraction_command_log(command_id,payload_hash,job_id,step_ordinal,created_at) VALUES(?,?,?,?,?)");
