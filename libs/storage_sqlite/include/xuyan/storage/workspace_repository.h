@@ -227,6 +227,10 @@ public:
     /** @brief 读取单个抽取候选及其原文证据元数据。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> loadExtractionCandidate(
         const std::string& candidate_id);
+    /** @brief 在单一事务中校验明确目标及两侧修订，保存候选接受映射、证据、别名修订和命令日志。 */
+    xuyan::domain::Result<xuyan::domain::ExtractionCandidate> acceptCandidateIntoEntity(
+        const std::string& command_id, const std::string& candidate_id, int expected_candidate_revision,
+        const xuyan::domain::CandidateEntitySelection& selection, const std::string& provenance_type);
     /** @brief 原子保存审核、证据及专用投影；关系端点在事务内按明确ID和预期修订校验。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> reviewExtractionCandidate(
         const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,

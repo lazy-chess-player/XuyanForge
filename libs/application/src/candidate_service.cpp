@@ -176,6 +176,20 @@ Result<xuyan::domain::RelationEndpointMatchPage> CandidateService::matchRelation
     }
 }
 
+/** @brief 转交明确的跨章实体关联，不根据同名结果替作者选择目标，不进行网络请求。 */
+Result<xuyan::domain::ExtractionCandidate> CandidateService::acceptIntoEntity(
+    const std::string& command_id, const std::string& candidate_id, int expected_candidate_revision,
+    const xuyan::domain::CandidateEntitySelection& selection, const std::string& provenance_type) {
+    try {
+        xuyan::storage::WorkspaceRepository repository(database_path_);
+        return repository.acceptCandidateIntoEntity(command_id, candidate_id, expected_candidate_revision,
+                                                    selection, provenance_type);
+    } catch (...) {
+        return Result<xuyan::domain::ExtractionCandidate>::failure({ErrorCode::storage_error,
+            "实体关联无法打开工作区，详情已隐藏", true, "检查工作区后重试"});
+    }
+}
+
 /** @brief 按作者明确的端点选择和来源性质生成条目/事件/关系/地点投影，统一由仓储原子提交。 */
 Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
     const std::string& command_id, const std::string& candidate_id, int expected_revision,

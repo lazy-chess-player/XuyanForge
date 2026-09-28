@@ -3188,6 +3188,198 @@ void testEntityMergeRelationReferenceRepair() {
             "blocked split must retain author description and its revision");
 }
 
+/** @brief 验证跨章明确关联累积证据和逐字别名，保留作者字段并在失败时原子回滚。 */
+void testCandidateAcceptanceIntoExistingEntity() {
+    using namespace xuyan::application;
+    using xuyan::package::JsonValue;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-entity-link-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
+            "entity link must own an isolated workspace");
+    struct Cleanup {
+        std::filesystem::path directory, parent;
+        /** @brief 只清理本次独占测试目录，保持外部小说和用户工作区不变。 */
+        ~Cleanup() {
+            if (directory.parent_path() == parent) {
+                std::error_code ignored;
+                std::filesystem::remove_all(directory, ignored);
+            }
+        }
+    } cleanup{directory, parent};
+    const auto database = directory / "workspace.sqlite";
+    xuyan::storage::WorkspaceRepository repository(database);
+    auto world = repository.createWorldTemplate("entity-link-world", "跨章关联测试");
+    auto other = repository.createWorldTemplate("entity-link-other", "其他测试世界");
+    require(world.ok() && other.ok(), "entity link worlds must be explicitly created");
+    /** @brief 显式创建具有作者自定义字段的同名条目，不由候选或生产代码预填资料。 */
+    const auto create = [&](const std::string& id, const std::string& world_id, const std::string& status) {
+        xuyan::domain::WorldEntity entity;
+        entity.id = id; entity.world_id = world_id; entity.kind = "character";
+        entity.name = "闻澈"; entity.aliases = {"小澈"}; entity.tags = {"作者标签"};
+        entity.description = "作者已经校对的说明"; entity.attributes_json = "{\"作者字段\":42}";
+        entity.review_status = status;
+        auto result = repository.createEntity("create-" + id, entity);
+        require(result.ok(), "entity link target must create");
+        return *result.value;
+    };
+    const auto target = create("entity-link-target", world.value->id, "accepted");
+    const auto same_name = create("entity-link-distinct", world.value->id, "accepted");
+    const auto foreign = create("entity-link-foreign", other.value->id, "accepted");
+    const auto pending = create("entity-link-pending", world.value->id, "candidate");
+    auto full_aliases = create("entity-link-full-aliases", world.value->id, "accepted");
+    for (int index = 1; index < 128; ++index) full_aliases.aliases.push_back("alias-" + std::to_string(index));
+    auto full_saved = repository.saveEntity("entity-link-fill-aliases", full_aliases, 1);
+    require(full_saved.ok(), "alias limit fixture must save explicitly");
+    auto deleted = create("entity-link-deleted", world.value->id, "accepted");
+    require(repository.deleteEntity("entity-link-delete", deleted.id, 1).ok(), "link tombstone must create");
+    const auto file = directory / "runtime.md";
+    {
+        std::ofstream output(file, std::ios::binary);
+        for (int index = 1; index <= 3; ++index)
+            output << "# 第" << index << "章\n小澈也称北行者，遇见南来客。\n";
+        require(output.good(), "entity link runtime source must write");
+    }
+    SourceImportService sources(database);
+    auto source = sources.importTextFile("entity-link-source", file, "1", world.value->id);
+    require(source.ok() && source.value->chapters.size() == 3, "link source must have three chapters");
+    InMemoryCredentialStore credentials;
+    ProviderConnectionService connections(database, credentials);
+    xuyan::domain::ProviderConnection connection;
+    connection.id = "entity-link-provider"; connection.name = "无网络测试连接";
+    connection.kind = "deepseek"; connection.endpoint = "https://api.deepseek.com";
+    connection.default_model = "deepseek-flash"; connection.data_policy = "remote_allowed";
+    require(connections.save("entity-link-connection", connection, 0, std::string{"synthetic-test-secret"}).ok(),
+            "entity link must not use real credentials or network");
+    ExtractionJobService jobs(database);
+    auto job = jobs.create("entity-link-job", source.value->id, 6000, 0, 0, 1200, connection.id);
+    require(job.ok() && job.value->total_steps == 3, "entity link job must slice by chapter");
+    CandidateService service(database);
+    std::vector<xuyan::domain::ExtractionCandidate> candidates;
+    for (int ordinal = 1; ordinal <= 3; ++ordinal) {
+        const auto state = jobs.loadState(job.value->id);
+        require(state.ok(), "entity link checkpoint must load");
+        auto step = jobs.claimNext("entity-link-claim-" + std::to_string(ordinal), job.value->id, state.value->revision);
+        require(step.ok(), "link chapter must claim");
+        auto quote = sources.evidenceText(source.value->id, step.value->start_codepoint, step.value->end_codepoint);
+        require(quote.ok(), "link original quote must load");
+        JsonValue::Array items;
+        for (int index = 0; index < 3; ++index)
+            items.emplace_back(JsonValue::Object{{"type", "entity"}, {"name", index == 1 ? "南来客" : "小澈"},
+                {"fields", JsonValue::Object{{"kind", index == 2 ? "faction" : "character"},
+                    {"aliases", index == 0 ? JsonValue::Array{"北行者"} : JsonValue::Array{}}}},
+                {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
+                {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
+                {"quote", *quote.value}, {"provenance_type", "model_inference"}});
+        const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v2"},
+            {"prompt_version", "extract-v2"}, {"candidates", std::move(items)}});
+        require(service.ingestStepOutput("entity-link-output-" + std::to_string(ordinal), job.value->id,
+                    ordinal, step.value->attempt, output).ok(), "link candidates must ingest");
+    }
+    auto page = service.listPage(world.value->id, source.value->id, "candidate", 20, 0);
+    require(page.ok() && page.value->total == 9, "repeated mentions must remain pending, not auto-link");
+    xuyan::domain::ExtractionCandidate mismatch_name, mismatch_kind;
+    for (const auto& candidate : page.value->items) {
+        if (candidate.name == "南来客") mismatch_name = candidate;
+        else if (candidate.fields_json.find("faction") != std::string::npos) mismatch_kind = candidate;
+        else candidates.push_back(candidate);
+    }
+    require(candidates.size() == 3, "link fixture must retain one repeated mention per chapter");
+    sqlite3* raw = nullptr;
+    const auto opened = sqlite3_open(database.string().c_str(), &raw);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(raw, &sqlite3_close);
+    require(opened == SQLITE_OK && sql, "link SQL checks must use owned database");
+    const auto baseline = sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity");
+    const auto frozen = repository.publishWorldVersion("entity-link-version", world.value->id, "");
+    require(frozen.ok(), "association test must freeze an immutable version first");
+    const auto& candidate = candidates.front();
+    for (const auto& id : {foreign.id, pending.id, deleted.id, std::string{"missing"}})
+        require(!service.acceptIntoEntity("entity-link-invalid-" + id, candidate.id, 1, {id, 1}, "original_fact").ok(),
+                "link must reject missing, cross-world, unconfirmed and deleted targets");
+    for (const auto& provenance : {"model_inference", "in_text_claim", "invalid"})
+        require(!service.acceptIntoEntity("entity-link-truth-" + std::string(provenance), candidate.id, 1,
+                    {target.id, 1}, provenance).ok(), "claims and hypotheses must not contaminate confirmed aliases");
+    require(!service.acceptIntoEntity("entity-link-name", mismatch_name.id, 1, {target.id, 1}, "original_fact").ok()
+                && !service.acceptIntoEntity("entity-link-kind", mismatch_kind.id, 1, {target.id, 1}, "original_fact").ok(),
+            "link must require exact whole name/alias and matching kind");
+    require(!service.acceptIntoEntity("", candidate.id, 1, {target.id, 1}, "original_fact").ok()
+                && !service.acceptIntoEntity("entity-link-rev", candidate.id, 0, {target.id, 1}, "original_fact").ok()
+                && !service.acceptIntoEntity("entity-link-rev-target", candidate.id, 1, {target.id, 0}, "original_fact").ok()
+                && !service.acceptIntoEntity("entity-link-overflow", candidate.id, std::numeric_limits<int>::max(),
+                    {target.id, 1}, "original_fact").ok()
+                && !service.acceptIntoEntity("entity-link-alias-limit", candidate.id, 1,
+                    {full_aliases.id, 2}, "original_fact").ok(),
+            "link must reject empty command and unspecified revisions");
+    require(sqlite3_exec(sql.get(), "CREATE TRIGGER fail_entity_link_log BEFORE INSERT ON candidate_review_command_log "
+        "BEGIN SELECT RAISE(ABORT,'link log failure'); END", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "link fault must install at the last transactional write");
+    require(!service.acceptIntoEntity("entity-link-first", candidate.id, 1, {target.id, 1}, "original_fact").ok(),
+            "last-step fault must reject entity association");
+    auto unchanged = repository.loadEntity(target.id);
+    auto still_pending = repository.loadExtractionCandidate(candidate.id);
+    require(unchanged.ok() && unchanged.value->revision == 1 && unchanged.value->aliases == target.aliases
+                && still_pending.ok() && still_pending.value->revision == 1 && still_pending.value->review_status == "candidate"
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM evidence_reference") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 9,
+            "fault must roll back aliases, head, candidate history, acceptance and evidence together");
+    require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_entity_link_log", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "link fault must remove before retry");
+    auto accepted = service.acceptIntoEntity("entity-link-first", candidate.id, 1, {target.id, 1}, "original_fact");
+    require(accepted.ok() && accepted.value->review_status == "accepted" && accepted.value->revision == 2,
+            "explicit cross-chapter acceptance must associate with existing entity");
+    auto linked = repository.loadEntity(target.id);
+    require(linked.ok() && linked.value->revision == 2 && linked.value->name == target.name
+                && linked.value->description == target.description && linked.value->tags == target.tags
+                && linked.value->attributes_json == target.attributes_json && linked.value->aliases.size() == 2
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity") == baseline,
+            "link must extend only literal aliases, preserve author fields and create no duplicate entity");
+    auto replayed = service.acceptIntoEntity("entity-link-first", candidate.id, 1, {target.id, 1}, "original_fact");
+    require(replayed.ok() && replayed.value->id == candidate.id && replayed.value->revision == 2
+                && replayed.value->provenance_type == "original_fact",
+            "link replay must return without requiring the old target revision again");
+    auto conflict = service.acceptIntoEntity("entity-link-first", candidate.id, 1, {same_name.id, 1}, "original_fact");
+    require(!conflict.ok() && conflict.error->code == xuyan::domain::ErrorCode::command_conflict,
+            "same command must not relink to a different same-name entity");
+    require(!service.acceptIntoEntity("entity-link-stale", candidates[1].id, 1, {target.id, 1}, "original_fact").ok(),
+            "first-time association must reject stale target revision");
+    for (std::size_t index = 1; index < candidates.size(); ++index)
+        require(service.acceptIntoEntity("entity-link-next-" + std::to_string(index), candidates[index].id, 1,
+                    {target.id, 2}, "author_setting").ok(), "later chapters must add evidence to the explicitly selected target");
+    auto evidence = EvidenceService(database).listForSource(source.value->id);
+    const auto current_target = repository.loadEntity(target.id);
+    const auto distinct_target = repository.loadEntity(same_name.id);
+    const auto current_frozen = repository.loadWorldVersion(frozen.value->id);
+    require(evidence.ok() && evidence.value->size() == 3
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity") == baseline
+                && current_target.ok() && current_target.value->revision == 2
+                && distinct_target.ok() && distinct_target.value->aliases == same_name.aliases
+                && current_frozen.ok() && current_frozen.value->content_hash == frozen.value->content_hash
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_version_member WHERE entity_revision<>1") == 1,
+            "three chapters must accumulate evidence without redundant revisions or modifying same-name entity");
+    for (const auto& item : *evidence.value)
+        require(item.entity_id == target.id && item.field_path == "identity" && item.source_id == source.value->id
+                    && item.quote_hash == xuyan::domain::sha256(item.quote)
+                    && sources.evidenceText(item.source_id, item.start_codepoint, item.end_codepoint).value == item.quote,
+                "identity association must retain exact independently traceable source evidence");
+    auto edited = *linked.value; edited.name = "作者新名称"; edited.aliases.clear();
+    require(repository.saveEntity("entity-link-author-edit", edited, 2).ok(), "author edit after association must save");
+    auto historical = service.acceptIntoEntity("entity-link-first", candidate.id, 1, {target.id, 1}, "original_fact");
+    const auto after_replay = repository.loadEntity(target.id);
+    require(historical.ok() && historical.value->id == candidate.id && after_replay.ok()
+                && after_replay.value->name == edited.name
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM evidence_reference") == 3,
+            "historical replay must not reinterpret or rewrite an edited target");
+    require(repository.deleteEntity("entity-link-later-delete", target.id, 3).ok(), "linked target may be soft deleted later");
+    xuyan::storage::WorkspaceRepository reopened(database);
+    auto persisted = reopened.acceptCandidateIntoEntity("entity-link-first", candidate.id, 1, {target.id, 1}, "original_fact");
+    const auto tombstone = reopened.loadEntity(target.id);
+    require(persisted.ok() && persisted.value->id == candidate.id && persisted.value->review_status == "accepted"
+                && tombstone.ok() && tombstone.value->deleted && tombstone.value->revision == 4
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance WHERE entity_id='entity-link-target'") == 3,
+            "reopened replay must preserve historical associations without resurrecting a deleted target");
+}
+
 /** @brief 验证实体审核保留逐字别名，关系端点只提供当前世界的精确、已确认匹配建议。 */
 void testAcceptedEntityAliasesAndEndpointMatches() {
     using namespace xuyan::application;
@@ -4800,6 +4992,7 @@ int main() {
         testAcceptedRelationAndLocationProjection();
         testEntityMergeRelationReferenceRepair();
         testAcceptedEntityAliasesAndEndpointMatches();
+        testCandidateAcceptanceIntoExistingEntity();
         testAcceptedEventTimelineProjection();
         testNarrativeBackbonePreviewAndEvidenceMapping();
         testCharacterBlueprintVersioning();

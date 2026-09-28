@@ -37,6 +37,12 @@ struct ExtractionCandidatePage {
     std::int64_t offset{0};
 };
 
+/** @brief 作者明确选择的已有实体；关联时必须同时核对候选和实体的当前修订。 */
+struct CandidateEntitySelection {
+    std::string entity_id;
+    int expected_revision{0};
+};
+
 /** @brief 表示当前已确认实体的轻量端点建议；稳定ID和修订必须由作者明确选择。 */
 struct RelationEndpointMatch {
     std::string entity_id;

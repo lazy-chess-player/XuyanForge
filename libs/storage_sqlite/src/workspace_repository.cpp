@@ -3289,6 +3289,131 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::loadExtractionCa
     } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionCandidate>::failure(storageError(exception)); }
 }
 
+/** @brief 将实体候选明确关联已有条目，避免跨章重复建档；所有相关写入共用一个事务。 */
+Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::acceptCandidateIntoEntity(
+    const std::string& command_id, const std::string& candidate_id, int expected_candidate_revision,
+    const xuyan::domain::CandidateEntitySelection& selection, const std::string& provenance_type) {
+    using CandidateResult = Result<xuyan::domain::ExtractionCandidate>;
+    using xuyan::package::JsonValue;
+    /** @brief 返回关联前的边界或规则错误，不包含原文、字段正文或凭据。 */
+    const auto reject = [](ErrorCode code, const std::string& message) {
+        return CandidateResult::failure({code, message, false, "刷新候选并明确选择同世界同类型的已确认条目"});
+    };
+    if (command_id.empty() || command_id.size() > 512 || candidate_id.empty() || candidate_id.size() > 512
+        || selection.entity_id.empty() || selection.entity_id.size() > 512
+        || expected_candidate_revision < 1 || expected_candidate_revision >= std::numeric_limits<int>::max()
+        || selection.expected_revision < 1 || selection.expected_revision >= std::numeric_limits<int>::max()
+        || (provenance_type != "original_fact" && provenance_type != "author_setting"))
+        return reject(ErrorCode::validation_failed, "实体关联需要命令、两侧预期修订和明确的事实确认；说法与假设须单独保留");
+    try {
+        Transaction transaction(database_);
+        auto loaded = loadExtractionCandidate(candidate_id);
+        if (!loaded.ok()) return loaded;
+        auto candidate = *loaded.value;
+        candidate.provenance_type = provenance_type;
+        auto valid = xuyan::domain::validateExtractionCandidate(candidate);
+        if (!valid.ok()) return valid;
+        if (candidate.schema_version != "candidate-v2" || candidate.candidate_type != "entity")
+            return reject(ErrorCode::validation_failed, "已有条目关联只支持当前类型化实体候选，不合并事件、关系或规则");
+        auto fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
+        const auto* kind = fields.ok() ? fields.value->find("kind") : nullptr;
+        const auto* aliases = fields.ok() ? fields.value->find("aliases") : nullptr;
+        if (!fields.ok() || !fields.value->isObject() || fields.value->object().size() != 2
+            || !kind || !kind->isString() || !xuyan::domain::isSupportedEntityKind(kind->string())
+            || kind->string() == "event" || kind->string() == "rule" || !aliases || !aliases->isArray()
+            || aliases->array().size() > 16 || candidate.quote.find(candidate.name) == std::string::npos)
+            return reject(ErrorCode::validation_failed, "关联候选缺少合法分类或逐字实体标识");
+        WorldEntity literal;
+        literal.name = candidate.name; literal.kind = kind->string();
+        std::set<std::string> unique_aliases;
+        for (const auto& alias : aliases->array()) {
+            if (!alias.isString() || alias.string().empty() || candidate.quote.find(alias.string()) == std::string::npos
+                || !unique_aliases.insert(alias.string()).second)
+                return reject(ErrorCode::validation_failed, "关联别名必须唯一并有当前引文的逐字证据");
+            literal.aliases.push_back(alias.string());
+        }
+        auto valid_literal = xuyan::domain::validateEntity(std::move(literal));
+        if (!valid_literal.ok()) return CandidateResult::failure(*valid_literal.error);
+        // 摘要绑定选择的稳定ID和修订，不把当前实体内容混入重放语义，也不使用可碰撞的分隔字符串。
+        const auto payload = "entity-link-v1:" + xuyan::domain::sha256(xuyan::package::writeJson(JsonValue::Object{
+            {"candidate_id", candidate.id}, {"candidate_revision", expected_candidate_revision},
+            {"job_id", candidate.job_id}, {"step", candidate.step_ordinal}, {"source_id", candidate.source_id},
+            {"quote_hash", candidate.quote_hash}, {"start", static_cast<std::int64_t>(candidate.start_codepoint)},
+            {"end", static_cast<std::int64_t>(candidate.end_codepoint)}, {"name", candidate.name}, {"fields", *fields.value},
+            {"entity_id", selection.entity_id}, {"entity_revision", selection.expected_revision}, {"provenance", provenance_type}}));
+        Statement replay(database_, "SELECT payload_hash,candidate_id FROM candidate_review_command_log WHERE command_id=?");
+        bindText(replay.get(), 1, command_id);
+        const auto replay_step = sqlite3_step(replay.get());
+        if (replay_step == SQLITE_ROW) {
+            if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != candidate.id)
+                return reject(ErrorCode::command_conflict, "命令标识已用于不同的审核或实体关联");
+            // 重放必须先于目标当前名称/修订检查；作者后续编辑不会改写已提交的关联或再次添加证据。
+            transaction.commit();
+            return loaded;
+        }
+        if (replay_step != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        if (candidate.revision != expected_candidate_revision
+            || (candidate.review_status != "candidate" && candidate.review_status != "conflicted"))
+            return reject(ErrorCode::revision_conflict, "候选修订已变化或审核已终结，不能重新关联");
+        Statement source(database_, "SELECT world_id FROM source_document WHERE id=?");
+        bindText(source.get(), 1, candidate.source_id);
+        if (sqlite3_step(source.get()) != SQLITE_ROW)
+            return reject(ErrorCode::missing_context, "关联候选的来源世界不存在");
+        auto selected = validateChosenEndpoint(database_, columnText(source.get(), 0), candidate.name,
+                                              selection.entity_id, selection.expected_revision);
+        if (!selected.ok()) return reject(selected.error->code, "所选已有条目的世界、确认状态、名称／完整别名或修订不符合关联条件");
+        auto target = readEntityRevision(database_, selection.entity_id);
+        if (target.kind != kind->string())
+            return reject(ErrorCode::rule_conflict, "候选和所选已有条目类型不同，必须先校对分类冲突");
+        // 只合并作者明确接受、逐字有据的别名；名称、说明、标签、属性、地图和关系均不从新候选覆盖。
+        const auto previous_aliases = target.aliases;
+        target.aliases.insert(target.aliases.end(), valid_literal.value->aliases.begin(), valid_literal.value->aliases.end());
+        std::sort(target.aliases.begin(), target.aliases.end());
+        target.aliases.erase(std::unique(target.aliases.begin(), target.aliases.end()), target.aliases.end());
+        auto valid_target = xuyan::domain::validateEntity(std::move(target));
+        if (!valid_target.ok()) return CandidateResult::failure(*valid_target.error);
+        target = std::move(*valid_target.value);
+        if (target.aliases != previous_aliases) {
+            ++target.revision;
+            insertEntityRevision(database_, target);
+            updateEntityHead(database_, target);
+        }
+        candidate.review_status = "accepted"; candidate.revision = expected_candidate_revision + 1;
+        Statement update(database_, "UPDATE extraction_candidate SET provenance_type=?,review_status='accepted',revision=?,updated_at=? WHERE id=? AND revision=?");
+        bindText(update.get(), 1, provenance_type); sqlite3_bind_int(update.get(), 2, candidate.revision);
+        bindText(update.get(), 3, utcNow()); bindText(update.get(), 4, candidate.id);
+        sqlite3_bind_int(update.get(), 5, expected_candidate_revision);
+        if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1)
+            throw std::runtime_error("实体关联候选并发更新失败");
+        Statement history(database_, "INSERT INTO candidate_review_history(candidate_id,revision,name,fields_json,provenance_type,review_status,updated_at) VALUES(?,?,?,?,?,'accepted',?)");
+        bindText(history.get(), 1, candidate.id); sqlite3_bind_int(history.get(), 2, candidate.revision);
+        bindText(history.get(), 3, candidate.name); bindText(history.get(), 4, candidate.fields_json);
+        bindText(history.get(), 5, provenance_type); bindText(history.get(), 6, utcNow());
+        if (sqlite3_step(history.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        Statement acceptance(database_, "INSERT INTO candidate_acceptance(candidate_id,entity_id,accepted_at) VALUES(?,?,?)");
+        bindText(acceptance.get(), 1, candidate.id); bindText(acceptance.get(), 2, target.id); bindText(acceptance.get(), 3, utcNow());
+        if (sqlite3_step(acceptance.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        // 身份原文证据独立保存，不能声称已经修改作者的description，也不改变原始来源或候选字段。
+        Statement evidence(database_, "INSERT INTO evidence_reference(id,entity_id,field_path,source_id,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,revision,created_at) VALUES(?,?,'identity',?,?,?,?,?,?,1,?)");
+        bindText(evidence.get(), 1, "evidence-from-" + candidate.id); bindText(evidence.get(), 2, target.id);
+        bindText(evidence.get(), 3, candidate.source_id);
+        sqlite3_bind_int64(evidence.get(), 4, static_cast<sqlite3_int64>(candidate.start_codepoint));
+        sqlite3_bind_int64(evidence.get(), 5, static_cast<sqlite3_int64>(candidate.end_codepoint));
+        bindText(evidence.get(), 6, candidate.quote); bindText(evidence.get(), 7, candidate.quote_hash);
+        bindText(evidence.get(), 8, provenance_type); bindText(evidence.get(), 9, utcNow());
+        if (sqlite3_step(evidence.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        Statement log(database_, "INSERT INTO candidate_review_command_log(command_id,payload_hash,candidate_id,revision,created_at) VALUES(?,?,?,?,?)");
+        bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, candidate.id);
+        sqlite3_bind_int(log.get(), 4, candidate.revision); bindText(log.get(), 5, utcNow());
+        if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        transaction.commit();
+        return CandidateResult::success(std::move(candidate));
+    } catch (...) {
+        return CandidateResult::failure({ErrorCode::storage_error, "实体关联存储失败，事务已回滚，详情已隐藏", true,
+                                         "检查工作区后以同一命令重试"});
+    }
+}
+
 /** @brief 在单一审核事务中提交带原文证据的条目及类型投影，明确端点须在写入前再次消歧。 */
 Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtractionCandidate(
     const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,
