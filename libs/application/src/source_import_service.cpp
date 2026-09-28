@@ -301,7 +301,31 @@ xuyan::domain::Result<std::string> SourceImportService::storeAsset(const std::st
         const auto relative = std::filesystem::path("assets") / hash.substr(0, 2) / (hash + std::string(suffix));
         const auto absolute = workspace_root_ / relative;
         std::filesystem::create_directories(absolute.parent_path());
-        if (!std::filesystem::exists(absolute)) {
+        if (std::filesystem::is_symlink(absolute)) {
+            throw std::runtime_error("来源资产路径不能是符号链接");
+        }
+        if (std::filesystem::exists(absolute)) {
+            // 同名资产必须逐字节一致；不能因路径命中就信任旧文件，否则章节和证据会引用错误正文。
+            if (!std::filesystem::is_regular_file(absolute)
+                || std::filesystem::file_size(absolute) != bytes.size()) {
+                throw std::runtime_error("已有来源资产与导入文本不一致");
+            }
+            std::ifstream existing(absolute, std::ios::binary);
+            if (!existing) throw std::runtime_error("无法校验已有来源资产");
+            std::array<char, 64 * 1024> buffer{};
+            for (std::size_t offset = 0; offset < bytes.size();) {
+                const auto count = std::min(buffer.size(), bytes.size() - offset);
+                existing.read(buffer.data(), static_cast<std::streamsize>(count));
+                if (existing.gcount() != static_cast<std::streamsize>(count)
+                    || !std::equal(buffer.data(), buffer.data() + count, bytes.data() + offset)) {
+                    throw std::runtime_error("已有来源资产与导入文本不一致");
+                }
+                offset += count;
+            }
+            if (existing.peek() != std::char_traits<char>::eof() || existing.bad()) {
+                throw std::runtime_error("已有来源资产与导入文本不一致");
+            }
+        } else {
             const auto temporary = absolute.string() + ".tmp";
             {
                 std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -361,8 +385,14 @@ xuyan::domain::Result<xuyan::domain::SourceDocument> SourceImportService::import
     auto chapters = xuyan::domain::detectChapters(decoded.value->normalized_utf8, document.id);
     if (!chapters.ok()) return xuyan::domain::Result<xuyan::domain::SourceDocument>::failure(*chapters.error);
     document.chapters = std::move(*chapters.value);
-    xuyan::storage::WorkspaceRepository repository(database_path_);
-    return repository.saveSource(command_id, document);
+    try {
+        xuyan::storage::WorkspaceRepository repository(database_path_);
+        return repository.saveSource(command_id, document);
+    } catch (const std::exception&) {
+        // 数据库打不开时不让异常越过导入服务边界；已有资产保持原样，便于修复工作区后重试。
+        return xuyan::domain::Result<xuyan::domain::SourceDocument>::failure(
+            {ErrorCode::storage_error, "导入来源保存失败", true, "检查工作区文件与权限后重试"});
+    }
 }
 
 xuyan::domain::Result<std::vector<xuyan::domain::SourceDocument>> SourceImportService::list() {

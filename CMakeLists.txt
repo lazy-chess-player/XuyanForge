@@ -7,7 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+    # 明确源文件与执行字符集为 UTF-8，避免中文文案受构建机代码页影响。
+    add_compile_options(/W4 /permissive- /utf-8)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()

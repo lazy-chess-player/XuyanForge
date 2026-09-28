@@ -73,7 +73,7 @@ public:
 private:
     /** @brief 在 64 MiB 导入上限内读取文件，拒绝无权限或不完整的读取。 */
     xuyan::domain::Result<std::string> readBounded(const std::filesystem::path& path) const;
-    /** @brief 按内容哈希写入一次性资产文件，并返回工作区相对路径。 */
+    /** @brief 按内容哈希写入资产；复用旧文件前逐块核对字节，不一致时返回存储错误。 */
     xuyan::domain::Result<std::string> storeAsset(const std::string& hash, std::string_view suffix,
                                                  std::string_view bytes) const;
 

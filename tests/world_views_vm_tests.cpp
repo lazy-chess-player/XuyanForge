@@ -188,12 +188,24 @@ void testCandidatePaging(const std::filesystem::path& database) {
     require(view_model.errorText().isEmpty() && view_model.totalCount() == 101
             && view_model.pageCount() == 2 && view_model.candidates().size() == 100,
             "world A first candidate page incorrect");
+    require(!view_model.canPreviousPage() && view_model.canNextPage(),
+            "first candidate page must only allow forward navigation");
     require(view_model.candidates().front().toMap().value("id").toString() == "candidate-001",
             "candidate paging order incorrect");
     view_model.nextPage();
     waitUntilIdle(view_model);
     require(view_model.pageIndex() == 1 && view_model.candidates().size() == 1
-            && view_model.selectedId() == "candidate-101", "world A last candidate page incorrect");
+            && view_model.selectedId() == "candidate-101"
+            && view_model.canPreviousPage() && !view_model.canNextPage(),
+            "world A last candidate page incorrect");
+    view_model.previousPage();
+    waitUntilIdle(view_model);
+    require(view_model.pageIndex() == 0 && view_model.selectedId() == "candidate-001",
+            "candidate previous-page navigation must restore the first page");
+    view_model.nextPage();
+    waitUntilIdle(view_model);
+    require(view_model.pageIndex() == 1 && view_model.selectedId() == "candidate-101",
+            "candidate forward navigation must return to the last page");
     executeFixtureSql(database, "DELETE FROM extraction_candidate WHERE id='candidate-101';");
     view_model.refresh();
     waitUntilIdle(view_model);

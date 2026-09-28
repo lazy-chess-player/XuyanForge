@@ -1,6 +1,6 @@
 # 构建与运行
 
-执行计划与任务依赖分别见[主计划](04-cpp-implementation-plan.md)和[看板](07-development-task-board.md)。本文只列实际已有入口；CI 仍在后续任务中。
+执行计划与任务依赖分别见[主计划](04-cpp-implementation-plan.md)和[看板](07-development-task-board.md)。本文列实际已有入口；自动化配置已加入，远端结果以[状态记录](05-development-status.md)为准，不把配置存在视为构建通过。
 
 ## Windows（已验证工具链）
 
@@ -38,7 +38,7 @@ cmake --build build/linux-core-dev
 ctest --test-dir build/linux-core-dev --output-on-failure
 ```
 
-界面和测试同时启用时，CTest 运行 `core_tests`、`stress_tests`、`tst_qmltests`，找到 Python 解释器时另运行 `contract_tests`；`check-contracts` 仍是独立构建目标。`tst_qmltests` 使用离屏平台和内存工作区替身，不读取用户工作区、不发网络请求。可按单个 QML 用例输出 JUnit：
+界面和测试同时启用时，CTest 运行 `core_tests`、`stress_tests`、`tst_qmltests` 和 `tst_world_views_vm`，找到 Python 解释器时另运行 `contract_tests`；`check-contracts` 仍是独立构建目标。`tst_qmltests` 使用离屏平台和内存工作区替身，视图模型测试使用独立临时工作区；二者都不读取用户工作区、不发模型请求。可按单个 QML 用例输出 JUnit：
 
 ```powershell
 ./build/windows-dev/tst_qmltests.exe -o ./build/qmltests.xml,junitxml
@@ -65,6 +65,31 @@ $env:XUYANFORGE_STRESS_10M = '1'
 ./tools/build-and-preview.ps1 -NoLaunch -RunTests
 Remove-Item Env:XUYANFORGE_STRESS_10M
 ```
+
+## 无密钥自动化质量门禁
+
+工作流：[开发质量门禁](../.github/workflows/quality.yml)。推送及拉取请求自动运行：
+
+- Linux核心、压力与契约回归，不构建界面；
+- Windows界面、核心、Qt Quick和视图模型回归；
+- Windows单独关闭测试的正式应用编译，避免把测试引擎作为生产依赖；
+- 汇总“阶段质量门禁”：任一前置作业失败、取消或跳过时汇总失败。
+
+这不是软件发行流水线，不会发布安装器，也未替管理员启用仓库分支保护。阶段上传后必须检查汇总状态；后续发行任务依赖门禁通过。若要在仓库层禁止绕过检查合并，需要管理员将汇总状态设为必需检查，本轮未修改该设置。
+
+Windows固定Qt 6.8.3、Visual Studio 2022编译环境、Python 3.12.10及vcpkg `2026.07.29`提交，SQLite清单明确启用全文检索；MSVC指定`/utf-8`。第三方动作固定完整提交号。Linux基础镜像与系统包可能更新，报告记录实际CMake、编译器、SQLite和Python版本；固定配置不等于逐字节可重复发行。
+
+工作流无需模型密钥，显式清空本地小说开关；默认只生成有限合成测试资料，不读取私人小说、不调用模型。可手动运行并勾选“额外运行千万字合成结构回归”；该选项增加Linux运行时合成结构测试，仍不发送远程请求，也不代表完整千万字界面验收。
+
+证据产物仅包含白名单构建输入摘要、工具版本、CTest JUnit与测试日志，保留14天；不上传CMake完整缓存、环境变量、工作区数据库、可执行文件或小说素材。构建摘要不含原始差异正文和未跟踪文件名。隐私边界回归及本机构建记录入口：
+
+```powershell
+$env:PYTHONUTF8 = '1'
+python -m unittest discover -s tools -p test_record_build_inputs.py -v
+python tools/record_build_inputs.py --build-directory build/windows-dev --label '本机开发构建'
+```
+
+依赖清单位于`tools/ci-dependencies`，不放在仓库根目录，因此不会改变现有一键编译对本机Qt MinGW工具链的使用。自动化配置依据：[Qt安装动作](https://github.com/jurplel/install-qt-action)、[vcpkg清单模式](https://learn.microsoft.com/en-us/vcpkg/concepts/manifest-mode)、[GitHub工作流产物](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflow-artifacts)。
 
 ## DeepSeek 连接与真实自检
 

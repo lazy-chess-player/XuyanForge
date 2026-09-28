@@ -791,6 +791,19 @@ void testSourceImportAndCodepointEvidence() {
         auto empty_import = importer.importTextFile("import-empty-source", empty_source, "1", "world-source-test");
         require(!empty_import.ok() && empty_import.error->code == xuyan::domain::ErrorCode::validation_failed,
                 "empty source must not create a zero-length chapter");
+        const auto inaccessible_database = directory / "database-folder";
+        std::filesystem::create_directory(inaccessible_database);
+        bool inaccessible_import_returned_error = false;
+        try {
+            auto unavailable = xuyan::application::SourceImportService(inaccessible_database).importTextFile(
+                "unreadable-source-import", source, "1", "world-source-test");
+            inaccessible_import_returned_error = !unavailable.ok()
+                && unavailable.error->code == xuyan::domain::ErrorCode::storage_error;
+        } catch (const std::exception&) {
+            inaccessible_import_returned_error = false;
+        }
+        require(inaccessible_import_returned_error,
+                "source import must return a storage error instead of throwing when the workspace cannot open");
         xuyan::domain::SourceChapter inaccessible_chapter;
         inaccessible_chapter.id = "unreadable-chapter";
         inaccessible_chapter.title = "无法读取的章节";
@@ -844,6 +857,21 @@ void testSourceImportAndCodepointEvidence() {
         require(normalized.ok(), "normalized source asset must be readable");
         require(normalized.value->find('\r') == std::string::npos, "CRLF must normalize to LF");
         require(normalized.value->rfind("\xef\xbb\xbf", 0) != 0, "UTF-8 BOM must be removed from normalized text");
+        // 再次导入不得复用同一路径下已经损坏的内容寻址资产。
+        const auto normalized_path = directory / normalized_asset_ref;
+        auto damaged = *normalized.value;
+        damaged.front() = damaged.front() == '#' ? '!' : '#';
+        {
+            std::ofstream output(normalized_path, std::ios::binary | std::ios::trunc);
+            output.write(damaged.data(), static_cast<std::streamsize>(damaged.size()));
+        }
+        auto damaged_import = importer.importTextFile("import-damaged-asset", source, "1", "world-source-test");
+        require(!damaged_import.ok() && damaged_import.error->code == xuyan::domain::ErrorCode::storage_error,
+                "import must reject a reused asset whose bytes differ from its content hash");
+        {
+            std::ofstream output(normalized_path, std::ios::binary | std::ios::trunc);
+            output.write(normalized.value->data(), static_cast<std::streamsize>(normalized.value->size()));
+        }
         const auto emoji_byte = normalized.value->find("🙂");
         require(emoji_byte != std::string::npos, "emoji must survive source normalization");
         const auto emoji_codepoint = xuyan::domain::utf8CodepointCount(

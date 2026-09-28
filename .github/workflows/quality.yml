@@ -1,0 +1,195 @@
+name: 开发质量门禁
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_long_form:
+        description: 额外运行千万字合成结构回归（仍不调用模型）
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+  XUYANFORGE_NOVEL_FIXTURE: ''
+  XUYANFORGE_NOVEL_FULL_OFFLINE: '0'
+  XUYANFORGE_STRESS_10M: '0'
+  VCPKG_DISABLE_METRICS: '1'
+  VCPKG_BINARY_SOURCES: clear
+
+jobs:
+  core:
+    name: Linux 核心回归
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 读取项目代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: 准备 Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12.10'
+      - name: 准备核心依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ninja-build libsqlite3-dev sqlite3
+      - name: 验证报告隐私边界
+        run: python -m unittest discover -s tools -p test_record_build_inputs.py -v
+      - name: 配置无界面构建
+        run: >-
+          cmake -S . -B build/ci-core -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DXUYANFORGE_BUILD_UI=OFF
+          -DXUYANFORGE_BUILD_TESTS=ON
+      - name: 编译核心与测试
+        run: cmake --build build/ci-core --parallel 2
+      - name: 保存输入版本
+        run: |
+          python tools/record_build_inputs.py --build-directory build/ci-core --label 'Linux 核心回归'
+          sqlite3 --version > build/ci-core/reports/sqlite-version.txt
+      - name: 运行核心、压力与契约回归
+        run: >-
+          ctest --test-dir build/ci-core --output-on-failure
+          --output-junit '${{ github.workspace }}/build/ci-core/reports/test-results.xml'
+      - name: 运行可选千万字结构回归
+        if: github.event_name == 'workflow_dispatch' && inputs.run_long_form
+        env:
+          XUYANFORGE_STRESS_10M: '1'
+        run: build/ci-core/core_tests | tee build/ci-core/reports/long-form.log
+      - name: 保存核心验证证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: 核心验证证据
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/ci-core/reports/*.json
+            build/ci-core/reports/*.xml
+            build/ci-core/reports/*-version.txt
+            build/ci-core/reports/long-form.log
+            build/ci-core/Testing/Temporary/LastTest.log
+
+  windows:
+    name: Windows 界面与生产构建
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: 读取项目代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: 读取固定版本的依赖工具
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: microsoft/vcpkg
+          ref: 9e593bb18ea69cc5095e012465dcd675a822ed0d # 2026.07.29
+          path: build/ci-vcpkg
+          persist-credentials: false
+      - name: 准备 Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12.10'
+      - name: 准备微软编译环境
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+          vsversion: '2022'
+      - name: 准备固定 Qt 工具包
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          archives: qtbase qtdeclarative
+          setup-python: 'false'
+          aqtversion: '==3.3.0'
+          py7zrversion: '==1.1.0'
+          cache: 'false'
+      - name: 准备 SQLite 依赖工具
+        run: |
+          & .\build\ci-vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证报告隐私边界
+        run: python -m unittest discover -s tools -p test_record_build_inputs.py -v
+      - name: 配置界面与测试
+        run: |
+          cmake -S . -B build/ci-windows -G Ninja -DCMAKE_BUILD_TYPE=Debug `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/build/ci-vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            "-DVCPKG_MANIFEST_DIR=$env:GITHUB_WORKSPACE/tools/ci-dependencies" `
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/build/ci-deps" `
+            -DVCPKG_MANIFEST_MODE=ON -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DXUYANFORGE_BUILD_UI=ON -DXUYANFORGE_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 编译界面与测试
+        run: cmake --build build/ci-windows --parallel 2
+      - name: 保存输入版本
+        run: |
+          python tools/record_build_inputs.py --build-directory build/ci-windows --label 'Windows 界面回归'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          qmake -query QT_VERSION | Set-Content build/ci-windows/reports/qt-version.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 运行核心、Qt Quick 与视图模型回归
+        run: |
+          $env:PATH = "$env:GITHUB_WORKSPACE/build/ci-deps/x64-windows/debug/bin;$env:GITHUB_WORKSPACE/build/ci-deps/x64-windows/bin;" + $env:PATH
+          ctest --test-dir build/ci-windows --output-on-failure `
+            --output-junit "$env:GITHUB_WORKSPACE/build/ci-windows/reports/test-results.xml"
+          exit $LASTEXITCODE
+      - name: 独立验证关闭测试的正式目标
+        run: |
+          cmake -S . -B build/ci-production -G Ninja -DCMAKE_BUILD_TYPE=Debug `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/build/ci-vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            "-DVCPKG_MANIFEST_DIR=$env:GITHUB_WORKSPACE/tools/ci-dependencies" `
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/build/ci-deps" `
+            -DVCPKG_MANIFEST_MODE=ON -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DXUYANFORGE_BUILD_UI=ON -DXUYANFORGE_BUILD_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/ci-production --target xuyanforge_app --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/record_build_inputs.py --build-directory build/ci-production --label 'Windows 正式目标隔离'
+          exit $LASTEXITCODE
+      - name: 保存 Windows 验证证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Windows验证证据
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/ci-windows/reports/*.json
+            build/ci-windows/reports/*.xml
+            build/ci-windows/reports/*-version.txt
+            build/ci-windows/Testing/Temporary/LastTest.log
+            build/ci-production/reports/*.json
+
+  quality-gate:
+    name: 阶段质量门禁
+    if: always()
+    needs: [core, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检查全部验证结果
+        shell: bash
+        run: |
+          if [[ '${{ needs.core.result }}' != 'success' || '${{ needs.windows.result }}' != 'success' ]]; then
+            printf '%s\n' '验证未全部通过，阶段质量门禁失败。'
+            exit 1
+          fi
+          printf '%s\n' '全部验证通过；这不是软件发行或完整产品验收。'
