@@ -18,7 +18,8 @@ public:
         std::size_t maximum_codepoints = 6000, std::size_t overlap_codepoints = 200,
         int max_requests = 0, int output_token_limit_per_request = 1200,
         const std::string& provider_connection_id = {},
-        const xuyan::domain::ExtractionInputConfig& input = {});
+        const xuyan::domain::ExtractionInputConfig& input = {},
+        const xuyan::domain::ProviderGenerationConfig& generation = {});
     /** @brief 列出工作区内所有可恢复的提取任务及其当前进度。 */
     xuyan::domain::Result<std::vector<xuyan::domain::ExtractionJob>> list();
     /** @brief 仅列出指定世界的可恢复解析任务，避免加载无关世界的步骤。 */

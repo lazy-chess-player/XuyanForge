@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xuyan/domain/scenario.h"
+#include "xuyan/domain/provider_connection.h"
 
 #include <map>
 #include <string>
@@ -17,6 +18,8 @@ struct StructuredGenerationRequest {
     std::string json_schema;
     int max_output_tokens{2048};
     bool stream{false};
+    std::string provider_kind;
+    xuyan::domain::ProviderGenerationConfig generation;
 };
 
 struct ProviderHttpRequest {

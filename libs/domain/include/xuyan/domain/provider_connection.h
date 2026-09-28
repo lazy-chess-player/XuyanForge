@@ -3,8 +3,19 @@
 #include "xuyan/domain/scenario.h"
 
 #include <string>
+#include <string_view>
 
 namespace xuyan::domain {
+
+/** @brief 不含凭据的生成语义；默认沿用厂商思考行为，结构化输出模式采用当前已验证适配器。 */
+struct ProviderGenerationConfig {
+    std::string reasoning_effort{"provider_default"};
+    std::string output_format{"provider_schema_v1"};
+};
+
+/** @brief 校验生成配置；显式思考强度目前只对 DeepSeek Responses 开放，其他厂商不能静默忽略。 */
+Result<ProviderGenerationConfig> validateProviderGenerationConfig(
+    ProviderGenerationConfig config, std::string_view provider_kind = {});
 
 struct ProviderConnection {
     std::string id;

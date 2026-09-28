@@ -464,7 +464,7 @@ void testNativeProviderProtocolAdapters() {
     using xuyan::providers::ProviderProtocol;
     const xuyan::providers::StructuredGenerationRequest request{
         "https://provider.example", "model-1", "Return an actor intent.",
-        R"({"type":"object","required":["actor_id"],"properties":{"actor_id":{"type":"string"}}})", 512, false};
+        R"({"type":"object","required":["actor_id"],"properties":{"actor_id":{"type":"string"}}})", 512, false, {}, {}};
     const std::vector<std::pair<ProviderProtocol, std::string>> protocols{
         {ProviderProtocol::openai_responses, "/responses"},
         {ProviderProtocol::openai_compatible, "/chat/completions"},
@@ -478,6 +478,25 @@ void testNativeProviderProtocolAdapters() {
                 "each native adapter must produce its own structured-output request without credentials in the body");
         require(xuyan::package::parseJson(built.value->body).ok(), "provider request bodies must be valid JSON");
     }
+
+    auto configured = request;
+    configured.provider_kind = "deepseek";
+    for (const auto effort : {"provider_default", "none", "low", "high", "max"}) {
+        configured.generation.reasoning_effort = effort;
+        auto built = xuyan::providers::buildProviderRequest(ProviderProtocol::openai_responses, configured);
+        require(built.ok(), "valid DeepSeek reasoning effort must serialize");
+        auto body = xuyan::package::parseJson(built.value->body);
+        const auto* reasoning = body.value->find("reasoning");
+        if (std::string_view(effort) == "provider_default")
+            require(reasoning == nullptr, "provider default must not silently disable thinking");
+        else require(reasoning && reasoning->find("effort") && reasoning->find("effort")->string() == effort,
+                     "explicit reasoning effort must be preserved in the native body");
+    }
+    require(!xuyan::providers::buildProviderRequest(ProviderProtocol::openai_compatible, configured).ok(),
+            "unsupported thinking protocol must reject rather than ignore configuration");
+    configured.provider_kind = "anthropic";
+    require(!xuyan::providers::buildProviderRequest(ProviderProtocol::anthropic_messages, configured).ok(),
+            "unsupported vendor must reject explicit thinking mode");
 
     auto openai = xuyan::providers::parseProviderResponse(ProviderProtocol::openai_responses,
         R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"actor_id\":\"a\"}"}]}],"usage":{"input_tokens":12,"output_tokens":7}})");
@@ -936,6 +955,13 @@ void testFrozenBackboneExtractionInput() {
         xuyan::domain::Result<ProviderTransportResponse> send(const xuyan::providers::ProviderHttpRequest& request,
             const std::string&, int) override {
             ++calls;
+            const auto body = xuyan::package::parseJson(request.body);
+            require(body.ok(), "generation fixture must receive JSON request");
+            const auto* reasoning = body.value->find("reasoning");
+            require(expected_effort == "provider_default" ? reasoning == nullptr
+                : reasoning != nullptr && reasoning->find("effort") != nullptr
+                    && reasoning->find("effort")->string() == expected_effort,
+                "remote task must use its frozen reasoning effort without default override");
             require(request.body.find("天空蔚蓝") == std::string::npos, "backbone transport must omit description");
             require(request.body.find(quote) != std::string::npos, "backbone transport must preserve event quote");
             if (on_send) on_send();
@@ -953,16 +979,20 @@ void testFrozenBackboneExtractionInput() {
         }
         int calls{0};
         std::string quote;
+        std::string expected_effort{"provider_default"};
         std::function<void()> on_send;
     } transport;
     ExtractionJobService jobs(database);
     const xuyan::domain::ExtractionInputConfig compact{"backbone", "compact", "backbone-v1"};
-    auto job = jobs.create("input-job", source.value->id, 500, 0, 2, 512, connection.id, compact);
+    const xuyan::domain::ProviderGenerationConfig no_thinking{"none", "provider_schema_v1"};
+    auto job = jobs.create("input-job", source.value->id, 500, 0, 2, 512, connection.id, compact, no_thinking);
     require(job.ok() && job.value->total_steps == 2 && transport.calls == 0, "input creation must not send");
     auto loaded = jobs.loadState(job.value->id);
     require(loaded.ok() && loaded.value->input.mode == "backbone" && loaded.value->input.density == "compact"
-                && loaded.value->input.algorithm_version == "backbone-v1", "input snapshot must survive reload");
+                && loaded.value->input.algorithm_version == "backbone-v1"
+                && loaded.value->generation.reasoning_effort == "none", "input and generation snapshots must survive reload");
     transport.quote = quotes[0];
+    transport.expected_effort = "none";
     RemoteExtractionProcessor processor(database, credentials, transport);
     RemoteBatchOptions one; one.maximum_steps = 1;
     auto first = processor.processBatch(job.value->id, one);
@@ -979,12 +1009,21 @@ void testFrozenBackboneExtractionInput() {
             && candidate.quote_hash == xuyan::domain::sha256(candidate.quote), "backbone evidence must map to exact original range and hash");
     }
     require(sources.loadNormalizedText(source.value->id).value == std::optional<std::string>{text}, "compression must not modify original");
-    auto cached = jobs.create("input-cached", source.value->id, 500, 0, 2, 512, connection.id, compact);
+    auto cached = jobs.create("input-cached", source.value->id, 500, 0, 2, 512, connection.id, compact, no_thinking);
     auto raw = jobs.create("input-raw", source.value->id, 500, 0, 2, 512, connection.id);
     auto balanced = jobs.create("input-balanced", source.value->id, 500, 0, 2, 512, connection.id,
         {"backbone", "balanced", "backbone-v1"});
     require(cached.ok() && cached.value->status == "completed" && raw.ok() && raw.value->completed_steps == 0
         && balanced.ok() && balanced.value->completed_steps == 0, "mode and density must isolate caches while identical snapshot reuses them");
+    auto thinking_default = jobs.create("input-thinking-default", source.value->id, 500, 0, 2, 512, connection.id, compact);
+    auto larger_output = jobs.create("input-larger-output", source.value->id, 500, 0, 2, 768, connection.id, compact, no_thinking);
+    require(thinking_default.ok() && thinking_default.value->completed_steps == 0
+        && larger_output.ok() && larger_output.value->completed_steps == 0,
+        "thinking effort and output limit changes must invalidate semantic caches");
+    require(!xuyan::domain::validateProviderGenerationConfig(no_thinking, "local").ok()
+        && !xuyan::domain::validateProviderGenerationConfig({"ultra", "provider_schema_v1"}, "deepseek").ok()
+        && !xuyan::domain::validateProviderGenerationConfig({"none", "plain_text"}, "deepseek").ok(),
+        "unsupported provider controls and output modes must not be silently ignored");
     require(!jobs.create("input-job", source.value->id, 500, 0, 2, 512, connection.id).ok(), "input changes must conflict with command replay");
     require(!jobs.create("input-invalid", source.value->id, 500, 0, 2, 512, connection.id,
         {"backbone", "compact", "backbone-v999"}).ok(), "unknown algorithm must fail before creating task");
@@ -1026,6 +1065,7 @@ void testFrozenBackboneExtractionInput() {
     require(!processor.processNext(before.value->id).ok() && transport.calls == calls_before
         && jobs.loadState(before.value->id).value->budget.consumed_requests == 0, "changed original must reject before budget and send");
     { std::ofstream file(asset, std::ios::binary | std::ios::trunc); file << text; }
+    transport.expected_effort = "provider_default";
     transport.quote = quotes[0]; transport.on_send = replaceDescription;
     auto during = processor.processNext(before.value->id);
     transport.on_send = {};
@@ -1036,11 +1076,28 @@ void testFrozenBackboneExtractionInput() {
     // 缺少输入快照的旧任务明确回退为原文，不迁移到新主干默认。
     sqlite3* legacy = nullptr;
     require(sqlite3_open(database.string().c_str(), &legacy) == SQLITE_OK, "owned migration fixture must open");
-    require(sqlite3_exec(legacy, "DROP TABLE extraction_job_input_snapshot; PRAGMA user_version=26;", nullptr, nullptr, nullptr) == SQLITE_OK, "owned migration fixture must downgrade");
+    require(sqlite3_exec(legacy, "DROP TABLE extraction_job_input_snapshot; DROP TABLE extraction_job_generation_snapshot; PRAGMA user_version=26;", nullptr, nullptr, nullptr) == SQLITE_OK, "owned migration fixture must downgrade");
     sqlite3_close(legacy);
     auto historical = jobs.loadState(raw.value->id);
     require(historical.ok(), historical.error ? historical.error->message : "migration must return a snapshot");
     require(historical.ok() && historical.value->input.mode == "raw" && historical.value->input.algorithm_version == "source-v1", "old task must preserve raw semantics after migration");
+    require(historical.value->generation.reasoning_effort == "provider_default", "historical task must retain vendor-default thinking behavior");
+    require(sqlite3_open(database.string().c_str(), &legacy) == SQLITE_OK, "generation migration fixture must reopen");
+    require(sqlite3_exec(legacy, "DROP TABLE extraction_job_generation_snapshot; PRAGMA user_version=27;", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "generation migration fixture must downgrade independently");
+    sqlite3_close(legacy);
+    require(jobs.loadState(raw.value->id).ok(), "schema 27 must migrate generation snapshot without rewriting input");
+    require(sqlite3_open(database.string().c_str(), &legacy) == SQLITE_OK, "generation corruption fixture must open");
+    require(sqlite3_exec(legacy, "DELETE FROM extraction_job_generation_snapshot;", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "owned generation snapshots must delete");
+    sqlite3_close(legacy);
+    const auto calls_before_generation_corruption = transport.calls;
+    require(!jobs.loadState(raw.value->id).ok() && !processor.processNext(raw.value->id).ok()
+            && transport.calls == calls_before_generation_corruption, "current missing generation snapshot must fail closed without transport");
+    require(sqlite3_open(database.string().c_str(), &legacy) == SQLITE_OK, "generation restore fixture must open");
+    require(sqlite3_exec(legacy, "INSERT INTO extraction_job_generation_snapshot SELECT id,'provider_default','provider_schema_v1' FROM extraction_job;", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "restore only owned generation fixture rows");
+    sqlite3_close(legacy);
     sqlite3* broken = nullptr;
     require(sqlite3_open(database.string().c_str(), &broken) == SQLITE_OK, "owned corruption fixture must open");
     sqlite3_stmt* deletion = nullptr;
@@ -2392,7 +2449,7 @@ COMMIT;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> verification(upgraded_database, &sqlite3_close);
     require(reopened_result == SQLITE_OK && verification != nullptr,
             "upgraded candidate fixture database must reopen");
-    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 27
+    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 28
                 && sqliteScalar(verification.get(),
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_candidate_scope_page'") == 1
                 && sqliteScalar(verification.get(), "SELECT COUNT(*) FROM candidate_review_history") == 9,

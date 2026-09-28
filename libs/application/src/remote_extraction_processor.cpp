@@ -190,6 +190,8 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
     xuyan::storage::WorkspaceRepository repository(database_path_);
     auto connection = repository.loadProviderConnection(job.value->provider_connection_id);
     if (!connection.ok()) return Result<JobResult>::failure(*connection.error);
+    const auto generation_config = xuyan::domain::validateProviderGenerationConfig(job.value->generation, connection.value->kind);
+    if (!generation_config.ok()) return Result<JobResult>::failure(*generation_config.error);
     // 配置在建任务后变化时，先于领取步骤和消耗请求预算拒绝；网关发送前还会再次核对。
     if (job.value->provider_connection_fingerprint.empty()
         || xuyan::domain::providerConnectionFingerprint(*connection.value)
@@ -228,7 +230,7 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
         ProviderGenerationService gateway(database_path_, credentials_, transport_);
         auto generated = gateway.generate(job.value->provider_connection_id, prompt, schema,
                                           job.value->budget.output_token_limit_per_request, 60000,
-                                          job.value->provider_connection_fingerprint);
+                                          job.value->provider_connection_fingerprint, job.value->generation);
         if (!generated.ok()) {
             // 传输异常可能发生在发送之后；未知请求不能被普通失败的重试路径自动重发。
             const auto status = generated.error->code == xuyan::domain::ErrorCode::storage_error

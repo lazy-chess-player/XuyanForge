@@ -47,7 +47,8 @@ public:
     xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> generate(
         const std::string& connection_id, const std::string& prompt,
         const std::string& json_schema, int max_output_tokens = 1024,
-        int timeout_ms = 30000, const std::string& expected_connection_fingerprint = {});
+        int timeout_ms = 30000, const std::string& expected_connection_fingerprint = {},
+        const xuyan::domain::ProviderGenerationConfig& generation_config = {});
     /** @brief 使用不含小说正文的合成提示词自检连接和结构化输出链路。 */
     xuyan::domain::Result<ProviderTestReport> testStructuredGeneration(
         const std::string& connection_id, int timeout_ms = 30000);

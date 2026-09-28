@@ -66,9 +66,15 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     const std::string& command_id, const std::string& source_id,
     std::size_t maximum_codepoints, std::size_t overlap_codepoints,
     int max_requests, int output_token_limit_per_request,
-    const std::string& provider_connection_id, const xuyan::domain::ExtractionInputConfig& input) {
+    const std::string& provider_connection_id, const xuyan::domain::ExtractionInputConfig& input,
+    const xuyan::domain::ProviderGenerationConfig& generation) {
     const auto valid_input = xuyan::domain::validateExtractionInputConfig(input);
     if (!valid_input.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*valid_input.error);
+    const auto valid_generation = xuyan::domain::validateProviderGenerationConfig(generation);
+    if (!valid_generation.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*valid_generation.error);
+    if (provider_connection_id.empty() && generation.reasoning_effort != "provider_default")
+        return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
+            {xuyan::domain::ErrorCode::validation_failed, "离线任务不能指定模型思考配置", false, "保留默认配置"});
     if (input.mode != "raw" && provider_connection_id.empty())
         return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
             {xuyan::domain::ErrorCode::validation_failed, "主干模型输入需要绑定模型连接", false, "离线任务使用原文模式"});
@@ -109,11 +115,14 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     if (segments.empty()) segments.emplace_back(0, total);
     xuyan::domain::ExtractionJob job;
     job.input = input;
+    job.generation = generation;
     job.id = "job-" + xuyan::domain::sha256(command_id).substr(0, 24); job.source_id = source_id;
     // 远程任务只绑定当时的连接指纹；创建任务本身不读取密钥，也不调用模型。
     if (!provider_connection_id.empty()) {
         auto connection = repository.loadProviderConnection(provider_connection_id);
         if (!connection.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*connection.error);
+        const auto supported = xuyan::domain::validateProviderGenerationConfig(generation, connection.value->kind);
+        if (!supported.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*supported.error);
         if (connection.value->deleted || !connection.value->enabled || connection.value->default_model.empty())
             return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
                 {xuyan::domain::ErrorCode::validation_failed, "所选模型连接未启用或缺少模型", false,

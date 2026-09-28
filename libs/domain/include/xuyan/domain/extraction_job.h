@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xuyan/domain/scenario.h"
+#include "xuyan/domain/provider_connection.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +69,7 @@ struct ExtractionJobState {
     int revision{0};
     ExtractionBudget budget;
     ExtractionInputConfig input;
+    ProviderGenerationConfig generation;
     bool has_ready_step{false};
     bool has_running_step{false};
     bool requires_attention{false};

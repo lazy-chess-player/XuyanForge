@@ -42,7 +42,8 @@ ProviderGenerationService::ProviderGenerationService(
 xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> ProviderGenerationService::generate(
     const std::string& connection_id, const std::string& prompt,
     const std::string& json_schema, int max_output_tokens, int timeout_ms,
-    const std::string& expected_connection_fingerprint) {
+    const std::string& expected_connection_fingerprint,
+    const xuyan::domain::ProviderGenerationConfig& generation_config) {
     if (timeout_ms < 1000 || timeout_ms > 300000) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
         configurationError("模型请求超时必须在 1—300 秒之间", "调整超时设置"));
     try {
@@ -65,12 +66,16 @@ xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> ProviderGenera
 
         auto protocol = xuyan::providers::protocolForProviderKind(connection.value->kind);
         if (!protocol.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*protocol.error);
+        const auto supported = xuyan::domain::validateProviderGenerationConfig(generation_config, connection.value->kind);
+        if (!supported.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*supported.error);
         xuyan::providers::StructuredGenerationRequest generation;
         generation.endpoint = connection.value->endpoint;
         generation.model_id = connection.value->default_model;
         generation.prompt = prompt;
         generation.json_schema = json_schema;
         generation.max_output_tokens = max_output_tokens;
+        generation.provider_kind = connection.value->kind;
+        generation.generation = generation_config;
         auto request = xuyan::providers::buildProviderRequest(*protocol.value, generation);
         if (!request.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*request.error);
 

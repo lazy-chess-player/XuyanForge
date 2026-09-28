@@ -4,6 +4,10 @@
 #include "extraction_job_view_model.h"
 
 #include "xuyan/application/world_graph_service.h"
+#include "xuyan/application/extraction_job_service.h"
+#include "xuyan/application/mock_extraction_processor.h"
+#include "xuyan/application/remote_extraction_processor.h"
+#include "xuyan/application/provider_connection_service.h"
 #include "xuyan/application/source_import_service.h"
 #include "xuyan/application/evidence_service.h"
 #include "xuyan/domain/hash.h"
@@ -23,6 +27,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <atomic>
 
 namespace {
 
@@ -102,6 +107,8 @@ VALUES('job-a','source-a','completed','candidate-v1','extract-v1','','',101,101,
       ('job-b','source-b','completed','candidate-v1','extract-v1','','',1,1,0,1,'2026-09-27','2026-09-27');
 INSERT INTO extraction_job_input_snapshot(job_id,mode,density,algorithm_version)
 SELECT id,'raw','none','source-v1' FROM extraction_job;
+INSERT INTO extraction_job_generation_snapshot(job_id,reasoning_effort,output_format)
+SELECT id,'provider_default','provider_schema_v1' FROM extraction_job;
 WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<102)
 INSERT INTO extraction_candidate(id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,
     start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,
@@ -629,6 +636,234 @@ void testJobLateCallback(const std::filesystem::path& database) {
     pool->setMaxThreadCount(old_limit);
 }
 
+/** @brief 等待自有解析批次及其结束后的列表刷新，不依赖固定休眠。 */
+void waitUntilBatchStopped(ExtractionJobViewModel& model) {
+    if (model.running() || model.busy()) {
+        QEventLoop loop;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        QObject::connect(&model, &ExtractionJobViewModel::changed, &loop, [&] {
+            if (!model.running() && !model.busy()) loop.quit();
+        });
+        QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+        timeout.start(10000); loop.exec();
+    }
+    QCoreApplication::processEvents();
+    waitUntilIdle(model);
+    require(!model.running(), "background batch failed to stop");
+}
+
+/** @brief 在私有临时目录生成多片章节并创建离线任务，正式程序不携带这些数据。 */
+xuyan::domain::ExtractionJob createBatchFixture(const std::filesystem::path& database) {
+    seedWorlds(database);
+    const auto manuscript = database.parent_path() / "batch.md";
+    {
+        std::ofstream output(manuscript, std::ios::binary);
+        for (int chapter = 1; chapter <= 2; ++chapter) {
+            output << "# 第" << chapter << "章\n";
+            for (int line = 0; line < 8; ++line) output << "记录者打开文档。" << std::string(160, 'a') << "\n";
+        }
+        require(output.good(), "batch fixture file failed");
+    }
+    auto source = xuyan::application::SourceImportService(database).importTextFile("batch-source", manuscript, "1", "world-a");
+    require(source.ok(), "batch fixture import failed");
+    auto job = xuyan::application::ExtractionJobService(database).create("batch-job", source.value->id, 1000, 0, 0, 2048);
+    require(job.ok() && job.value->total_steps >= 4, "batch fixture must have multiple slices in each chapter");
+    return *job.value;
+}
+
+/** @brief 在第一个持久化检查点阻塞调度，测试可明确控制暂停与取消的先后顺序。 */
+ExtractionJobViewModel::BatchRunner gatedBatch(QSemaphore& checkpoint, QSemaphore& release, std::atomic<int>& starts) {
+    return [&](const auto& path, const auto& id, const xuyan::application::OfflineBatchOptions& options) {
+        const bool first_run = starts.fetch_add(1) == 0;
+        auto gated = options;
+        gated.on_progress = [&](const auto& progress) {
+            options.on_progress(progress);
+            if (first_run && progress.processed_steps == 1) {
+                checkpoint.release();
+                require(release.tryAcquire(1, 10000), "checkpoint gate timed out");
+            }
+            return options.on_progress(progress);
+        };
+        return xuyan::application::MockExtractionProcessor(path).processBatch(id, gated);
+    };
+}
+
+/** @brief 验证显式启动、重复点击防护、片段级暂停及跨进程可读取的续跑检查点。 */
+void testBatchPauseAndResume() {
+    TemporaryWorkspace workspace;
+    const auto job = createBatchFixture(workspace.database());
+    const auto id = QString::fromStdString(job.id);
+    QSemaphore checkpoint, release;
+    std::atomic<int> starts{0};
+    ExtractionJobViewModel model(workspace.database(), nullptr, gatedBatch(checkpoint, release, starts));
+    waitUntilIdle(model); model.setWorldId("world-a"); waitUntilIdle(model);
+    model.refresh(); waitUntilIdle(model);
+    require(starts == 0 && !model.running(), "creation and refresh must not start a batch");
+    model.startJob(id);
+    require(checkpoint.tryAcquire(1, 10000), "first checkpoint did not arrive");
+    QCoreApplication::processEvents();
+    auto card = model.jobs().front().toMap();
+    require(card.value("completed").toInt() == 1 && card.value("completedChapters").toInt() == 0
+            && card.value("totalChapters").toInt() == 2, "partial chapter must not count as complete");
+    model.startJob(id);
+    model.pauseJob(id);
+    require(model.running() && model.stopping() && starts == 1, "pause or duplicate click state incorrect");
+    release.release(); waitUntilBatchStopped(model);
+    auto paused = xuyan::application::ExtractionJobService(workspace.database()).load(job.id);
+    require(paused.ok() && paused.value->completed_steps == 1 && model.jobs().front().toMap().value("paused").toBool(),
+            "pause must preserve exactly the committed checkpoint");
+    model.resumeJob(id); waitUntilBatchStopped(model);
+    auto completed = xuyan::application::ExtractionJobService(workspace.database()).load(job.id);
+    require(completed.ok() && completed.value->status == "completed"
+            && completed.value->completed_steps == job.total_steps && starts == 2
+            && completed.value->steps.front().attempt == 1, "resume must not rerun completed slices");
+    require(model.jobs().front().toMap().value("completedChapters").toInt() == 2,
+            "all chapters must finish after remaining slices commit");
+}
+
+/** @brief 验证运行中可取消，随后点暂停不能把永久取消降级，已提交片段不删除。 */
+void testBatchCancel() {
+    TemporaryWorkspace workspace;
+    const auto job = createBatchFixture(workspace.database());
+    const auto id = QString::fromStdString(job.id);
+    QSemaphore checkpoint, release;
+    std::atomic<int> starts{0};
+    ExtractionJobViewModel model(workspace.database(), nullptr, gatedBatch(checkpoint, release, starts));
+    waitUntilIdle(model); model.setWorldId("world-a"); waitUntilIdle(model);
+    model.startJob(id); require(checkpoint.tryAcquire(1, 10000), "cancel checkpoint did not arrive");
+    model.cancelJob(id, 0); model.pauseJob(id); release.release(); waitUntilBatchStopped(model);
+    auto cancelled = xuyan::application::ExtractionJobService(workspace.database()).load(job.id);
+    require(cancelled.ok() && cancelled.value->status == "cancelled" && cancelled.value->completed_steps == 1
+            && cancelled.value->steps.front().status == "completed", "cancel must retain committed slice");
+    model.resumeJob(id);
+    require(!model.running() && starts == 1, "cancelled queue must not restart");
+}
+
+/** @brief 验证后台解析期间切换世界不会污染新世界列表或偷偷开始另一个任务。 */
+void testBatchWorldIsolation() {
+    TemporaryWorkspace workspace;
+    const auto job = createBatchFixture(workspace.database());
+    QSemaphore checkpoint, release;
+    std::atomic<int> starts{0};
+    ExtractionJobViewModel model(workspace.database(), nullptr, gatedBatch(checkpoint, release, starts));
+    waitUntilIdle(model); model.setWorldId("world-a"); waitUntilIdle(model);
+    model.startJob(QString::fromStdString(job.id));
+    require(checkpoint.tryAcquire(1, 10000), "world switch checkpoint did not arrive");
+    model.setWorldId("world-b"); waitUntilIdle(model);
+    model.startJob(QString::fromStdString(job.id));
+    release.release(); waitUntilBatchStopped(model);
+    require(model.jobs().isEmpty() && model.errorText().isEmpty() && starts == 1,
+            "old batch callback must not populate new world");
+    model.setWorldId("world-a"); waitUntilIdle(model);
+    require(model.jobs().front().toMap().value("status").toString() == "completed", "old world result must remain persisted");
+}
+
+/** @brief 验证未知异常隐藏私有内容并清理运行态，随后可以重新启动同一任务。 */
+void testBatchFailureRecovery() {
+    TemporaryWorkspace workspace;
+    const auto job = createBatchFixture(workspace.database());
+    std::atomic<int> calls{0};
+    ExtractionJobViewModel model(workspace.database(), nullptr, [&](const auto& path, const auto& id, const auto& options) {
+        if (calls.fetch_add(1) == 0) throw std::runtime_error("private-worker-detail");
+        return xuyan::application::MockExtractionProcessor(path).processBatch(id, options);
+    });
+    waitUntilIdle(model); model.setWorldId("world-a"); waitUntilIdle(model);
+    model.startJob(QString::fromStdString(job.id)); waitUntilBatchStopped(model);
+    require(!model.running() && !model.busy() && !model.errorText().isEmpty() && !model.errorText().contains("private-worker-detail"),
+            "worker failure must sanitize details and clear running state");
+    model.startJob(QString::fromStdString(job.id)); waitUntilBatchStopped(model);
+    require(model.jobs().front().toMap().value("status").toString() == "completed", "worker failure must remain recoverable");
+}
+
+/** @brief 验证视图模型销毁时请求停止并真正等待自有工作线程，不遗留后台执行者。 */
+void testBatchDestructionJoinsWorker() {
+    TemporaryWorkspace workspace;
+    const auto job = createBatchFixture(workspace.database());
+    QSemaphore started, release;
+    std::atomic<bool> exited{false};
+    auto model = std::make_unique<ExtractionJobViewModel>(workspace.database(), nullptr,
+        [&](const auto& path, const auto& id, const xuyan::application::OfflineBatchOptions& options) {
+            std::stop_callback wake(options.stop_token, [&] { release.release(); });
+            started.release();
+            require(release.tryAcquire(1, 10000), "destructor must request stop");
+            auto result = xuyan::application::MockExtractionProcessor(path).processBatch(id, options);
+            exited = true;
+            return result;
+        });
+    waitUntilIdle(*model); model->setWorldId("world-a"); waitUntilIdle(*model);
+    model->startJob(QString::fromStdString(job.id));
+    require(started.tryAcquire(1, 10000), "destructor worker did not start");
+    model.reset();
+    require(exited && xuyan::application::ExtractionJobService(workspace.database()).load(job.id).value->completed_steps == 0,
+            "destructor must join before source lifetime ends without sending new slices");
+}
+
+/** @brief 使用真实远程处理器和无网络传输替身，验证显式启动与在途暂停、恢复。 */
+void testRemoteBatchControls() {
+    using namespace xuyan::application;
+    TemporaryWorkspace workspace;
+    const auto offline = createBatchFixture(workspace.database());
+    InMemoryCredentialStore credentials;
+    xuyan::domain::ProviderConnection connection;
+    connection.id = "vm-owned-connection"; connection.name = "临时模型连接";
+    connection.kind = "deepseek"; connection.endpoint = "https://provider.example";
+    connection.default_model = "owned-model";
+    require(ProviderConnectionService(workspace.database(), credentials).save(
+        "vm-provider", connection, 0, std::string{"vm-owned-credential"}).ok(), "remote fixture provider failed");
+    auto job = ExtractionJobService(workspace.database()).create("vm-remote-job", offline.source_id, 1000, 0, 0, 2048, connection.id);
+    require(job.ok(), "remote fixture job failed");
+    QSemaphore sending, release;
+    class Transport final : public IProviderTransport {
+    public:
+        /** @brief 绑定可控的在途请求关卡；只返回合成的空候选，不访问网络。 */
+        Transport(QSemaphore& started, QSemaphore& gate) : started_(started), gate_(gate) {}
+        /** @brief 第一请求等待测试指令，后续请求直接返回合法的空结构化结果。 */
+        xuyan::domain::Result<ProviderTransportResponse> send(const xuyan::providers::ProviderHttpRequest&,
+            const std::string&, int) override {
+            if (calls.fetch_add(1) == 0) {
+                started_.release();
+                require(gate_.tryAcquire(1, 10000), "remote send gate timed out");
+            }
+            return xuyan::domain::Result<ProviderTransportResponse>::success({200, false, false,
+                R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v2\",\"prompt_version\":\"extract-v2\",\"entities\":[],\"events\":[],\"relations\":[],\"rules\":[]}"}]}]})"});
+        }
+        std::atomic<int> calls{0};
+    private:
+        QSemaphore& started_;
+        QSemaphore& gate_;
+    } transport(sending, release);
+    ExtractionJobViewModel model(workspace.database(), nullptr, [&](const auto& path, const auto& id, const OfflineBatchOptions& options) {
+        RemoteBatchOptions remote;
+        remote.maximum_steps = options.maximum_steps; remote.stop_token = options.stop_token;
+        remote.on_progress = [&](const auto& progress) {
+            const auto action = options.on_progress({progress.job_id, progress.total_steps,
+                progress.completed_steps, progress.processed_steps, progress.revision});
+            if (action == OfflineBatchAction::cancel) return RemoteBatchAction::cancel;
+            return action == OfflineBatchAction::pause ? RemoteBatchAction::pause : RemoteBatchAction::proceed;
+        };
+        auto result = RemoteExtractionProcessor(path, credentials, transport).processBatch(id, remote);
+        using Result = xuyan::domain::Result<OfflineBatchResult>;
+        if (!result.ok()) return Result::failure(*result.error);
+        const auto reason = result.value->reason == RemoteBatchStopReason::completed ? OfflineBatchStopReason::completed
+            : result.value->reason == RemoteBatchStopReason::paused ? OfflineBatchStopReason::paused : OfflineBatchStopReason::needs_attention;
+        return Result::success({std::move(result.value->job), result.value->processed_steps, reason});
+    });
+    waitUntilIdle(model); model.setWorldId("world-a"); waitUntilIdle(model);
+    model.refresh(); waitUntilIdle(model);
+    require(transport.calls == 0, "remote model must not send on construction or refresh");
+    const auto id = QString::fromStdString(job.value->id);
+    model.startJob(id); require(sending.tryAcquire(1, 10000), "explicit remote start did not send");
+    model.pauseJob(id); release.release(); waitUntilBatchStopped(model);
+    auto paused = ExtractionJobService(workspace.database()).load(job.value->id);
+    require(paused.ok() && paused.value->completed_steps == 1 && transport.calls == 1,
+            "in-flight pause must commit current slice and not send next");
+    model.resumeJob(id); waitUntilBatchStopped(model);
+    require(transport.calls == job.value->total_steps
+            && ExtractionJobService(workspace.database()).load(job.value->id).value->status == "completed",
+            "remote resume must send only remaining slices");
+}
+
 } // namespace
 
 /** @brief 运行世界视图模型的异步选择与回调隔离回归。 */
@@ -649,6 +884,12 @@ int main(int argc, char* argv[]) {
         testLongChapterWindows();
         testJobSelection(workspace.database());
         testJobLateCallback(workspace.database());
+        testBatchPauseAndResume();
+        testBatchCancel();
+        testBatchWorldIsolation();
+        testBatchFailureRecovery();
+        testBatchDestructionJoinsWorker();
+        testRemoteBatchControls();
         {
             TemporaryWorkspace empty_page_workspace;
             seedWorlds(empty_page_workspace.database());

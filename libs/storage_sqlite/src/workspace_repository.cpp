@@ -596,6 +596,12 @@ xuyan::domain::ExtractionJobState readExtractionJobState(sqlite3* database, cons
         if (sqlite3_step(input.get()) != SQLITE_ROW) throw std::runtime_error("解析任务输入快照缺失");
         job.input = {columnText(input.get(), 0), columnText(input.get(), 1), columnText(input.get(), 2)};
     }
+    {
+        Statement generation(database, "SELECT reasoning_effort,output_format FROM extraction_job_generation_snapshot WHERE job_id=?");
+        bindText(generation.get(), 1, job_id);
+        if (sqlite3_step(generation.get()) != SQLITE_ROW) throw std::runtime_error("解析任务生成配置快照缺失");
+        job.generation = {columnText(generation.get(), 0), columnText(generation.get(), 1)};
+    }
     return job;
 }
 
@@ -841,7 +847,7 @@ void WorkspaceRepository::migrate() {
         if (sqlite3_step(version.get()) != SQLITE_ROW) throw std::runtime_error("无法读取工作区版本");
         existing_version = sqlite3_column_int(version.get(), 0);
     }
-    if (existing_version > 27)
+    if (existing_version > 28)
         throw std::runtime_error("工作区由更新版本创建；原数据库未修改，请使用匹配的软件版本");
     // 旧版快照列依赖固定测试人物。只迁移没有任何提交的空表，保留用户的其他资料。
     std::vector<std::string> snapshot_columns;
@@ -851,7 +857,7 @@ void WorkspaceRepository::migrate() {
     }
     const std::vector<std::string> current_columns{
         "branch_id", "commit_id", "parent_commit_id", "state_hash", "state_json", "created_at"};
-    if (existing_version == 27) {
+    if (existing_version == 28) {
         // 已完成迁移的数据库只恢复连接级外键开关，避免每次分页都重扫历史表。
         if (snapshot_columns != current_columns)
             throw std::runtime_error("工作区快照结构不受支持；原数据库未修改，请使用匹配的软件版本");
@@ -859,18 +865,24 @@ void WorkspaceRepository::migrate() {
             throw std::runtime_error(sqlite3_errmsg(database_));
         return;
     }
-    if (existing_version == 26) {
+    if (existing_version == 26 || existing_version == 27) {
         if (snapshot_columns != current_columns)
             throw std::runtime_error("工作区快照结构不受支持；原数据库未修改，请使用匹配的软件版本");
-        // 此分支只增加输入快照；构造器已持迁移锁，不能再次获取写事务锁。
-        constexpr auto upgrade_input = "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;"
+        // 构造器已持迁移锁，不能再次获取写事务锁；27版本不能自动补齐损坏的输入快照。
+        std::string upgrade_input = "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;";
+        if (existing_version == 26) upgrade_input +=
             "CREATE TABLE IF NOT EXISTS extraction_job_input_snapshot("
             "job_id TEXT PRIMARY KEY,mode TEXT NOT NULL,density TEXT NOT NULL,algorithm_version TEXT NOT NULL,"
             "FOREIGN KEY(job_id) REFERENCES extraction_job(id));"
             "INSERT OR IGNORE INTO extraction_job_input_snapshot(job_id,mode,density,algorithm_version) "
-            "SELECT id,'raw','none','source-v1' FROM extraction_job; PRAGMA user_version=27; COMMIT;";
+            "SELECT id,'raw','none','source-v1' FROM extraction_job;";
+        upgrade_input += "CREATE TABLE IF NOT EXISTS extraction_job_generation_snapshot("
+            "job_id TEXT PRIMARY KEY,reasoning_effort TEXT NOT NULL,output_format TEXT NOT NULL,"
+            "FOREIGN KEY(job_id) REFERENCES extraction_job(id));"
+            "INSERT OR IGNORE INTO extraction_job_generation_snapshot(job_id,reasoning_effort,output_format) "
+            "SELECT id,'provider_default','provider_schema_v1' FROM extraction_job; PRAGMA user_version=28; COMMIT;";
         char* message = nullptr;
-        if (sqlite3_exec(database_, upgrade_input, nullptr, nullptr, &message) != SQLITE_OK) {
+        if (sqlite3_exec(database_, upgrade_input.c_str(), nullptr, nullptr, &message) != SQLITE_OK) {
             const std::string detail = message == nullptr ? "无法升级解析输入快照" : message;
             sqlite3_free(message);
             sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -1034,6 +1046,12 @@ CREATE TABLE IF NOT EXISTS extraction_job_input_snapshot(
 -- 旧任务明确保留原文语义，当前任务缺快照不会在连接快速路径中自动补齐。
 INSERT OR IGNORE INTO extraction_job_input_snapshot(job_id,mode,density,algorithm_version)
 SELECT id,'raw','none','source-v1' FROM extraction_job;
+CREATE TABLE IF NOT EXISTS extraction_job_generation_snapshot(
+  job_id TEXT PRIMARY KEY,reasoning_effort TEXT NOT NULL,output_format TEXT NOT NULL,
+  FOREIGN KEY(job_id) REFERENCES extraction_job(id)
+);
+INSERT OR IGNORE INTO extraction_job_generation_snapshot(job_id,reasoning_effort,output_format)
+SELECT id,'provider_default','provider_schema_v1' FROM extraction_job;
 CREATE TABLE IF NOT EXISTS extraction_step(
   id TEXT PRIMARY KEY,job_id TEXT NOT NULL,ordinal INTEGER NOT NULL,start_codepoint INTEGER NOT NULL,end_codepoint INTEGER NOT NULL,
   chunk_hash TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL,output_json TEXT NOT NULL,error_message TEXT NOT NULL,
@@ -1233,7 +1251,7 @@ CREATE TABLE IF NOT EXISTS simulation_director_intervention(
   actor_id TEXT NOT NULL,speech TEXT NOT NULL,operation TEXT NOT NULL,target_id TEXT NOT NULL,created_at TEXT NOT NULL,
   FOREIGN KEY(session_id) REFERENCES simulation_session(id)
 );
-PRAGMA user_version=27;
+PRAGMA user_version=28;
 )SQL";
     char* message = nullptr;
     if (sqlite3_exec(database_, sql, nullptr, nullptr, &message) != SQLITE_OK) {
@@ -2373,6 +2391,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
     payload_builder << "|provider:" << job.provider_connection_id << ':' << job.model_id
                     << ':' << job.provider_connection_fingerprint;
     payload_builder << "|input:" << job.input.mode << ':' << job.input.density << ':' << job.input.algorithm_version;
+    payload_builder << "|generation:" << job.generation.reasoning_effort << ':' << job.generation.output_format;
     for (const auto& step : job.steps) payload_builder << '|' << step.start_codepoint << ':' << step.end_codepoint << ':' << step.chunk_hash;
     payload_builder << "|budget:" << job.budget.estimated_input_tokens << ':' << job.budget.output_token_limit_per_request
                     << ':' << job.budget.max_requests << ':' << job.budget.sample_steps << ':' << job.budget.price_known
@@ -2397,6 +2416,8 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
                 return Result<xuyan::domain::ExtractionJob>::failure(
                     {ErrorCode::validation_failed, "模型连接在创建任务期间发生变化", false,
                      "重新选择连接并创建解析任务"});
+            const auto supported = xuyan::domain::validateProviderGenerationConfig(job.generation, connection.kind);
+            if (!supported.ok()) return Result<xuyan::domain::ExtractionJob>::failure(*supported.error);
         }
         std::ostringstream entity_index_builder;
         {
@@ -2409,6 +2430,9 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
         const auto parameters_hash = xuyan::domain::sha256(job.schema_version + '|' + job.prompt_version + '|'
             + job.provider_connection_id + '|' + job.model_id + '|' + job.provider_connection_fingerprint
             + '|' + job.input.mode + '|' + job.input.density + '|' + job.input.algorithm_version);
+        const auto generation_parameters_hash = xuyan::domain::sha256(parameters_hash + '|'
+            + job.generation.reasoning_effort + '|' + job.generation.output_format + '|'
+            + std::to_string(job.budget.output_token_limit_per_request));
         job.revision = 1; job.status = "queued"; job.completed_steps = 0; job.cancel_requested = false;
         Statement insert(database_, "INSERT INTO extraction_job(id,source_id,status,schema_version,prompt_version,provider_connection_id,model_id,total_steps,completed_steps,cancel_requested,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)");
         bindText(insert.get(), 1, job.id); bindText(insert.get(), 2, job.source_id); bindText(insert.get(), 3, job.status);
@@ -2431,6 +2455,12 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
             if (sqlite3_step(snapshot.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
         }
         {
+            Statement snapshot(database_, "INSERT INTO extraction_job_generation_snapshot(job_id,reasoning_effort,output_format) VALUES(?,?,?)");
+            bindText(snapshot.get(), 1, job.id); bindText(snapshot.get(), 2, job.generation.reasoning_effort);
+            bindText(snapshot.get(), 3, job.generation.output_format);
+            if (sqlite3_step(snapshot.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        }
+        {
             Statement budget(database_, "INSERT INTO extraction_budget(job_id,estimated_input_tokens,output_token_limit,max_requests,consumed_requests,sample_steps,price_known,estimated_cost_microunits,currency) VALUES(?,?,?,?,?,?,?,?,?)");
             bindText(budget.get(), 1, job.id);
             sqlite3_bind_int64(budget.get(), 2, static_cast<sqlite3_int64>(job.budget.estimated_input_tokens));
@@ -2443,7 +2473,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
         {
             Statement context(database_, "INSERT INTO extraction_job_cache_context(job_id,entity_index_hash,parameters_hash) VALUES(?,?,?)");
             bindText(context.get(), 1, job.id); bindText(context.get(), 2, entity_index_hash);
-            bindText(context.get(), 3, parameters_hash);
+            bindText(context.get(), 3, generation_parameters_hash);
             if (sqlite3_step(context.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
         }
         int reused_steps = 0;
@@ -2461,7 +2491,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
                     "ORDER BY es.updated_at DESC LIMIT 1");
                 bindText(cached.get(), 1, step.chunk_hash); bindText(cached.get(), 2, job.schema_version);
                 bindText(cached.get(), 3, job.prompt_version); bindText(cached.get(), 4, entity_index_hash);
-                bindText(cached.get(), 5, parameters_hash);
+                bindText(cached.get(), 5, generation_parameters_hash);
                 if (sqlite3_step(cached.get()) == SQLITE_ROW) {
                     cached_job_id = columnText(cached.get(), 0); cached_ordinal = sqlite3_column_int(cached.get(), 1);
                     cached_start = static_cast<std::size_t>(sqlite3_column_int64(cached.get(), 2));

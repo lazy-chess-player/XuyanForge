@@ -17,6 +17,11 @@ Result<ExtractionInputConfig> validateExtractionInputConfig(ExtractionInputConfi
 Result<ExtractionJob> validateExtractionJob(ExtractionJob job) {
     const auto input = validateExtractionInputConfig(job.input);
     if (!input.ok()) return Result<ExtractionJob>::failure(*input.error);
+    const auto generation = validateProviderGenerationConfig(job.generation);
+    if (!generation.ok()) return Result<ExtractionJob>::failure(*generation.error);
+    if (job.provider_connection_id.empty() && job.generation.reasoning_effort != "provider_default")
+        return Result<ExtractionJob>::failure(
+            {ErrorCode::validation_failed, "离线任务不能指定模型思考配置", false, "绑定模型连接或保留默认配置"});
     if (job.input.mode != "raw" && job.provider_connection_id.empty())
         return Result<ExtractionJob>::failure(
             {ErrorCode::validation_failed, "主干模型输入需要明确绑定模型连接", false, "离线任务保留原文模式"});

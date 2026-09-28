@@ -8,6 +8,19 @@
 
 namespace xuyan::domain {
 
+/** @brief 验证冻结的思考强度和结构化输出参数，拒绝未知值与不支持的提供商组合。 */
+Result<ProviderGenerationConfig> validateProviderGenerationConfig(
+    ProviderGenerationConfig config, std::string_view provider_kind) {
+    constexpr std::array efforts{std::string_view{"provider_default"}, std::string_view{"none"},
+        std::string_view{"low"}, std::string_view{"high"}, std::string_view{"max"}};
+    if (config.output_format != "provider_schema_v1"
+        || std::find(efforts.begin(), efforts.end(), config.reasoning_effort) == efforts.end()
+        || (!provider_kind.empty() && provider_kind != "deepseek" && config.reasoning_effort != "provider_default"))
+        return Result<ProviderGenerationConfig>::failure(
+            {ErrorCode::validation_failed, "生成思考强度或输出模式不受当前提供商支持", false, "保留默认或显式选择已支持配置并新建任务"});
+    return Result<ProviderGenerationConfig>::success(std::move(config));
+}
+
 Result<ProviderConnection> validateProviderConnection(ProviderConnection connection) {
     constexpr std::array kinds{
         std::string_view{"openai"}, std::string_view{"openai-compatible"},

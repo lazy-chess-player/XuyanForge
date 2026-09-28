@@ -48,7 +48,7 @@ public:
      */
     xuyan::domain::Result<xuyan::domain::ExtractionJob> processNext(const std::string& job_id);
     /**
-     * @brief 显式执行原文模式的串行有界批次，每个提交后的检查点通知进度。
+     * @brief 显式按冻结的原文或主干模式执行串行有界批次，每个提交后的检查点通知进度。
      * @details 不自动重试失败/未知步骤，不增加任务的持久化请求预算。同进程同任务
      * 单步和批次互斥；回调同步运行且不得抛出异常，外部取消在下次调度前重新读取。
      */

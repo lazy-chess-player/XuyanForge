@@ -58,11 +58,15 @@ JsonValue requestBody(ProviderProtocol protocol, const StructuredGenerationReque
             {"role", "user"}, {"content", JsonValue::Array{input_part}}});
         const JsonValue format(JsonValue::Object{{"type", "json_schema"}, {"name", "actor_intent"},
             {"strict", true}, {"schema", schema}});
-        return JsonValue::Object{
+        JsonValue::Object body{
             {"model", request.model_id},
             {"input", JsonValue::Array{input_message}},
             {"text", JsonValue::Object{{"format", format}}},
             {"max_output_tokens", request.max_output_tokens}, {"stream", request.stream}, {"store", false}};
+        // Responses 使用 reasoning.effort；默认不发该字段，不能误用聊天接口的 thinking.type。
+        if (request.generation.reasoning_effort != "provider_default")
+            body.emplace("reasoning", JsonValue::Object{{"effort", request.generation.reasoning_effort}});
+        return body;
     }
     if (protocol == ProviderProtocol::openai_compatible) {
         const JsonValue format(JsonValue::Object{{"name", "actor_intent"}, {"strict", true}, {"schema", schema}});
@@ -183,6 +187,11 @@ ProviderGenerationResult parseGemini(const JsonValue& root) {
 
 xuyan::domain::Result<ProviderHttpRequest> buildProviderRequest(
     ProviderProtocol protocol, const StructuredGenerationRequest& request) {
+    const auto config = xuyan::domain::validateProviderGenerationConfig(request.generation, request.provider_kind);
+    if (!config.ok()) return xuyan::domain::Result<ProviderHttpRequest>::failure(*config.error);
+    if (request.generation.reasoning_effort != "provider_default"
+        && (request.provider_kind != "deepseek" || protocol != ProviderProtocol::openai_responses))
+        return xuyan::domain::Result<ProviderHttpRequest>::failure(protocolError("此协议不支持显式思考强度，未构造发送请求"));
     if (request.endpoint.empty() || request.model_id.empty() || request.prompt.empty()
         || request.json_schema.empty() || request.max_output_tokens < 1 || request.max_output_tokens > 1'000'000)
         return xuyan::domain::Result<ProviderHttpRequest>::failure(protocolError("模型请求缺少端点、模型、提示词、Schema 或有效输出上限"));
