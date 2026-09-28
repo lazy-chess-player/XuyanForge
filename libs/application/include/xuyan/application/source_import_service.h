@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xuyan/domain/source_document.h"
+#include "xuyan/domain/extraction_job.h"
 
 #include <filesystem>
 #include <string>
@@ -36,6 +37,10 @@ struct SourceTextRange {
     std::size_t start_codepoint{0};
     std::size_t end_codepoint{0};
 };
+
+/** @brief 用已校验单片原文及冻结参数生成模型输入和可逆映射，不读取文件或调用模型。 */
+xuyan::domain::Result<NarrativePreview> buildExtractionInput(std::string source_text,
+    std::size_t base_codepoint, const xuyan::domain::ExtractionInputConfig& config);
 
 /** @brief 在连续保留的原文中唯一定位逐字引文；跨省略段、重复或无效引文返回错误。 */
 xuyan::domain::Result<SourceTextRange> locateNarrativeQuote(const NarrativePreview& preview,

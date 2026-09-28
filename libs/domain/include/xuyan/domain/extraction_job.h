@@ -9,6 +9,16 @@
 
 namespace xuyan::domain {
 
+/** @brief 冻结单片模型输入语义；原文是默认值，主干筛选必须显式指定密度和算法版本。 */
+struct ExtractionInputConfig {
+    std::string mode{"raw"};
+    std::string density{"none"};
+    std::string algorithm_version{"source-v1"};
+};
+
+/** @brief 拒绝未知或互相矛盾的输入参数，避免恢复任务时静默采用新算法。 */
+Result<ExtractionInputConfig> validateExtractionInputConfig(ExtractionInputConfig config);
+
 struct ExtractionStep {
     std::string id;
     std::string job_id;
@@ -57,6 +67,7 @@ struct ExtractionJobState {
     bool cancel_requested{false};
     int revision{0};
     ExtractionBudget budget;
+    ExtractionInputConfig input;
     bool has_ready_step{false};
     bool has_running_step{false};
     bool requires_attention{false};

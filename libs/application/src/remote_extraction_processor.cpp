@@ -202,6 +202,11 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
     SourceImportService sources(database_path_);
     auto chunk = sources.evidenceText(job.value->source_id, next.start_codepoint, next.end_codepoint);
     if (!chunk.ok()) return Result<JobResult>::failure(*chunk.error);
+    // 不仅核对引文：上下文篡改也会改变模型含义，必须先于领取和消耗额度拒绝。
+    if (xuyan::domain::sha256(*chunk.value) != next.chunk_hash)
+        return error<JobResult>("解析原文片段与任务冻结摘要不一致；请重新导入并创建任务");
+    auto input = buildExtractionInput(std::move(*chunk.value), next.start_codepoint, job.value->input);
+    if (!input.ok()) return Result<JobResult>::failure(*input.error);
 
     // 原文片段确认可读之后才领取步骤；领取事务承担预算上限检查。
     const auto claimed = jobs.claimNext(commandId("remote-claim", job_id, next.ordinal, next.attempt + 1),
@@ -219,7 +224,7 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
     try {
         // 四类输出分别要求不同字段；小说正文只作为不可信数据，无法指定写入事实。
         const auto schema = typedExtractionResponseSchema();
-        const auto prompt = typedExtractionPrompt(*chunk.value);
+        const auto prompt = typedExtractionPrompt(input.value->preview_text);
         ProviderGenerationService gateway(database_path_, credentials_, transport_);
         auto generated = gateway.generate(job.value->provider_connection_id, prompt, schema,
                                           job.value->budget.output_token_limit_per_request, 60000,
@@ -241,18 +246,13 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
         // 每条逐字引文重新映射到不可变原文，随后由候选服务再次做哈希和范围校验。
         JsonValue::Array candidates;
         for (const auto& item : *parsed.value) {
-            const auto byte = chunk.value->find(item.quote);
-            if (byte == std::string::npos) return finishFailure("failed", "模型引文无法在原文中定位");
-            // 重复引文不能默认为第一次出现；这种证据锚点必须由人工补足上下文。
-            if (chunk.value->find(item.quote, byte + 1) != std::string::npos)
-                return finishFailure("failed", "模型引文在当前片段中出现多次，无法唯一定位");
-            const auto start = step.start_codepoint + xuyan::domain::utf8CodepointCount(
-                std::string_view(*chunk.value).substr(0, byte));
-            const auto end = start + xuyan::domain::utf8CodepointCount(item.quote);
+            // 在连续保留的原文中定位，省略标记不是证据，不允许把不连续句段拼成引文。
+            const auto range = locateNarrativeQuote(*input.value, item.quote);
+            if (!range.ok()) return finishFailure("failed", "模型引文不在唯一连续保留的原文中");
             candidates.emplace_back(JsonValue::Object{
                 {"type", item.type}, {"name", item.name}, {"quote", item.quote},
-                {"start_codepoint", static_cast<std::int64_t>(start)},
-                {"end_codepoint", static_cast<std::int64_t>(end)},
+                {"start_codepoint", static_cast<std::int64_t>(range.value->start_codepoint)},
+                {"end_codepoint", static_cast<std::int64_t>(range.value->end_codepoint)},
                 {"fields", item.fields},
                 {"provenance_type", "model_inference"}});
         }

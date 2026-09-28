@@ -896,6 +896,164 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
             "legal generic history must still be reviewable without inventing new typed fields");
 }
 
+/** @brief 验证冻结主干输入、逐片恢复、缓存隔离及来源篡改拒绝；所有文本和响应均由测试生成。 */
+void testFrozenBackboneExtractionInput() {
+    using namespace xuyan::application;
+    using xuyan::package::JsonValue;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-input-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory), "input test must own its directory");
+    struct Cleanup {
+        std::filesystem::path root;
+        /** @brief 只清理刚由测试创建的独占目录，不触碰用户素材。 */
+        ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(root, ignored); }
+    } cleanup{directory};
+    const auto database = directory / "workspace.sqlite";
+    xuyan::storage::WorkspaceRepository repository(database);
+    require(repository.createWorldTemplate("input-world", "输入契约测试").ok(), "input world must create");
+    SourceImportService sources(database);
+    const auto manuscript = directory / "owned.txt";
+    std::string text;
+    std::vector<std::string> quotes;
+    for (int chapter = 1; chapter <= 2; ++chapter) {
+        quotes.push_back("记录者打开编号" + std::to_string(chapter) + "的匣子");
+        text += "# 第" + std::to_string(chapter) + "章\n天空蔚蓝，微风柔和。\n" + quotes.back() + "。\n";
+    }
+    { std::ofstream file(manuscript, std::ios::binary); file << text; }
+    auto source = sources.importTextFile("input-source", manuscript, "1", "input-world");
+    require(source.ok() && source.value->chapters.size() == 2, "input source must have two chapters");
+    InMemoryCredentialStore credentials;
+    ProviderConnectionService connections(database, credentials);
+    xuyan::domain::ProviderConnection connection;
+    connection.id = "owned-input-provider"; connection.name = "输入测试连接"; connection.kind = "deepseek";
+    connection.endpoint = "https://api.deepseek.com"; connection.default_model = "deepseek-chat";
+    connection.data_policy = "remote_allowed";
+    require(connections.save("input-provider", connection, 0, std::string{"owned-input-secret"}).ok(), "input provider must save");
+    class Transport final : public IProviderTransport {
+    public:
+        /** @brief 检查实际请求已省略描写，返回当前指定引文；回调仅用于模拟在途资产篡改。 */
+        xuyan::domain::Result<ProviderTransportResponse> send(const xuyan::providers::ProviderHttpRequest& request,
+            const std::string&, int) override {
+            ++calls;
+            require(request.body.find("天空蔚蓝") == std::string::npos, "backbone transport must omit description");
+            require(request.body.find(quote) != std::string::npos, "backbone transport must preserve event quote");
+            if (on_send) on_send();
+            const auto typed = xuyan::package::writeJson(JsonValue::Object{
+                {"schema_version", "candidate-v2"}, {"prompt_version", "extract-v2"},
+                {"entities", JsonValue::Array{}}, {"relations", JsonValue::Array{}}, {"rules", JsonValue::Array{}},
+                {"events", JsonValue::Array{JsonValue::Object{{"name", "打开匣子"}, {"quote", quote},
+                    {"fields", JsonValue::Object{{"action", "打开"}, {"participants", JsonValue::Array{"记录者"}},
+                        {"location", ""}, {"time_text", ""}}}}}}});
+            return xuyan::domain::Result<ProviderTransportResponse>::success({200, false, false,
+                xuyan::package::writeJson(JsonValue::Object{{"status", "completed"},
+                    {"output", JsonValue::Array{JsonValue::Object{{"content", JsonValue::Array{JsonValue::Object{
+                        {"type", "output_text"}, {"text", typed}}}}}}},
+                    {"usage", JsonValue::Object{{"input_tokens", 40}, {"output_tokens", 40}}}})});
+        }
+        int calls{0};
+        std::string quote;
+        std::function<void()> on_send;
+    } transport;
+    ExtractionJobService jobs(database);
+    const xuyan::domain::ExtractionInputConfig compact{"backbone", "compact", "backbone-v1"};
+    auto job = jobs.create("input-job", source.value->id, 500, 0, 2, 512, connection.id, compact);
+    require(job.ok() && job.value->total_steps == 2 && transport.calls == 0, "input creation must not send");
+    auto loaded = jobs.loadState(job.value->id);
+    require(loaded.ok() && loaded.value->input.mode == "backbone" && loaded.value->input.density == "compact"
+                && loaded.value->input.algorithm_version == "backbone-v1", "input snapshot must survive reload");
+    transport.quote = quotes[0];
+    RemoteExtractionProcessor processor(database, credentials, transport);
+    RemoteBatchOptions one; one.maximum_steps = 1;
+    auto first = processor.processBatch(job.value->id, one);
+    require(first.ok() && first.value->job.completed_steps == 1, "first backbone checkpoint must complete");
+    transport.quote = quotes[1];
+    RemoteExtractionProcessor resumed(database, credentials, transport);
+    auto second = resumed.processBatch(job.value->id, one);
+    require(second.ok() && second.value->job.status == "completed" && transport.calls == 2, "backbone resume must process only remaining step");
+    auto candidates = repository.listExtractionCandidatesForJob(job.value->id, 10);
+    require(candidates.ok() && candidates.value->size() == 2, "backbone must commit two review candidates");
+    for (const auto& candidate : *candidates.value) {
+        auto original = sources.evidenceText(source.value->id, candidate.start_codepoint, candidate.end_codepoint);
+        require(original.ok() && *original.value == candidate.quote
+            && candidate.quote_hash == xuyan::domain::sha256(candidate.quote), "backbone evidence must map to exact original range and hash");
+    }
+    require(sources.loadNormalizedText(source.value->id).value == std::optional<std::string>{text}, "compression must not modify original");
+    auto cached = jobs.create("input-cached", source.value->id, 500, 0, 2, 512, connection.id, compact);
+    auto raw = jobs.create("input-raw", source.value->id, 500, 0, 2, 512, connection.id);
+    auto balanced = jobs.create("input-balanced", source.value->id, 500, 0, 2, 512, connection.id,
+        {"backbone", "balanced", "backbone-v1"});
+    require(cached.ok() && cached.value->status == "completed" && raw.ok() && raw.value->completed_steps == 0
+        && balanced.ok() && balanced.value->completed_steps == 0, "mode and density must isolate caches while identical snapshot reuses them");
+    require(!jobs.create("input-job", source.value->id, 500, 0, 2, 512, connection.id).ok(), "input changes must conflict with command replay");
+    require(!jobs.create("input-invalid", source.value->id, 500, 0, 2, 512, connection.id,
+        {"backbone", "compact", "backbone-v999"}).ok(), "unknown algorithm must fail before creating task");
+    require(!jobs.create("input-offline", source.value->id, 500, 0, 2, 512, {}, compact).ok(),
+        "backbone configuration must not silently change the offline processor");
+    auto input = buildExtractionInput("开头。\n天空蔚蓝，微风柔和。\n记录者打开了匣子。", 10, compact);
+    require(input.ok() && !locateNarrativeQuote(*input.value, "开头。\n记录者打开了匣子").ok()
+        && !locateNarrativeQuote(*input.value, "天空蔚蓝").ok(), "omitted descriptions and stitched quotes cannot map to evidence");
+    auto duplicate = buildExtractionInput("记录者打开了匣子。\n天空蔚蓝。\n记录者打开了匣子。", 0, compact);
+    require(duplicate.ok() && !locateNarrativeQuote(*duplicate.value, "记录者打开了匣子").ok(),
+        "duplicate retained quotes must remain ambiguous");
+    // 直接绕过远程处理器提交被省略的真实原文，候选服务也必须拒绝。
+    auto claimed = jobs.claimNext("input-forged-claim", balanced.value->id, balanced.value->revision);
+    require(claimed.ok(), "omitted evidence test must claim its own pending step");
+    const std::string omitted = "天空蔚蓝，微风柔和。";
+    const auto omitted_cp = xuyan::domain::utf8CodepointCount(std::string_view(text).substr(0, text.find(omitted)));
+    const auto forged = xuyan::package::writeJson(JsonValue::Object{
+        {"schema_version", "candidate-v2"}, {"prompt_version", "extract-v2"},
+        {"candidates", JsonValue::Array{JsonValue::Object{{"type", "event"}, {"name", "描写"}, {"quote", omitted},
+            {"fields", JsonValue::Object{{"action", "描写"}, {"participants", JsonValue::Array{}}, {"location", ""}, {"time_text", ""}}},
+            {"start_codepoint", static_cast<std::int64_t>(omitted_cp)},
+            {"end_codepoint", static_cast<std::int64_t>(omitted_cp + xuyan::domain::utf8CodepointCount(omitted))},
+            {"provenance_type", "model_inference"}}}}});
+    require(!CandidateService(database).ingestStepOutput("input-forged", balanced.value->id, 1, claimed.value->attempt, forged).ok()
+        && repository.listExtractionCandidatesForJob(balanced.value->id, 10).value->empty(),
+        "candidate service must independently reject omitted evidence and commit nothing");
+    // 在发送前和回报后都改写未引用的描写；引文本身仍相同，单纯引文校验无法发现这个错误。
+    const auto asset = directory / source.value->normalized_asset_ref;
+    const auto replaceDescription = [&] {
+        auto changed = text;
+        changed.replace(changed.find("蔚蓝"), std::string("蔚蓝").size(), "阴暗");
+        std::ofstream file(asset, std::ios::binary | std::ios::trunc); file << changed;
+    };
+    auto before = jobs.create("input-tamper-before", source.value->id, 500, 0, 2, 512, connection.id,
+        {"backbone", "conservative", "backbone-v1"});
+    require(before.ok(), "tamper fixture must create before editing asset");
+    replaceDescription();
+    const auto calls_before = transport.calls;
+    require(!processor.processNext(before.value->id).ok() && transport.calls == calls_before
+        && jobs.loadState(before.value->id).value->budget.consumed_requests == 0, "changed original must reject before budget and send");
+    { std::ofstream file(asset, std::ios::binary | std::ios::trunc); file << text; }
+    transport.quote = quotes[0]; transport.on_send = replaceDescription;
+    auto during = processor.processNext(before.value->id);
+    transport.on_send = {};
+    require(during.ok() && during.value->steps.front().status == "failed"
+        && during.value->budget.consumed_requests == 1
+        && repository.listExtractionCandidatesForJob(before.value->id, 10).value->empty(), "changed in-flight context must reject whole candidate batch without resending");
+    { std::ofstream file(asset, std::ios::binary | std::ios::trunc); file << text; }
+    // 缺少输入快照的旧任务明确回退为原文，不迁移到新主干默认。
+    sqlite3* legacy = nullptr;
+    require(sqlite3_open(database.string().c_str(), &legacy) == SQLITE_OK, "owned migration fixture must open");
+    require(sqlite3_exec(legacy, "DROP TABLE extraction_job_input_snapshot; PRAGMA user_version=26;", nullptr, nullptr, nullptr) == SQLITE_OK, "owned migration fixture must downgrade");
+    sqlite3_close(legacy);
+    auto historical = jobs.loadState(raw.value->id);
+    require(historical.ok(), historical.error ? historical.error->message : "migration must return a snapshot");
+    require(historical.ok() && historical.value->input.mode == "raw" && historical.value->input.algorithm_version == "source-v1", "old task must preserve raw semantics after migration");
+    sqlite3* broken = nullptr;
+    require(sqlite3_open(database.string().c_str(), &broken) == SQLITE_OK, "owned corruption fixture must open");
+    sqlite3_stmt* deletion = nullptr;
+    require(sqlite3_prepare_v2(broken, "DELETE FROM extraction_job_input_snapshot WHERE job_id=?", -1, &deletion, nullptr) == SQLITE_OK,
+        "owned corruption statement must prepare");
+    sqlite3_bind_text(deletion, 1, raw.value->id.c_str(), -1, SQLITE_TRANSIENT);
+    require(sqlite3_step(deletion) == SQLITE_DONE, "owned input snapshot must delete");
+    sqlite3_finalize(deletion); sqlite3_close(broken);
+    const auto calls_before_corruption = transport.calls;
+    require(!jobs.loadState(raw.value->id).ok() && !processor.processNext(raw.value->id).ok()
+        && transport.calls == calls_before_corruption, "current task missing input snapshot must refuse rather than silently switching modes");
+}
+
 /** @brief 验证远程抽样须显式单步触发，且连接变更和旧任务不会泄露原文。 */
 void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
     class FakeTransport final : public xuyan::application::IProviderTransport {
@@ -1152,8 +1310,11 @@ void testRemoteBatchCheckpoints() {
         auto source = sources.importTextFile("batch-source-" + label, manuscript, "1", "owned-batch-world");
         require(source.ok() && static_cast<int>(source.value->chapters.size()) == chapters,
                 "runtime source must retain every chapter");
+        const xuyan::domain::ExtractionInputConfig input = large_batch && label == "full"
+            ? xuyan::domain::ExtractionInputConfig{"backbone", "conservative", "backbone-v1"}
+            : xuyan::domain::ExtractionInputConfig{};
         auto job = jobs.create("batch-job-" + label, source.value->id,
-                              large_batch && label == "full" ? 50000 : 500, 0, requests, 512, connection.id);
+                              large_batch && label == "full" ? 50000 : 500, 0, requests, 512, connection.id, input);
         require(job.ok() && job.value->total_steps == chapters && job.value->completed_steps == 0,
                 "each owned chapter must create an uncached ready step");
         return *job.value;
@@ -1177,6 +1338,7 @@ void testRemoteBatchCheckpoints() {
             require(data.ok() && data.value->find("novel_fragment") != nullptr,
                     "novel fragment must remain an escaped data field");
             const auto& fragment = data.value->find("novel_fragment")->string();
+            sent_fragment_codepoints += xuyan::domain::utf8CodepointCount(fragment);
             const auto start = fragment.find("记录者完成编号");
             const auto end = fragment.find("。", start);
             require(start != std::string::npos && end != std::string::npos,
@@ -1203,6 +1365,7 @@ void testRemoteBatchCheckpoints() {
         }
         int calls{0};
         int http_status{200};
+        std::size_t sent_fragment_codepoints{0};
         bool timed_out{false};
         bool cancelled{false};
         bool malformed{false};
@@ -1250,10 +1413,14 @@ void testRemoteBatchCheckpoints() {
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - batch_started).count();
     std::cout << "Owned remote batch validation: " << full_chapters << " chapters, "
               << finished.value->job.steps.back().end_codepoint << " source codepoints, "
+              << transport.sent_fragment_codepoints << " sent fragment codepoints, "
               << finished.value->processed_steps << " resumed steps, " << read_audit.counts.full_history_reads
               << " historical output SELECTs, " << elapsed << " seconds.\n";
     require(read_audit.counts.full_history_reads <= 1,
             "batch scheduling must read historical outputs only once for its final full snapshot");
+    if (large_batch) require(finished.value->job.input.mode == "backbone"
+        && transport.sent_fragment_codepoints < finished.value->job.steps.back().end_codepoint / 20,
+        "large backbone batch must actually reduce model input, not merely rename the task mode");
     auto sorted_quotes = transport.quotes;
     std::sort(sorted_quotes.begin(), sorted_quotes.end());
     require(std::adjacent_find(sorted_quotes.begin(), sorted_quotes.end()) == sorted_quotes.end(),
@@ -2225,7 +2392,7 @@ COMMIT;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> verification(upgraded_database, &sqlite3_close);
     require(reopened_result == SQLITE_OK && verification != nullptr,
             "upgraded candidate fixture database must reopen");
-    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 26
+    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 27
                 && sqliteScalar(verification.get(),
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_candidate_scope_page'") == 1
                 && sqliteScalar(verification.get(), "SELECT COUNT(*) FROM candidate_review_history") == 9,
@@ -3384,6 +3551,7 @@ int main() {
         testProviderGenerationGatewayAndCredentialIsolation();
         testTypedExtractionOutputContract();
         testTypedExtractionPersistenceAndVersionIsolation();
+        testFrozenBackboneExtractionInput();
         testRemoteExtractionOneStepIsExplicitAndEvidenceBound();
         testRemoteBatchCheckpoints();
         testEntityCrudSearchAndOptimisticLocking();

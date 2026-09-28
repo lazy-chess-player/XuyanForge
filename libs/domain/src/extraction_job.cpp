@@ -5,7 +5,21 @@
 
 namespace xuyan::domain {
 
+Result<ExtractionInputConfig> validateExtractionInputConfig(ExtractionInputConfig config) {
+    const bool raw = config.mode == "raw" && config.density == "none" && config.algorithm_version == "source-v1";
+    const bool backbone = config.mode == "backbone" && config.algorithm_version == "backbone-v1"
+        && (config.density == "conservative" || config.density == "balanced" || config.density == "compact");
+    if (!raw && !backbone) return Result<ExtractionInputConfig>::failure(
+        {ErrorCode::validation_failed, "解析输入模式、密度或算法版本无效", false, "重新选择输入模式并创建任务"});
+    return Result<ExtractionInputConfig>::success(std::move(config));
+}
+
 Result<ExtractionJob> validateExtractionJob(ExtractionJob job) {
+    const auto input = validateExtractionInputConfig(job.input);
+    if (!input.ok()) return Result<ExtractionJob>::failure(*input.error);
+    if (job.input.mode != "raw" && job.provider_connection_id.empty())
+        return Result<ExtractionJob>::failure(
+            {ErrorCode::validation_failed, "主干模型输入需要明确绑定模型连接", false, "离线任务保留原文模式"});
     if (job.id.empty() || job.source_id.empty() || job.steps.empty() || job.steps.size() > 100000)
         return Result<ExtractionJob>::failure(
             {ErrorCode::validation_failed, "提取任务缺少 ID、来源或有效步骤", false, "重新创建任务"});

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -98,7 +99,7 @@ bool containsAny(std::string_view text, std::initializer_list<std::string_view> 
     });
 }
 
-/** @brief 将单个原文片段切成可追溯句段，并按预览密度生成非权威主干草稿。 */
+/** @brief 按 backbone-v1 生成可追溯的非权威主干；改变切句、筛选或拼接语义须提升算法版本。 */
 xuyan::domain::Result<NarrativePreview> buildNarrativePreview(std::string source_text,
                                                                std::size_t base_codepoint,
                                                                NarrativePreviewDensity density) {
@@ -173,7 +174,7 @@ xuyan::domain::Result<NarrativePreview> buildNarrativePreview(std::string source
         const bool heading = content.starts_with('#') || (content.starts_with("第")
             && content.size() <= 96 && containsAny(content, {"章", "回", "节", "卷"}));
         const bool dialogue = containsAny(content, {"“", "”", "「", "」", "『", "』"});
-        // 词表只用于可审阅预览，不是事实判定器；未知句段仍由密度档位显式决定是否抽样保留。
+        // 词表只用于只读输入筛选，不是事实判定器或完整性保证；未知句段由密度决定是否保留。
         const bool action = containsAny(content, {
             "发现", "决定", "告诉", "承诺", "答应", "拒绝", "攻击", "战斗", "杀死", "死亡",
             "受伤", "逃走", "出发", "抵达", "到达", "进入", "离开", "拿到", "获得", "失去",
@@ -216,6 +217,27 @@ xuyan::domain::Result<NarrativePreview> buildNarrativePreview(std::string source
 }
 
 } // namespace
+
+xuyan::domain::Result<NarrativePreview> buildExtractionInput(std::string source_text,
+    std::size_t base_codepoint, const xuyan::domain::ExtractionInputConfig& config) {
+    auto valid = xuyan::domain::validateExtractionInputConfig(config);
+    if (!valid.ok()) return xuyan::domain::Result<NarrativePreview>::failure(*valid.error);
+    const auto count = xuyan::domain::utf8CodepointCount(source_text);
+    if (count == 0 || count > 50000 || base_codepoint > std::numeric_limits<std::size_t>::max() - count)
+        return xuyan::domain::Result<NarrativePreview>::failure(fileError("解析输入必须为有效的单片原文"));
+    if (config.mode == "backbone") {
+        const auto density = config.density == "compact" ? NarrativePreviewDensity::compact
+            : config.density == "conservative" ? NarrativePreviewDensity::conservative : NarrativePreviewDensity::balanced;
+        return buildNarrativePreview(std::move(source_text), base_codepoint, density);
+    }
+    NarrativePreview input;
+    input.source_text = std::move(source_text);
+    input.preview_text = input.source_text;
+    input.source_codepoints = input.retained_codepoints = count;
+    input.segments.push_back({base_codepoint, base_codepoint + count, 0, input.source_text.size(),
+                              true, NarrativeSelectionReason::context});
+    return xuyan::domain::Result<NarrativePreview>::success(std::move(input));
+}
 
 xuyan::domain::Result<SourceTextRange> locateNarrativeQuote(const NarrativePreview& preview,
                                                              std::string_view quote) {

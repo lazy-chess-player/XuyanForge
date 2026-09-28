@@ -81,6 +81,17 @@ Result<JobResult> CandidateService::ingestStepOutputImpl(
         auto step_text = sources.evidenceText(job.value->source_id,
                                               step->start_codepoint, step->end_codepoint);
         if (!step_text.ok()) return Result<JobResult>::failure(*step_text.error);
+        // 重新核对完整上下文摘要，防止在途改变未引用文字却通过逐字引文校验。
+        if (xuyan::domain::sha256(*step_text.value) != step->chunk_hash)
+            return protocolError<JobResult>("解析原文片段与任务冻结摘要不一致");
+        auto valid_input = xuyan::domain::validateExtractionInputConfig(job.value->input);
+        if (!valid_input.ok()) return Result<JobResult>::failure(*valid_input.error);
+        std::optional<NarrativePreview> retained_input;
+        if (job.value->input.mode == "backbone") {
+            auto input = buildExtractionInput(*step_text.value, step->start_codepoint, job.value->input);
+            if (!input.ok()) return Result<JobResult>::failure(*input.error);
+            retained_input = std::move(*input.value);
+        }
         std::vector<xuyan::domain::ExtractionCandidate> candidates;
         candidates.reserve(items->array().size());
         for (std::size_t index = 0; index < items->array().size(); ++index) {
@@ -109,6 +120,12 @@ Result<JobResult> CandidateService::ingestStepOutputImpl(
                 start_cp - step->start_codepoint, end_cp - step->start_codepoint);
             if (!original.ok() || *original.value != quote->string())
                 return protocolError<JobResult>("候选引文与来源码点区间不一致");
+            if (retained_input) {
+                // 候选服务自身执行保留范围校验，其他入口不能绕过远程处理器提交省略内容。
+                const auto mapped = locateNarrativeQuote(*retained_input, quote->string());
+                if (!mapped.ok() || mapped.value->start_codepoint != start_cp || mapped.value->end_codepoint != end_cp)
+                    return protocolError<JobResult>("候选引文不在唯一连续保留的原文范围内");
+            }
             xuyan::domain::ExtractionCandidate candidate;
             candidate.id = "candidate-" + xuyan::domain::sha256(command_id + '|' + std::to_string(index)).substr(0, 24);
             candidate.job_id = job_id; candidate.step_ordinal = step_ordinal; candidate.source_id = job.value->source_id;

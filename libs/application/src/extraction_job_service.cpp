@@ -66,7 +66,12 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     const std::string& command_id, const std::string& source_id,
     std::size_t maximum_codepoints, std::size_t overlap_codepoints,
     int max_requests, int output_token_limit_per_request,
-    const std::string& provider_connection_id) {
+    const std::string& provider_connection_id, const xuyan::domain::ExtractionInputConfig& input) {
+    const auto valid_input = xuyan::domain::validateExtractionInputConfig(input);
+    if (!valid_input.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*valid_input.error);
+    if (input.mode != "raw" && provider_connection_id.empty())
+        return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
+            {xuyan::domain::ErrorCode::validation_failed, "主干模型输入需要绑定模型连接", false, "离线任务使用原文模式"});
     if (maximum_codepoints < 500 || maximum_codepoints > 50000 || overlap_codepoints >= maximum_codepoints / 2
         || max_requests < 0 || output_token_limit_per_request < 1 || output_token_limit_per_request > 1000000)
         return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
@@ -79,7 +84,7 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
         {xuyan::domain::ErrorCode::validation_failed, "空来源不能创建提取任务", false, "选择包含正文的来源"});
     // 正文只解码一次，先建立段尾/句末索引，再用码点到字节的映射截取每一步。
     const auto boundaries = textBoundaries(*text.value);
-    // Normalize once: repeated codepointSlice() rescans the complete novel for every step.
+    // 一次建立码点到字节索引，避免每片调用 codepointSlice() 都重新扫描整本正文。
     std::vector<std::uint32_t> byte_offsets;
     byte_offsets.reserve(total + 1);
     for (std::size_t byte = 0; byte < text.value->size();) {
@@ -103,6 +108,7 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
     if (covered < total) segments.emplace_back(covered, total);
     if (segments.empty()) segments.emplace_back(0, total);
     xuyan::domain::ExtractionJob job;
+    job.input = input;
     job.id = "job-" + xuyan::domain::sha256(command_id).substr(0, 24); job.source_id = source_id;
     // 远程任务只绑定当时的连接指纹；创建任务本身不读取密钥，也不调用模型。
     if (!provider_connection_id.empty()) {

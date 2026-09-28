@@ -89,7 +89,7 @@ void executeFixtureSql(const std::filesystem::path& database, const char* sql) {
     if (status != SQLITE_OK) throw std::runtime_error("candidate fixture SQL failed: " + error);
 }
 
-/** @brief 构造超过一页的两世界候选，仅用于离线校对列表回归。 */
+/** @brief 构造超过一页的两世界候选及完整原文任务快照，仅用于离线列表回归。 */
 void seedCandidates(const std::filesystem::path& database) {
     executeFixtureSql(database, R"SQL(
 PRAGMA foreign_keys=ON;
@@ -100,6 +100,8 @@ INSERT INTO extraction_job(id,source_id,status,schema_version,prompt_version,pro
     total_steps,completed_steps,cancel_requested,revision,created_at,updated_at)
 VALUES('job-a','source-a','completed','candidate-v1','extract-v1','','',101,101,0,1,'2026-09-27','2026-09-27'),
       ('job-b','source-b','completed','candidate-v1','extract-v1','','',1,1,0,1,'2026-09-27','2026-09-27');
+INSERT INTO extraction_job_input_snapshot(job_id,mode,density,algorithm_version)
+SELECT id,'raw','none','source-v1' FROM extraction_job;
 WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<102)
 INSERT INTO extraction_candidate(id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,
     start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,
