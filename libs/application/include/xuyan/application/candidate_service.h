@@ -28,7 +28,7 @@ public:
     xuyan::domain::Result<xuyan::domain::ExtractionCandidatePage> listPage(
         const std::string& world_id, const std::string& source_id,
         const std::string& review_status, int limit, std::int64_t offset);
-    /** @brief 以乐观锁保存人工接受、修改、拒绝或冲突标记。 */
+    /** @brief 以乐观锁审核候选；接受类型化事件时原子创建带证据时间线，不推定故事日期或因果。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> review(
         const std::string& command_id, const std::string& candidate_id, int expected_revision,
         const std::string& review_status, const std::string& name,

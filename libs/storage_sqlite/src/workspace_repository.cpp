@@ -3017,9 +3017,10 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::loadExtractionCa
     } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionCandidate>::failure(storageError(exception)); }
 }
 
+/** @brief 原子提交候选审核、接受条目、原文证据和可选事件投影，重放不产生第二份资料。 */
 Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtractionCandidate(
     const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,
-    std::optional<WorldEntity> accepted_entity) {
+    std::optional<WorldEntity> accepted_entity, std::optional<xuyan::domain::TimelineEvent> accepted_timeline) {
     if (candidate.review_status != "candidate" && candidate.review_status != "accepted"
         && candidate.review_status != "rejected" && candidate.review_status != "conflicted")
         return Result<xuyan::domain::ExtractionCandidate>::failure(
@@ -3035,14 +3036,85 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
         if (!checked.ok()) return Result<xuyan::domain::ExtractionCandidate>::failure(*checked.error);
         accepted_entity = std::move(*checked.value);
     }
-    const auto payload = candidate.id + '|' + std::to_string(expected_revision) + '|' + candidate.review_status + '|'
+    const bool requires_timeline = candidate.review_status == "accepted"
+        && candidate.schema_version == "candidate-v2" && candidate.candidate_type == "event";
+    if (requires_timeline != accepted_timeline.has_value())
+        return Result<xuyan::domain::ExtractionCandidate>::failure(
+            {ErrorCode::validation_failed, "类型化事件接受必须携带时间线投影，其他审核不能携带投影", false, "重新提交审核"});
+    const auto legacy_payload = candidate.id + '|' + std::to_string(expected_revision) + '|' + candidate.review_status + '|'
         + candidate.name + '|' + candidate.fields_json + '|' + candidate.provenance_type;
+    auto payload = legacy_payload;
+    if (accepted_timeline) {
+        using xuyan::package::JsonValue;
+        auto fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
+        const auto* time = fields.ok() ? fields.value->find("time_text") : nullptr;
+        const auto truth = candidate.provenance_type == "in_text_claim" ? "claim"
+            : candidate.provenance_type == "model_inference" ? "hypothesis" : "fact";
+        const auto& event = *accepted_timeline;
+        // 仓储入口不能用额外投影伪造时间、因果、真实性或跨条目引用。
+        if (!time || !time->isString() || event.id != accepted_entity->id
+            || event.world_id != accepted_entity->world_id || event.name != candidate.name
+            || event.story_time || event.narrative_order != candidate.step_ordinal
+            || event.relative_time != time->string() || event.truth_status != truth || event.revision != 0
+            || !event.prerequisites.empty() || !event.causes.empty() || !event.results.empty())
+            return Result<xuyan::domain::ExtractionCandidate>::failure(
+                {ErrorCode::validation_failed, "事件投影与候选证据或来源性质不一致", false, "从当前候选重新生成投影"});
+        auto checked = xuyan::domain::validateTimelineEvent(std::move(*accepted_timeline));
+        if (!checked.ok()) return Result<xuyan::domain::ExtractionCandidate>::failure(*checked.error);
+        accepted_timeline = std::move(*checked.value);
+        auto attributes = xuyan::package::parseJson(accepted_entity->attributes_json, 16, 2000);
+        auto expected_attributes = *fields.value;
+        expected_attributes.object()["xuyan_provenance_type"] = candidate.provenance_type;
+        expected_attributes.object()["xuyan_truth_status"] = truth;
+        if (!attributes.ok() || xuyan::package::writeJson(*attributes.value) != xuyan::package::writeJson(expected_attributes)
+            || accepted_entity->name != candidate.name || accepted_entity->review_status != "accepted" || accepted_entity->deleted
+            || accepted_entity->kind != (std::string_view(truth) == "fact" ? "event" : "other"))
+            return Result<xuyan::domain::ExtractionCandidate>::failure(
+                {ErrorCode::validation_failed, "事件条目与审核字段或真实性不一致", false, "从当前候选重新生成条目"});
+        // 新事件审核使用规范JSON摘要，避免分隔符碰撞，并把专用记录和条目内容纳入命令语义。
+        JsonValue::Array aliases, tags;
+        for (const auto& alias : accepted_entity->aliases) aliases.emplace_back(alias);
+        for (const auto& tag : accepted_entity->tags) tags.emplace_back(tag);
+        payload = "event-review-v1:" + xuyan::domain::sha256(xuyan::package::writeJson(JsonValue::Object{
+            {"candidate_id", candidate.id}, {"expected_revision", expected_revision}, {"name", candidate.name},
+            {"fields", *fields.value}, {"provenance", candidate.provenance_type},
+            {"entity_id", accepted_entity->id}, {"world_id", accepted_entity->world_id},
+            {"description", accepted_entity->description}, {"attributes", *attributes.value},
+            {"aliases", std::move(aliases)}, {"tags", std::move(tags)},
+            {"narrative_order", accepted_timeline->narrative_order}, {"relative_time", accepted_timeline->relative_time},
+            {"truth_status", accepted_timeline->truth_status}}));
+    }
     try {
         Transaction transaction(database_);
+        Statement current_query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE id=?");
+        bindText(current_query.get(), 1, candidate.id);
+        if (sqlite3_step(current_query.get()) != SQLITE_ROW) return Result<xuyan::domain::ExtractionCandidate>::failure(
+            {ErrorCode::missing_context, "找不到提取候选", false, "刷新校对列表"});
+        const auto current = readCandidate(current_query.get());
+        // 审核只允许改名称、字段和来源性质；证据及冻结任务身份不属于可编辑内容。
+        if (candidate.job_id != current.job_id || candidate.step_ordinal != current.step_ordinal
+            || candidate.source_id != current.source_id || candidate.candidate_type != current.candidate_type
+            || candidate.start_codepoint != current.start_codepoint || candidate.end_codepoint != current.end_codepoint
+            || candidate.quote != current.quote || candidate.quote_hash != current.quote_hash
+            || candidate.schema_version != current.schema_version || candidate.prompt_version != current.prompt_version)
+            return Result<xuyan::domain::ExtractionCandidate>::failure(
+                {ErrorCode::validation_failed, "审核不能修改候选身份或原文证据", false, "刷新候选后重新审核"});
+        if (accepted_entity) {
+            Statement source(database_, "SELECT world_id FROM source_document WHERE id=?");
+            bindText(source.get(), 1, current.source_id);
+            if (sqlite3_step(source.get()) != SQLITE_ROW || accepted_entity->world_id != columnText(source.get(), 0)
+                || accepted_entity->id != "entity-from-" + current.id)
+                return Result<xuyan::domain::ExtractionCandidate>::failure(
+                    {ErrorCode::validation_failed, "接受条目必须属于候选来源世界并使用稳定标识", false, "重新生成接受条目"});
+        }
         Statement replay(database_, "SELECT payload_hash,candidate_id FROM candidate_review_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
         if (sqlite3_step(replay.get()) == SQLITE_ROW) {
-            if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionCandidate>::failure(
+            const auto stored_payload = columnText(replay.get(), 0);
+            // 历史审核命令只返回已有结果，不借重放补写过去没有的事件记录。
+            const bool historical_event_replay = requires_timeline && stored_payload == legacy_payload
+                && current.review_status == "accepted" && columnText(replay.get(), 1) == candidate.id;
+            if (stored_payload != payload && !historical_event_replay) return Result<xuyan::domain::ExtractionCandidate>::failure(
                 {ErrorCode::command_conflict, "命令标识已用于其他候选审核", false, "生成新的命令标识"});
             Statement query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE id=?");
             bindText(query.get(), 1, columnText(replay.get(), 1));
@@ -3050,11 +3122,6 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
             auto result = readCandidate(query.get()); transaction.commit();
             return Result<xuyan::domain::ExtractionCandidate>::success(std::move(result));
         }
-        Statement current_query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE id=?");
-        bindText(current_query.get(), 1, candidate.id);
-        if (sqlite3_step(current_query.get()) != SQLITE_ROW) return Result<xuyan::domain::ExtractionCandidate>::failure(
-            {ErrorCode::missing_context, "找不到提取候选", false, "刷新校对列表"});
-        const auto current = readCandidate(current_query.get());
         if (current.revision != expected_revision || current.review_status == "accepted" || current.review_status == "rejected")
             return Result<xuyan::domain::ExtractionCandidate>::failure(
                 {ErrorCode::revision_conflict, "候选已被其他审核修改或终结", false, "刷新校对列表"});
@@ -3097,6 +3164,16 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
             bindText(add_evidence.get(), 9, evidence.provenance_type); sqlite3_bind_int(add_evidence.get(), 10, 1);
             bindText(add_evidence.get(), 11, utcNow());
             if (sqlite3_step(add_evidence.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+            if (accepted_timeline) {
+                // 不调用另启事务的公开时间线保存方法；任何插入失败均由本审核事务整体回滚。
+                Statement add_event(database_, "INSERT INTO timeline_event(id,world_id,name,has_story_time,story_time,narrative_order,relative_time,truth_status,revision) VALUES(?,?,?,0,0,?,?,?,1)");
+                bindText(add_event.get(), 1, accepted_timeline->id); bindText(add_event.get(), 2, accepted_timeline->world_id);
+                bindText(add_event.get(), 3, accepted_timeline->name);
+                sqlite3_bind_int(add_event.get(), 4, accepted_timeline->narrative_order);
+                bindText(add_event.get(), 5, accepted_timeline->relative_time);
+                bindText(add_event.get(), 6, accepted_timeline->truth_status);
+                if (sqlite3_step(add_event.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+            }
         }
         Statement log(database_, "INSERT INTO candidate_review_command_log(command_id,payload_hash,candidate_id,revision,created_at) VALUES(?,?,?,?,?)");
         bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, candidate.id);

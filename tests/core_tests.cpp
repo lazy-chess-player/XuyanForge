@@ -2527,6 +2527,254 @@ COMMIT;
             "deleted last page must return an empty page with updated total for pagination recovery");
 }
 
+/** @brief 验证类型化事件审核原子生成带原文证据的时间线，并保留真实性和重放语义。 */
+void testAcceptedEventTimelineProjection() {
+    using namespace xuyan::application;
+    using xuyan::package::JsonValue;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-event-review-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
+            "event review must own an isolated temporary workspace");
+    struct Cleanup {
+        std::filesystem::path directory;
+        std::filesystem::path parent;
+        /** @brief 接管独占目录的清理责任，不扫描或接管其他目录。 */
+        Cleanup(std::filesystem::path owned, std::filesystem::path expected_parent)
+            : directory(std::move(owned)), parent(std::move(expected_parent)) {}
+        /** @brief 禁止复制清理责任，避免重复移除同一目录。 */
+        Cleanup(const Cleanup&) = delete;
+        /** @brief 禁止覆盖已拥有的目录清理责任。 */
+        Cleanup& operator=(const Cleanup&) = delete;
+        /** @brief 仅清理本次创建的临时工作区，不接触用户小说或其他测试目录。 */
+        ~Cleanup() {
+            if (directory.parent_path() == parent) {
+                std::error_code ignored;
+                std::filesystem::remove_all(directory, ignored);
+            }
+        }
+    } cleanup{directory, parent};
+    const auto database = directory / "workspace.sqlite";
+    xuyan::storage::WorkspaceRepository repository(database);
+    auto world = repository.createWorldTemplate("event-review-world", "事件审核测试");
+    auto other_world = repository.createWorldTemplate("event-review-other", "另一测试世界");
+    require(world.ok() && other_world.ok(), "event review worlds must be created explicitly");
+    const auto file = directory / "private-runtime.md";
+    {
+        std::ofstream output(file, std::ios::binary);
+        output << "# 第一章\n众人准备出发。\n# 第二章\n翌日，林舟在北门找到钥匙。\n";
+        require(output.good(), "event review runtime text must be written");
+    }
+    SourceImportService sources(database);
+    auto source = sources.importTextFile("event-review-source", file, "1", world.value->id);
+    require(source.ok(), "event review source must import");
+    InMemoryCredentialStore credentials;
+    ProviderConnectionService connections(database, credentials);
+    xuyan::domain::ProviderConnection connection;
+    connection.id = "event-review-provider"; connection.name = "无网络测试连接";
+    connection.kind = "deepseek"; connection.endpoint = "https://api.deepseek.com";
+    connection.default_model = "deepseek-flash"; connection.data_policy = "remote_allowed";
+    require(connections.save("event-review-connection", connection, 0, std::string{"synthetic-test-secret"}).ok(),
+            "event review credentials must remain in memory without sending requests");
+    ExtractionJobService jobs(database);
+    auto job = jobs.create("event-review-job", source.value->id, 6000, 0, 0, 1200,
+                           connection.id);
+    require(job.ok() && job.value->total_steps == 2, "event review job must preserve two chapters");
+    CandidateService service(database);
+    auto first = jobs.claimNext("event-review-first", job.value->id, job.value->revision);
+    require(first.ok(), "first event review chapter must be claimable");
+    auto empty = service.ingestStepOutput("event-review-empty", job.value->id, first.value->ordinal,
+        first.value->attempt, R"({"schema_version":"candidate-v2","prompt_version":"extract-v2","candidates":[]})");
+    require(empty.ok(), "empty first chapter must commit");
+    auto step = jobs.claimNext("event-review-second", job.value->id, empty.value->revision);
+    require(step.ok(), "second event review chapter must be claimable");
+    auto quote = sources.evidenceText(source.value->id, step.value->start_codepoint, step.value->end_codepoint);
+    require(quote.ok(), "second chapter quote must be readable");
+    const JsonValue fields{JsonValue::Object{{"action", "找到钥匙"},
+        {"participants", JsonValue::Array{"林舟"}}, {"location", "北门"}, {"time_text", "翌日"}}};
+    JsonValue::Array items;
+    for (int index = 0; index < 5; ++index) {
+        // 同名候选仍分别校对，不把名称相同当作可以自动合并的依据。
+        items.emplace_back(JsonValue::Object{{"type", "event"}, {"name", "找到钥匙"},
+            {"fields", fields}, {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
+            {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
+            {"quote", *quote.value}, {"provenance_type", "model_inference"}});
+    }
+    const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v2"},
+        {"prompt_version", "extract-v2"}, {"candidates", std::move(items)}});
+    require(service.ingestStepOutput("event-review-output", job.value->id, step.value->ordinal,
+                step.value->attempt, output).ok(), "typed event candidates must ingest");
+    auto page = service.listPage(world.value->id, source.value->id, "candidate", 20, 0);
+    require(page.ok() && page.value->items.size() == 5, "all event candidates must await review");
+    auto timeline = repository.listTimelineEvents(world.value->id, true, std::nullopt);
+    require(timeline.ok() && timeline.value->empty(), "unreviewed events must not enter the timeline");
+    const auto fact = page.value->items[0];
+    sqlite3* opened = nullptr;
+    const auto open_status = sqlite3_open(database.string().c_str(), &opened);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(opened, &sqlite3_close);
+    require(open_status == SQLITE_OK && sql != nullptr, "event review failure fixture must open");
+    // 在最后的专用记录写入处注入失败，验证审核、条目、证据和命令日志一起回滚。
+    require(sqlite3_exec(sql.get(), "CREATE TRIGGER fail_event_projection BEFORE INSERT ON timeline_event "
+        "BEGIN SELECT RAISE(ABORT,'projection failure'); END", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "event projection failure trigger must install");
+    auto failed = service.review("event-review-fact", fact.id, 1, "accepted", fact.name,
+                                  fact.fields_json, "original_fact");
+    require(!failed.ok(), "a failed timeline insert must reject the whole candidate review");
+    auto pending = repository.loadExtractionCandidate(fact.id);
+    require(pending.ok() && pending.value->revision == 1 && pending.value->review_status == "candidate"
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 5
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_command_log") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM evidence_reference") == 0
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity") == 0,
+            "projection failure must leave no partial accepted entity, evidence, history or command");
+    require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_event_projection", nullptr, nullptr, nullptr) == SQLITE_OK,
+            "event projection failure trigger must be removed");
+    const std::array<std::string, 4> provenance{"original_fact", "in_text_claim", "model_inference", "author_setting"};
+    const std::array<std::string, 4> truths{"fact", "claim", "hypothesis", "fact"};
+    for (std::size_t index = 0; index < provenance.size(); ++index) {
+        const auto& candidate = page.value->items[index];
+        const auto command = index == 0 ? "event-review-fact" : "event-review-" + std::to_string(index);
+        // 未知时间必须保留为空；叙事顺序仅取冻结切片序号，不推导绝对日期或因果。
+        const auto reviewed_fields = index == 2
+            ? R"({"action":"找到钥匙","participants":[],"location":"","time_text":""})"
+            : candidate.fields_json;
+        auto accepted = service.review(command, candidate.id, 1, "accepted", candidate.name,
+                                        reviewed_fields, provenance[index]);
+        require(accepted.ok() && accepted.value->revision == 2, "typed event review must accept atomically");
+        auto replay = service.review(command, candidate.id, 1, "accepted", candidate.name,
+                                      reviewed_fields, provenance[index]);
+        require(replay.ok() && replay.value->revision == 2, "event review replay must return its existing revision");
+        auto events = repository.listTimelineEvents(world.value->id, true, std::nullopt);
+        require(events.ok() && events.value->size() == index + 1, "event review replay must not duplicate projections");
+        const auto id = "entity-from-" + candidate.id;
+        const auto event = std::find_if(events.value->begin(), events.value->end(),
+                                       [&](const auto& value) { return value.id == id; });
+        require(event != events.value->end() && event->name == candidate.name
+                    && event->truth_status == truths[index] && event->revision == 1
+                    && event->narrative_order == 2 && !event->story_time
+                    && event->relative_time == (index == 2 ? "" : "翌日")
+                    && event->prerequisites.empty() && event->causes.empty() && event->results.empty(),
+                "event projection must preserve provenance, unknown dates and absence of inferred causal edges");
+        auto entity = repository.loadEntity(id);
+        require(entity.ok() && entity.value->world_id == world.value->id
+                    && entity.value->kind == (truths[index] == "fact" ? "event" : "other"),
+                "claim and hypothesis entities must remain non-facts");
+        auto evidence = EvidenceService(database).listForSource(source.value->id);
+        require(evidence.ok() && std::any_of(evidence.value->begin(), evidence.value->end(),
+            [&](const auto& value) { return value.entity_id == id && value.quote == candidate.quote
+                && value.start_codepoint == candidate.start_codepoint && value.end_codepoint == candidate.end_codepoint
+                && value.quote_hash == candidate.quote_hash && value.provenance_type == provenance[index]; }),
+            "timeline ID must resolve to the accepted entity's exact original evidence");
+        require(!service.review("event-review-again-" + std::to_string(index), candidate.id, 2,
+            "accepted", candidate.name, reviewed_fields, provenance[index]).ok(),
+            "a new review command must not accept an already terminal event again");
+    }
+    const auto& rejected = page.value->items.back();
+    auto review_candidate = rejected;
+    review_candidate.review_status = "accepted";
+    xuyan::domain::WorldEntity proposed_entity;
+    proposed_entity.id = "entity-from-" + rejected.id; proposed_entity.world_id = world.value->id;
+    proposed_entity.name = rejected.name; proposed_entity.kind = "other"; proposed_entity.review_status = "accepted";
+    auto attributes = *xuyan::package::parseJson(rejected.fields_json).value;
+    attributes.object()["xuyan_provenance_type"] = "model_inference";
+    attributes.object()["xuyan_truth_status"] = "hypothesis";
+    proposed_entity.attributes_json = xuyan::package::writeJson(attributes);
+    xuyan::domain::TimelineEvent proposed_event;
+    proposed_event.id = proposed_entity.id; proposed_event.world_id = world.value->id;
+    proposed_event.name = rejected.name; proposed_event.relative_time = "翌日";
+    proposed_event.narrative_order = 2; proposed_event.truth_status = "hypothesis";
+    require(!repository.reviewExtractionCandidate("event-review-missing-projection", review_candidate, 1,
+        proposed_entity).ok(), "direct repository entry must not omit a required event projection");
+    std::vector<xuyan::domain::TimelineEvent> forged_events;
+    auto forged_event = proposed_event; forged_event.truth_status = "fact"; forged_events.push_back(forged_event);
+    forged_event = proposed_event; forged_event.story_time = 100; forged_events.push_back(forged_event);
+    forged_event = proposed_event; forged_event.causes = {"invented-cause"}; forged_events.push_back(forged_event);
+    forged_event = proposed_event; forged_event.narrative_order = 1; forged_events.push_back(forged_event);
+    forged_event = proposed_event; forged_event.world_id = other_world.value->id; forged_events.push_back(forged_event);
+    forged_event = proposed_event; forged_event.id = "unrelated-record"; forged_events.push_back(forged_event);
+    forged_event = proposed_event; forged_event.relative_time = "臆造时间"; forged_events.push_back(forged_event);
+    for (std::size_t index = 0; index < forged_events.size(); ++index)
+        require(!repository.reviewExtractionCandidate("event-review-forged-" + std::to_string(index),
+            review_candidate, 1, proposed_entity, forged_events[index]).ok(),
+            "direct repository entry must reject forged projection semantics before writing");
+    auto cross_entity = proposed_entity; cross_entity.world_id = other_world.value->id;
+    auto cross_event = proposed_event; cross_event.world_id = other_world.value->id;
+    require(!repository.reviewExtractionCandidate("event-review-cross-world", review_candidate, 1,
+        cross_entity, cross_event).ok(), "a consistent-looking projection must not accept into another source world");
+    auto fact_kind = proposed_entity; fact_kind.kind = "event";
+    require(!repository.reviewExtractionCandidate("event-review-promoted-entity", review_candidate, 1,
+        fact_kind, proposed_event).ok(), "hypothesis timeline projection must not create a fact-class entity");
+    auto downgraded = review_candidate; downgraded.schema_version = "candidate-v1"; downgraded.prompt_version = "extract-v1";
+    require(!repository.reviewExtractionCandidate("event-review-downgraded", downgraded, 1, proposed_entity).ok(),
+            "changing protocol identity must not bypass the required typed event projection");
+    auto changed_type = review_candidate; changed_type.candidate_type = "rule";
+    require(!repository.reviewExtractionCandidate("event-review-retyped", changed_type, 1, proposed_entity).ok(),
+            "changing candidate type must not bypass the required event projection");
+    auto forged_candidate = rejected;
+    forged_candidate.review_status = "conflicted";
+    forged_candidate.quote = "篡改后的证据"; forged_candidate.quote_hash = xuyan::domain::sha256(forged_candidate.quote);
+    require(!repository.reviewExtractionCandidate("event-review-forged-evidence", forged_candidate, 1, std::nullopt).ok(),
+            "direct repository entry must reject rehashed evidence changes during review");
+    forged_candidate = rejected; forged_candidate.review_status = "conflicted"; forged_candidate.step_ordinal = 1;
+    require(!repository.reviewExtractionCandidate("event-review-forged-order", forged_candidate, 1, std::nullopt).ok(),
+            "direct repository entry must reject changed frozen slice identity");
+    auto fact_entity = repository.loadEntity("entity-from-" + fact.id);
+    require(fact_entity.ok(), "accepted fact must remain readable");
+    auto fact_candidate = fact; fact_candidate.provenance_type = "original_fact"; fact_candidate.review_status = "accepted";
+    auto fact_event = proposed_event; fact_event.id = fact_entity.value->id; fact_event.name = fact.name; fact_event.truth_status = "fact";
+    fact_entity.value->description += "改变命令内容";
+    auto changed_replay = repository.reviewExtractionCandidate("event-review-fact", fact_candidate, 1,
+        *fact_entity.value, fact_event);
+    require(!changed_replay.ok() && changed_replay.error->code == xuyan::domain::ErrorCode::command_conflict,
+            "event acceptance replay must include entity and projection contents in its command identity");
+    fact_entity = repository.loadEntity("entity-from-" + fact.id);
+    fact_entity.value->aliases = {"新增别名"};
+    changed_replay = repository.reviewExtractionCandidate("event-review-fact", fact_candidate, 1,
+        *fact_entity.value, fact_event);
+    require(!changed_replay.ok() && changed_replay.error->code == xuyan::domain::ErrorCode::command_conflict,
+            "event acceptance replay must also bind aliases and tags");
+    // 重建旧版通用审核日志和缺少专用记录的历史状态；升级后重放只读，不隐式补写历史资料。
+    const auto legacy_payload = fact.id + "|1|accepted|" + fact.name + '|' + fact.fields_json + "|original_fact";
+    sqlite3_stmt* prepared = nullptr;
+    require(sqlite3_prepare_v2(sql.get(), "UPDATE candidate_review_command_log SET payload_hash=? WHERE command_id='event-review-fact'",
+        -1, &prepared, nullptr) == SQLITE_OK, "legacy review log fixture must prepare");
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> legacy_log(prepared, &sqlite3_finalize);
+    require(sqlite3_bind_text(legacy_log.get(), 1, legacy_payload.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK
+                && sqlite3_step(legacy_log.get()) == SQLITE_DONE && sqlite3_changes(sql.get()) == 1,
+            "legacy review log fixture must update exactly one owned row");
+    legacy_log.reset(); prepared = nullptr;
+    require(sqlite3_prepare_v2(sql.get(), "DELETE FROM timeline_event WHERE id=?", -1, &prepared, nullptr) == SQLITE_OK,
+            "legacy event fixture must prepare");
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> legacy_event(prepared, &sqlite3_finalize);
+    require(sqlite3_bind_text(legacy_event.get(), 1, fact_event.id.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK
+                && sqlite3_step(legacy_event.get()) == SQLITE_DONE && sqlite3_changes(sql.get()) == 1,
+            "legacy event fixture must remove only the owned projection");
+    legacy_event.reset();
+    auto historical_replay = service.review("event-review-fact", fact.id, 1, "accepted", fact.name,
+        fact.fields_json, "original_fact");
+    require(historical_replay.ok() && historical_replay.value->revision == 2
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM timeline_event") == 3
+                && !service.review("event-review-fact", fact.id, 1, "accepted", fact.name + "改",
+                    fact.fields_json, "original_fact").ok(),
+            "historical replay must remain idempotent and must not silently backfill or change an old acceptance");
+    require(repository.saveTimelineEvent("event-review-manual-history", fact_event, 0).ok(),
+            "only an explicit separate command may populate a missing historical timeline record");
+    require(service.review("event-review-reject", rejected.id, 1, "rejected", rejected.name,
+        rejected.fields_json, "model_inference").ok(), "rejected event must retain its review state");
+    auto others = repository.listTimelineEvents(other_world.value->id, true, std::nullopt);
+    require(others.ok() && others.value->empty()
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM timeline_event") == 4
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance") == 4
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM evidence_reference") == 4
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 10,
+            "event projection must remain world-scoped and rejection must create no specialized record");
+    xuyan::storage::WorkspaceRepository reopened(database);
+    auto persisted = reopened.listTimelineEvents(world.value->id, true, std::nullopt);
+    require(persisted.ok() && persisted.value->size() == 4,
+            "accepted event projections must survive a new repository connection");
+}
+
 /** @brief 验证主干预览的可逆句段覆盖、密度档位和唯一引文原文映射。 */
 void testNarrativeBackbonePreviewAndEvidenceMapping() {
     const auto temporary_root = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
@@ -3617,6 +3865,7 @@ int main() {
         testOfflineBatchCheckpoints();
         testPersistentExtractionQueue();
         testScopedCandidatePaging();
+        testAcceptedEventTimelineProjection();
         testNarrativeBackbonePreviewAndEvidenceMapping();
         testCharacterBlueprintVersioning();
         testWorldPackageRoundTripAndAtomicImport();

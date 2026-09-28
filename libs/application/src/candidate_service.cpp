@@ -165,6 +165,7 @@ Result<xuyan::domain::ExtractionCandidatePage> CandidateService::listPage(
     }
 }
 
+/** @brief 保存人工审核，按来源性质生成条目和类型化事件投影，并在同一仓储事务中提交。 */
 Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
     const std::string& command_id, const std::string& candidate_id, int expected_revision,
     const std::string& review_status, const std::string& name,
@@ -184,6 +185,7 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
             if (!valid.ok()) return Result<xuyan::domain::ExtractionCandidate>::failure(*valid.error);
         }
         std::optional<xuyan::domain::WorldEntity> entity;
+        std::optional<xuyan::domain::TimelineEvent> timeline;
         // 接受候选时仍按来源类型区分事实、原文人物说法和模型假设。
         if (review_status == "accepted") {
             auto source = repository.loadSource(candidate.source_id);
@@ -209,9 +211,20 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
                     ? "作者保留的模型推断，仍是待验证假设。证据引文：" + candidate.quote
                     : "由提取候选审核接受的事实。证据引文：" + candidate.quote;
             value.attributes_json = xuyan::package::writeJson(enriched_fields); value.review_status = "accepted";
+            if (candidate.schema_version == typedCandidateSchemaVersion && candidate.candidate_type == "event") {
+                xuyan::domain::TimelineEvent event;
+                // 与接受条目共用稳定标识，现有证据查询可直接回到原文；说法和假设不升级为事实。
+                event.id = value.id; event.world_id = value.world_id; event.name = value.name;
+                event.truth_status = truth_status;
+                event.narrative_order = candidate.step_ordinal;
+                event.relative_time = fields.value->find("time_text")->string();
+                // 文本切片序号仅表示本来源的叙述位置，不生成绝对故事时间或前因后果边。
+                timeline = std::move(event);
+            }
             entity = std::move(value);
         }
-        return repository.reviewExtractionCandidate(command_id, std::move(candidate), expected_revision, std::move(entity));
+        return repository.reviewExtractionCandidate(command_id, std::move(candidate), expected_revision,
+                                                      std::move(entity), std::move(timeline));
     } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionCandidate>::failure(
         {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }

@@ -125,6 +125,42 @@ Item {
             tryCompare(dialog, "remaining", 3)
             tryCompare(backend, "startCount", 0)
         }
+        /** @brief 单步发送确认框按退出键关闭时，不执行抽样或批量解析。 */
+        function test_remoteEscapeDoesNotSend() {
+            setJob(true, 0)
+            const page = createTemporaryObject(taskComponent, root)
+            verify(!!page, "Component exists")
+            const dialog = findChild(page, "remoteConfirm")
+            verify(!!dialog, "Object exists")
+            // 只准备弹窗的公开状态，关闭路径不访问未命名按钮或真实网络端口。
+            dialog.jobId = "owned-ui-job"
+            dialog.ordinal = 1; dialog.startCodepoint = 0; dialog.endCodepoint = 100
+            dialog.open()
+            tryCompare(dialog, "visible", true)
+            tryCompare(backend, "sampleCount", 0)
+            dialog.contentItem.forceActiveFocus()
+            keyClick(Qt.Key_Escape)
+            tryCompare(dialog, "visible", false)
+            tryCompare(backend, "sampleCount", 0)
+            tryCompare(backend, "startCount", 0)
+        }
+        /** @brief 取消确认框按退出键关闭时，原任务继续运行且不提交取消。 */
+        function test_cancelEscapeKeepsRunning() {
+            setJob(false, 0)
+            backend.running = true; backend.activeJobId = "owned-ui-job"
+            const page = createTemporaryObject(taskComponent, root)
+            verify(!!page, "Component exists")
+            const cancel = findChild(page, "cancelJob_owned-ui-job")
+            const dialog = findChild(page, "cancelConfirm")
+            verify(!!cancel, "Object exists"); verify(!!dialog, "Object exists")
+            mouseClick(cancel)
+            tryCompare(dialog, "visible", true)
+            dialog.contentItem.forceActiveFocus()
+            keyClick(Qt.Key_Escape)
+            tryCompare(dialog, "visible", false)
+            tryCompare(backend, "cancelCount", 0)
+            tryCompare(backend, "running", true)
+        }
         /** @brief 运行中即使列表刷新忙碌也能取消，且必须通过确认弹窗。 */
         function test_cancelWhileRunningAndRefreshing() {
             setJob(false, 0)

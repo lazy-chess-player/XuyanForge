@@ -224,10 +224,11 @@ public:
     /** @brief 读取单个抽取候选及其原文证据元数据。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> loadExtractionCandidate(
         const std::string& candidate_id);
-    /** @brief 按预期修订审核候选，并可同时落库被接受的实体。 */
+    /** @brief 按预期修订原子保存候选、条目及证据；类型化事件接受时必须同时提交一致的时间线投影。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> reviewExtractionCandidate(
         const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,
-        std::optional<xuyan::domain::WorldEntity> accepted_entity);
+        std::optional<xuyan::domain::WorldEntity> accepted_entity,
+        std::optional<xuyan::domain::TimelineEvent> accepted_timeline = std::nullopt);
     /** @brief 按修订保存实体的时间与人物可见范围。 */
     xuyan::domain::Result<xuyan::domain::EntityRetrievalScope> saveEntityRetrievalScope(
         const std::string& command_id, xuyan::domain::EntityRetrievalScope scope, int expected_revision);
