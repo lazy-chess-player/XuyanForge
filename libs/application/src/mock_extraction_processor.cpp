@@ -9,6 +9,9 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace xuyan::application {
@@ -18,6 +21,45 @@ namespace {
 std::string commandId(std::string_view prefix, const std::string& job_id, int revision) {
     return std::string(prefix) + '-' + xuyan::domain::sha256(job_id + '|' + std::to_string(revision)).substr(0, 24);
 }
+
+/** @brief 用短锁保护进程内正在执行的工作区/任务集合，不持锁执行 SQL 或调用用户回调。 */
+struct BatchRegistry {
+    std::mutex mutex;
+    std::unordered_set<std::string> active;
+};
+
+/** @brief 返回进程内唯一的离线批次登记表。 */
+BatchRegistry& batchRegistry() {
+    static BatchRegistry registry;
+    return registry;
+}
+
+/** @brief 以作用域登记防止同一任务的批次重复启动，异常返回也会释放登记。 */
+class BatchLease {
+public:
+    /** @brief 按规范化数据库路径和任务 ID 登记一次批次，不阻塞等待已有批次。 */
+    BatchLease(const std::filesystem::path& database, const std::string& job_id)
+        : key_(std::filesystem::weakly_canonical(database).generic_string() + '\n' + job_id) {
+        auto& registry = batchRegistry();
+        std::lock_guard lock(registry.mutex);
+        acquired_ = registry.active.insert(key_).second;
+    }
+    /** @brief 仅移除本对象成功取得的登记，不干扰其他正在运行的批次。 */
+    ~BatchLease() {
+        if (acquired_) {
+            auto& registry = batchRegistry();
+            std::lock_guard lock(registry.mutex);
+            registry.active.erase(key_);
+        }
+    }
+    BatchLease(const BatchLease&) = delete;
+    BatchLease& operator=(const BatchLease&) = delete;
+    /** @brief 判断是否成功取得本工作区/任务的独占批次登记。 */
+    bool acquired() const noexcept { return acquired_; }
+private:
+    std::string key_;
+    bool acquired_{false};
+};
 
 } // namespace
 
@@ -104,18 +146,67 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> MockExtractionProcessor::pro
     return committed;
 }
 
+xuyan::domain::Result<OfflineBatchResult> MockExtractionProcessor::processBatch(
+    const std::string& job_id, const OfflineBatchOptions& options) {
+    using Result = xuyan::domain::Result<OfflineBatchResult>;
+    using xuyan::domain::ErrorCode;
+    if (options.maximum_steps < 1 || options.maximum_steps > 100000)
+        return Result::failure({ErrorCode::validation_failed, "离线执行步骤上限无效", false, "使用 1—100000"});
+    try {
+        BatchLease lease(database_path_, job_id);
+        if (!lease.acquired()) return Result::failure(
+            {ErrorCode::rule_conflict, "此小说解析任务已有批次正在执行", false, "等待已有批次停止后继续"});
+        ExtractionJobService jobs(database_path_);
+        auto current = jobs.load(job_id);
+        if (!current.ok()) return Result::failure(*current.error);
+        int processed = 0;
+        for (;;) {
+            // 初始状态及每片已落盘的检查点才发通知；不把整本正文或候选输出送入进度回调。
+            auto action = OfflineBatchAction::proceed;
+            if (options.on_progress) {
+                try {
+                    action = options.on_progress({job_id, current.value->total_steps,
+                        current.value->completed_steps, processed, current.value->revision});
+                } catch (...) {
+                    return Result::failure({ErrorCode::validation_failed,
+                        "离线解析进度通知失败；已提交切片仍保留", true, "修复进度接收方后从检查点继续"});
+                }
+            }
+            // 最后一个切片已完成时优先报告完成，不能再把完成任务改写成取消。
+            if (current.value->status == "completed") return Result::success(
+                {std::move(*current.value), processed, OfflineBatchStopReason::completed});
+            if (current.value->status == "cancelled") return Result::success(
+                {std::move(*current.value), processed, OfflineBatchStopReason::cancelled});
+            if (current.value->status == "needs_attention") return Result::success(
+                {std::move(*current.value), processed, OfflineBatchStopReason::needs_attention});
+            if (action == OfflineBatchAction::cancel) {
+                // 在当前事务结束后持久化取消；剩余 ready 切片作废，已经提交的证据与候选不删除。
+                auto cancelled = jobs.cancel(commandId("offline-batch-cancel", job_id, current.value->revision),
+                                             job_id, current.value->revision);
+                if (!cancelled.ok()) return Result::failure(*cancelled.error);
+                return Result::success({std::move(*cancelled.value), processed, OfflineBatchStopReason::cancelled});
+            }
+            if (action == OfflineBatchAction::pause || options.stop_token.stop_requested())
+                return Result::success({std::move(*current.value), processed, OfflineBatchStopReason::paused});
+            if (processed == options.maximum_steps) return Result::success(
+                {std::move(*current.value), processed, OfflineBatchStopReason::step_limit});
+            current = processNext(job_id);
+            if (!current.ok()) return Result::failure(*current.error);
+            ++processed;
+        }
+    } catch (const std::exception&) {
+        // 不暴露路径、SQL 或回调中的私人内容；已提交步骤由原有事务与幂等命令保护。
+        return Result::failure({ErrorCode::storage_error, "离线解析批次无法继续", true, "检查工作区后从检查点继续"});
+    }
+}
+
 xuyan::domain::Result<xuyan::domain::ExtractionJob> MockExtractionProcessor::processAll(
     const std::string& job_id, int maximum_steps) {
-    if (maximum_steps < 1 || maximum_steps > 100000) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
-        {xuyan::domain::ErrorCode::validation_failed, "Mock 执行步骤上限无效", false, "使用 1—100000"});
-    ExtractionJobService jobs(database_path_);
-    auto current = jobs.load(job_id);
-    for (int step = 0; current.ok() && step < maximum_steps
-         && current.value->status != "completed" && current.value->status != "cancelled"
-         && current.value->status != "needs_attention"; ++step) {
-        current = processNext(job_id);
-    }
-    return current;
+    OfflineBatchOptions options;
+    options.maximum_steps = maximum_steps;
+    auto batch = processBatch(job_id, options);
+    if (!batch.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*batch.error);
+    return xuyan::domain::Result<xuyan::domain::ExtractionJob>::success(std::move(batch.value->job));
 }
 
 } // namespace xuyan::application

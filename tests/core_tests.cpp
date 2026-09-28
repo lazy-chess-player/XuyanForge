@@ -1020,6 +1020,145 @@ void testOfflineMissingAssetRecovery() {
     std::filesystem::remove_all(directory, ignored);
 }
 
+/** @brief 验证批次进度、暂停检查点、重建恢复、取消和回调错误不会重复处理小说片段。 */
+void testOfflineBatchCheckpoints() {
+    using namespace xuyan::application;
+    const auto temporary_root = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = temporary_root / ("xuyanforge-offline-batch-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == temporary_root && std::filesystem::create_directory(directory),
+            "offline batch test must use a new private temporary directory");
+    struct Cleanup {
+        std::filesystem::path root;
+        std::filesystem::path parent;
+        /** @brief 仅清理本测试创建且仍位于精确临时父目录下的文件。 */
+        ~Cleanup() {
+            if (root.parent_path() == parent) {
+                std::error_code ignored;
+                std::filesystem::remove_all(root, ignored);
+            }
+        }
+    } cleanup{directory, temporary_root};
+    const auto database = directory / "workspace.sqlite";
+    const auto manuscript = directory / "synthetic.txt";
+    {
+        std::ofstream output(manuscript, std::ios::binary);
+        for (int chapter = 1; chapter <= 4; ++chapter) {
+            output << "# 第" << chapter << "章\n";
+            for (int line = 0; line < 80; ++line)
+                output << "人物发现新的线索，因此决定离开原地继续调查。\n";
+        }
+    }
+    SourceImportService sources(database);
+    auto source = sources.importTextFile("batch-source", manuscript, "1", "world-batch-test");
+    require(source.ok(), "batch fixture source must import");
+    ExtractionJobService jobs(database);
+    auto job = jobs.create("batch-paused-job", source.value->id, 500, 0);
+    require(job.ok() && job.value->total_steps > 5, "batch fixture must contain multiple steps");
+    MockExtractionProcessor offline(database);
+    OfflineBatchOptions pause;
+    int notifications = 0;
+    pause.on_progress = [&](const OfflineBatchProgress& progress) {
+        require(progress.completed_steps == progress.processed_steps
+                    && progress.completed_steps == notifications,
+                "progress must describe durable checkpoints in order");
+        auto persisted = jobs.load(progress.job_id);
+        require(persisted.ok() && persisted.value->completed_steps == progress.completed_steps,
+                "progress must not announce an uncommitted step");
+        ++notifications;
+        return progress.processed_steps == 2 ? OfflineBatchAction::pause : OfflineBatchAction::proceed;
+    };
+    auto paused = offline.processBatch(job.value->id, pause);
+    require(paused.ok() && paused.value->reason == OfflineBatchStopReason::paused
+                && paused.value->processed_steps == 2 && paused.value->job.completed_steps == 2
+                && notifications == 3,
+            "pause must stop at the second committed checkpoint, not finish the full book");
+    require(std::none_of(paused.value->job.steps.begin(), paused.value->job.steps.end(),
+                        [](const auto& step) { return step.status == "running"; }),
+            "pause must not leave an in-flight offline step");
+    MockExtractionProcessor reopened(database);
+    OfflineBatchOptions one_step;
+    one_step.maximum_steps = 1;
+    auto yielded = reopened.processBatch(job.value->id, one_step);
+    require(yielded.ok() && yielded.value->reason == OfflineBatchStopReason::step_limit
+                && yielded.value->processed_steps == 1 && yielded.value->job.completed_steps == 3,
+            "new processor must resume at the next ready step and yield at its batch limit");
+    auto finished = reopened.processBatch(job.value->id);
+    require(finished.ok() && finished.value->reason == OfflineBatchStopReason::completed
+                && finished.value->job.completed_steps == job.value->total_steps
+                && std::all_of(finished.value->job.steps.begin(), finished.value->job.steps.end(),
+                               [](const auto& step) { return step.status == "completed" && step.attempt == 1; }),
+            "resuming must finish every step exactly once");
+    auto finished_again = reopened.processBatch(job.value->id);
+    require(finished_again.ok() && finished_again.value->processed_steps == 0
+                && finished_again.value->job.revision == finished.value->job.revision,
+            "starting a completed batch must not mutate or replay it");
+
+    // 改变切片大小，避免前一个完整任务的逐片缓存把新测试直接变成已完成任务。
+    auto stopped_job = jobs.create("batch-stop-token", source.value->id, 600, 0);
+    require(stopped_job.ok() && stopped_job.value->completed_steps < stopped_job.value->total_steps,
+            "stop-token fixture must retain ready steps");
+    std::stop_source stop;
+    stop.request_stop();
+    OfflineBatchOptions stopped;
+    stopped.stop_token = stop.get_token();
+    auto not_started = offline.processBatch(stopped_job.value->id, stopped);
+    require(not_started.ok() && not_started.value->reason == OfflineBatchStopReason::paused
+                && not_started.value->processed_steps == 0
+                && not_started.value->job.budget.consumed_requests == 0,
+            "an already stopped batch must claim no step or request budget");
+    OfflineBatchOptions cancel;
+    cancel.on_progress = [](const OfflineBatchProgress& progress) {
+        return progress.processed_steps == 1 ? OfflineBatchAction::cancel : OfflineBatchAction::proceed;
+    };
+    auto cancelled = offline.processBatch(stopped_job.value->id, cancel);
+    require(cancelled.ok() && cancelled.value->reason == OfflineBatchStopReason::cancelled
+                && cancelled.value->processed_steps == 1 && cancelled.value->job.cancel_requested
+                && cancelled.value->job.status == "cancelled"
+                && cancelled.value->job.budget.consumed_requests == 1,
+            "checkpoint cancellation must persist and schedule no second step");
+
+    auto callback_job = jobs.create("batch-callback-error", source.value->id, 700, 0);
+    require(callback_job.ok(), "callback-error fixture must create");
+    OfflineBatchOptions failing_callback;
+    failing_callback.on_progress = [](const OfflineBatchProgress& progress) {
+        if (progress.processed_steps == 1) throw std::runtime_error("private-callback-detail");
+        return OfflineBatchAction::proceed;
+    };
+    auto failed_callback = offline.processBatch(callback_job.value->id, failing_callback);
+    auto checkpoint = jobs.load(callback_job.value->id);
+    require(!failed_callback.ok() && failed_callback.error->message.find("private-callback-detail") == std::string::npos
+                && checkpoint.ok() && checkpoint.value->completed_steps == callback_job.value->completed_steps + 1,
+            "callback errors must preserve the committed checkpoint without leaking callback details");
+    auto recovered = offline.processBatch(callback_job.value->id, one_step);
+    require(recovered.ok() && recovered.value->job.completed_steps == callback_job.value->completed_steps + 2,
+            "callback failure must release the batch guard and allow checkpoint recovery");
+    std::stop_source running_stop;
+    OfflineBatchOptions stopping;
+    stopping.stop_token = running_stop.get_token();
+    stopping.on_progress = [&](const OfflineBatchProgress& progress) {
+        if (progress.processed_steps == 1) running_stop.request_stop();
+        return OfflineBatchAction::proceed;
+    };
+    auto stopped_after_start = offline.processBatch(callback_job.value->id, stopping);
+    require(stopped_after_start.ok() && stopped_after_start.value->processed_steps == 1
+                && stopped_after_start.value->reason == OfflineBatchStopReason::paused,
+            "a stop requested during processing must schedule no further step after the checkpoint");
+
+    auto duplicate_job = jobs.create("batch-duplicate-start", source.value->id, 800, 0);
+    require(duplicate_job.ok(), "duplicate-start fixture must create");
+    bool duplicate_rejected = false;
+    OfflineBatchOptions duplicate;
+    duplicate.on_progress = [&](const OfflineBatchProgress&) {
+        auto nested = reopened.processBatch(duplicate_job.value->id, one_step);
+        duplicate_rejected = !nested.ok() && nested.error->code == xuyan::domain::ErrorCode::rule_conflict;
+        return OfflineBatchAction::pause;
+    };
+    auto unique = offline.processBatch(duplicate_job.value->id, duplicate);
+    require(unique.ok() && unique.value->processed_steps == 0 && duplicate_rejected,
+            "same workspace/job batch must reject a duplicate start without holding locks across callbacks");
+}
+
 /** @brief 验证持久化提取队列、切片边界、预算、恢复、缓存和审核流程。 */
 void testPersistentExtractionQueue() {
     const auto directory = std::filesystem::temp_directory_path() / "xuyanforge-extraction-tests";
@@ -2330,14 +2469,27 @@ void testSyntheticTenMillionCodepointPipeline() {
                 "ten-million-codepoint chunks must not cross chapter boundaries");
     }
     xuyan::application::MockExtractionProcessor offline(database);
-    auto sampled = offline.processAll(job.value->id, 1);
-    require(sampled.ok() && sampled.value->completed_steps == 1,
-            "one offline sample must finish without processing the full book");
+    xuyan::application::OfflineBatchOptions pause;
+    pause.on_progress = [](const xuyan::application::OfflineBatchProgress& progress) {
+        return progress.processed_steps == 1 ? xuyan::application::OfflineBatchAction::pause
+                                            : xuyan::application::OfflineBatchAction::proceed;
+    };
+    auto sampled = offline.processBatch(job.value->id, pause);
+    require(sampled.ok() && sampled.value->job.completed_steps == 1
+                && sampled.value->reason == xuyan::application::OfflineBatchStopReason::paused,
+            "long-form batch must persist and pause at one committed checkpoint");
+    xuyan::application::OfflineBatchOptions one_step;
+    one_step.maximum_steps = 1;
+    auto resumed = xuyan::application::MockExtractionProcessor(database).processBatch(job.value->id, one_step);
+    require(resumed.ok() && resumed.value->job.completed_steps == 2
+                && resumed.value->reason == xuyan::application::OfflineBatchStopReason::step_limit
+                && resumed.value->job.steps.front().attempt == 1,
+            "long-form checkpoint must resume at the next step without replaying the first one");
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     std::cout << "Synthetic long-form validation: " << expected_han_characters << " Han characters, "
               << expected_codepoints << " codepoints, "
               << source.value->chapters.size() << " chapters, " << job.value->total_steps
-              << " chunks, one offline sample in " << seconds << " seconds.\n";
+              << " chunks, two offline steps with pause/resume in " << seconds << " seconds.\n";
 }
 
 } // namespace
@@ -2495,6 +2647,7 @@ int main() {
         testEntityCrudSearchAndOptimisticLocking();
         testSourceImportAndCodepointEvidence();
         testOfflineMissingAssetRecovery();
+        testOfflineBatchCheckpoints();
         testPersistentExtractionQueue();
         testScopedCandidatePaging();
         testNarrativeBackbonePreviewAndEvidenceMapping();
