@@ -2449,7 +2449,7 @@ COMMIT;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> verification(upgraded_database, &sqlite3_close);
     require(reopened_result == SQLITE_OK && verification != nullptr,
             "upgraded candidate fixture database must reopen");
-    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 29
+    require(sqliteScalar(verification.get(), "PRAGMA user_version") == 30
                 && sqliteScalar(verification.get(),
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_candidate_scope_page'") == 1
                 && sqliteScalar(verification.get(), "SELECT COUNT(*) FROM candidate_review_history") == 9,
@@ -2577,7 +2577,7 @@ void testGraphSemanticsMigrationAndExplicitWrites() {
         xuyan::storage::WorkspaceRepository migrated(database);
         const auto relations = migrated.listDirectedRelations("graph-migration-world", {}, std::nullopt, {}, true);
         const auto map = migrated.loadMapView("graph-migration-world");
-        require(sqliteScalar(sql.get(), "PRAGMA user_version") == 29 && relations.ok() && relations.value->size() == 1
+        require(sqliteScalar(sql.get(), "PRAGMA user_version") == 30 && relations.ok() && relations.value->size() == 1
                     && relations.value->front().strength == std::optional<int>{0} && !relations.value->front().bidirectional
                     && relations.value->front().truth_status == "hypothesis" && map.ok() && map.value->locations.size() == 1
                     && map.value->locations.front().image_x == std::optional<int>{0}
@@ -2634,7 +2634,7 @@ void testGraphSemanticsMigrationAndExplicitWrites() {
     require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_graph_migration", nullptr, nullptr, nullptr) == SQLITE_OK,
             "migration rollback fixture must remove its fault trigger");
     { xuyan::storage::WorkspaceRepository retry(database); }
-    require(sqliteScalar(sql.get(), "PRAGMA user_version") == 29, "migration must retry after failure");
+    require(sqliteScalar(sql.get(), "PRAGMA user_version") == 30, "migration must retry after failure");
     require(sqlite3_exec(sql.get(), "DELETE FROM relation_semantics", nullptr, nullptr, nullptr) == SQLITE_OK,
             "current-version missing semantics fixture must remove only its owned row");
     {
@@ -2643,11 +2643,11 @@ void testGraphSemanticsMigrationAndExplicitWrites() {
                     && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM relation_semantics") == 0,
                 "current-version missing semantics must fail closed without guessing known zero or repairing rows");
     }
-    require(sqlite3_exec(sql.get(), "PRAGMA user_version=30", nullptr, nullptr, nullptr) == SQLITE_OK,
+    require(sqlite3_exec(sql.get(), "PRAGMA user_version=31", nullptr, nullptr, nullptr) == SQLITE_OK,
             "future-version fixture must change only its owned marker");
     rejected = false;
     try { xuyan::storage::WorkspaceRepository future(database); } catch (const std::exception&) { rejected = true; }
-    require(rejected && sqliteScalar(sql.get(), "PRAGMA user_version") == 30
+    require(rejected && sqliteScalar(sql.get(), "PRAGMA user_version") == 31
                 && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM directed_relation") == 1,
             "future schema must be rejected without modifying existing records");
 }
@@ -2958,6 +2958,234 @@ void testAcceptedRelationAndLocationProjection() {
     require(persisted_map.ok() && persisted_map.value->locations.size() == 3
                 && persisted_relations.ok() && persisted_relations.value->size() == 2,
             "location and relationship semantic records must survive reopening");
+}
+
+/** @brief 验证跨章人物合并同步修复关系端点，拆分可追溯且不能覆盖合并后的图编辑。 */
+void testEntityMergeRelationReferenceRepair() {
+    using xuyan::domain::DirectedRelation;
+    using xuyan::domain::WorldEntity;
+    using xuyan::domain::ErrorCode;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-merge-reference-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory), "merge reference test must own its directory");
+    struct Cleanup {
+        std::filesystem::path directory;
+        std::filesystem::path parent;
+        /** @brief 仅清理本次自有目录，保留用户小说、工作区与其他测试资料。 */
+        ~Cleanup() { if (directory.parent_path() == parent) { std::error_code ignored; std::filesystem::remove_all(directory, ignored); } }
+    } cleanup{directory, parent};
+    const auto database = directory / "workspace.sqlite";
+    xuyan::storage::WorkspaceRepository repository(database);
+    require(repository.createWorldTemplate("merge-reference-world", "跨章引用回归").ok(), "merge reference world must create");
+    for (const auto& id : {"source", "target", "third"}) {
+        WorldEntity entity;
+        entity.id = "merge-reference-" + std::string(id); entity.world_id = "merge-reference-world"; entity.kind = "character";
+        entity.name = std::string(id) == "source" ? "林舟" : std::string(id) == "target" ? "阿舟" : "沈棠";
+        require(repository.createEntity("create-" + entity.id, entity).ok(), "merge reference entity must create explicitly");
+    }
+    const auto file = directory / "merge-reference-runtime.md";
+    { std::ofstream text(file, std::ios::binary); text << "# 第一章\n林舟守门。\n# 第二章\n阿舟归来。\n"; require(text.good(), "owned cross-chapter text must write"); }
+    xuyan::application::SourceImportService importer(database);
+    const auto source = importer.importTextFile("merge-reference-import", file, "1", "merge-reference-world");
+    require(source.ok() && source.value->chapters.size() == 2, "merge reference runtime text must import two chapters");
+    xuyan::application::EvidenceService evidence(database);
+    const auto original_evidence = evidence.create("merge-reference-evidence", "merge-reference-source", "description", source.value->id, 0, 2, "original_fact");
+    require(original_evidence.ok(), "merge reference evidence must bind its immutable source interval");
+    DirectedRelation outgoing;
+    outgoing.id = "merge-reference-out"; outgoing.world_id = "merge-reference-world";
+    outgoing.from_entity_id = "merge-reference-source"; outgoing.to_entity_id = "merge-reference-third";
+    outgoing.dimension = "同行"; outgoing.strength.reset(); outgoing.bidirectional = true; outgoing.visibility = "author";
+    require(repository.saveDirectedRelation("merge-reference-out-create", outgoing, 0).ok(), "outgoing relation must save");
+    auto incoming = outgoing;
+    incoming.id = "merge-reference-in"; incoming.from_entity_id = "merge-reference-third"; incoming.to_entity_id = "merge-reference-source";
+    incoming.bidirectional = false; incoming.strength = -25; incoming.valid_from = 10; incoming.valid_to = 40;
+    incoming.evidence_status = "assumption"; incoming.truth_status = "claim"; incoming.visibility = "restricted"; incoming.actor_grants = {"isolated-actor"};
+    require(repository.saveDirectedRelation("merge-reference-in-create", incoming, 0).ok(), "incoming relation must save");
+    auto untouched = outgoing;
+    untouched.id = "merge-reference-untouched"; untouched.from_entity_id = "merge-reference-target"; untouched.strength = 0;
+    require(repository.saveDirectedRelation("merge-reference-untouched-create", untouched, 0).ok(), "unaffected relation must save");
+    const auto published = repository.publishWorldVersion("merge-reference-version", "merge-reference-world", {});
+    require(published.ok() && published.value->members.size() == 3, "historical world version must freeze original entity revisions");
+    const auto merged = repository.mergeEntities("merge-reference-first", "merge-reference-source", 1, "merge-reference-target", 1);
+    require(merged.ok(), "explicit same-world character merge must succeed");
+    auto relations = repository.listDirectedRelations("merge-reference-world", {}, std::nullopt, {}, true);
+    require(relations.ok() && relations.value->size() == 3, "merge must retain every distinct relationship record");
+    for (const auto& relation : *relations.value) {
+        require(relation.from_entity_id != "merge-reference-source" && relation.to_entity_id != "merge-reference-source",
+                "merged relationship endpoints must not point to the tombstoned source entity");
+        if (relation.id == outgoing.id) require(relation.from_entity_id == "merge-reference-target" && relation.revision == 2
+            && relation.bidirectional && !relation.strength && relation.truth_status == "fact", "merge must preserve unknown bidirectional relation semantics");
+        if (relation.id == incoming.id) require(relation.to_entity_id == "merge-reference-target" && relation.revision == 2
+            && !relation.bidirectional && relation.strength == std::optional<int>{-25} && relation.valid_from == 10 && relation.valid_to == 40
+            && relation.truth_status == "claim" && relation.actor_grants == std::vector<std::string>{"isolated-actor"}, "merge must preserve claim, time and actor grants");
+        if (relation.id == untouched.id) require(relation.revision == 1 && relation.strength == std::optional<int>{0}, "unaffected relationship must not change revision or known zero");
+    }
+    const auto moved_evidence = evidence.listForSource(source.value->id);
+    require(moved_evidence.ok() && moved_evidence.value->size() == 1 && moved_evidence.value->front().entity_id == "merge-reference-target"
+        && moved_evidence.value->front().quote_hash == original_evidence.value->quote_hash, "evidence and relationship references must migrate together");
+    require(repository.mergeEntities("merge-reference-first", "merge-reference-source", 1, "merge-reference-target", 1).ok(), "merge replay must not rewrite graph twice");
+    sqlite3* opened = nullptr;
+    const auto opened_status = sqlite3_open(database.string().c_str(), &opened);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(opened, &sqlite3_close);
+    require(opened_status == SQLITE_OK && sql, "merge reference fixture must open its owned database");
+    /** @brief 只执行当前独占临时数据库的故障注入，SQL不包含用户输入或外部素材。 */
+    const auto execute = [&](const char* statement) {
+        require(sqlite3_exec(sql.get(), statement, nullptr, nullptr, nullptr) == SQLITE_OK, "owned merge reference SQL must execute");
+    };
+    execute("DELETE FROM entity_merge_graph_checkpoint; CREATE TEMP TABLE saved_merge_rewrites AS SELECT * FROM entity_relation_rewrite;");
+    const auto missing_checkpoint = repository.splitEntityMerge("merge-reference-missing-checkpoint", merged.value->merge_id, 2, 2);
+    require(!missing_checkpoint.ok() && missing_checkpoint.error->code == ErrorCode::rule_conflict,
+            "current-format merge must not split without its graph checkpoint");
+    execute("INSERT INTO entity_merge_graph_checkpoint SELECT id,'entity-relations-v1',2 FROM entity_merge;"
+        " DELETE FROM entity_relation_rewrite WHERE relation_id='merge-reference-out';");
+    const auto missing_journal = repository.splitEntityMerge("merge-reference-missing-journal", merged.value->merge_id, 2, 2);
+    require(!missing_journal.ok() && missing_journal.error->code == ErrorCode::rule_conflict,
+            "partial relation journal must not allow entity-only split");
+    execute("INSERT INTO entity_relation_rewrite SELECT * FROM saved_merge_rewrites WHERE relation_id='merge-reference-out';"
+        " UPDATE entity_relation_rewrite SET previous_from='merge-reference-third' WHERE relation_id='merge-reference-out';");
+    const auto corrupted_journal = repository.splitEntityMerge("merge-reference-corrupt-journal", merged.value->merge_id, 2, 2);
+    require(!corrupted_journal.ok() && corrupted_journal.error->code == ErrorCode::rule_conflict,
+            "journal must describe exactly the original source-to-target rewrite, not invented endpoints");
+    execute("UPDATE entity_relation_rewrite SET previous_from='merge-reference-source' WHERE relation_id='merge-reference-out';"
+        " DROP TABLE saved_merge_rewrites;");
+    const auto split = repository.splitEntityMerge("merge-reference-first-split", merged.value->merge_id, 2, 2);
+    require(split.ok(), "unedited graph merge must split successfully");
+    relations = repository.listDirectedRelations("merge-reference-world", {}, std::nullopt, {}, true);
+    require(relations.ok(), "split relations must load");
+    for (const auto& relation : *relations.value) {
+        if (relation.id == outgoing.id) require(relation.from_entity_id == "merge-reference-source" && relation.revision == 3, "split must restore outgoing endpoint as a new graph revision");
+        if (relation.id == incoming.id) require(relation.to_entity_id == "merge-reference-source" && relation.revision == 3, "split must restore incoming endpoint as a new graph revision");
+        if (relation.id == untouched.id) require(relation.revision == 1, "split must not rewrite unrelated target relationships");
+    }
+    require(repository.splitEntityMerge("merge-reference-first-split", merged.value->merge_id, 2, 2).ok(), "split replay must not increment graph twice");
+    execute("CREATE TRIGGER fail_merge_reference_graph BEFORE UPDATE ON directed_relation BEGIN SELECT RAISE(ABORT,'owned graph rewrite fault'); END;");
+    const auto failed_merge = repository.mergeEntities("merge-reference-second", "merge-reference-source", 3, "merge-reference-target", 3);
+    require(!failed_merge.ok() && failed_merge.error->code == ErrorCode::storage_error,
+            "late graph rewrite failure must fail the whole merge transaction");
+    require(sqliteScalar(sql.get(), "SELECT COUNT(*) FROM entity_merge") == 1
+        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM entity_merge_graph_checkpoint") == 1
+        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM entity_relation_rewrite") == 2
+        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM entity_merge_command_log") == 2
+        && sqliteScalar(sql.get(), "SELECT head_revision FROM world_entity WHERE id='merge-reference-source'") == 3
+        && sqliteScalar(sql.get(), "SELECT deleted FROM world_entity WHERE id='merge-reference-source'") == 0,
+        "failed merge must roll back journal, checkpoint, history, command and entity revisions");
+    const auto rolled_back_evidence = evidence.listForSource(source.value->id);
+    require(rolled_back_evidence.ok() && rolled_back_evidence.value->front().entity_id == "merge-reference-source",
+            "failed graph rewrite must roll back evidence migration too");
+    execute("DROP TRIGGER fail_merge_reference_graph;");
+    const auto second = repository.mergeEntities("merge-reference-second", "merge-reference-source", 3, "merge-reference-target", 3);
+    require(second.ok(), "a later explicit merge must work with current entity revisions");
+    execute("CREATE TRIGGER fail_split_reference_graph BEFORE UPDATE ON directed_relation BEGIN SELECT RAISE(ABORT,'owned graph restore fault'); END;");
+    const auto failed_split = repository.splitEntityMerge("merge-reference-failed-split", second.value->merge_id, 4, 4);
+    require(!failed_split.ok() && failed_split.error->code == ErrorCode::storage_error
+        && sqliteScalar(sql.get(), "SELECT head_revision FROM world_entity WHERE id='merge-reference-source'") == 4
+        && sqliteScalar(sql.get(), "SELECT deleted FROM world_entity WHERE id='merge-reference-source'") == 1
+        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM entity_merge WHERE active=1") == 1,
+        "late graph restore failure must roll back split entities, evidence and active history");
+    const auto evidence_after_failed_split = evidence.listForSource(source.value->id);
+    require(evidence_after_failed_split.ok() && evidence_after_failed_split.value->front().entity_id == "merge-reference-target",
+            "failed split must leave evidence mapped to the canonical target");
+    execute("DROP TRIGGER fail_split_reference_graph;");
+    outgoing.from_entity_id = "merge-reference-target"; outgoing.dimension = "作者新编辑";
+    require(repository.saveDirectedRelation("merge-reference-edit-after-merge", outgoing, 4).ok(), "author must be able to edit a rewritten relation");
+    const auto blocked = repository.splitEntityMerge("merge-reference-edited-split", second.value->merge_id, 4, 4);
+    require(!blocked.ok() && blocked.error->code == ErrorCode::revision_conflict,
+            "split must reject a graph edited since merge, even if entity revisions did not change");
+    const auto still_merged = repository.loadEntity("merge-reference-source");
+    require(still_merged.ok() && still_merged.value->deleted && still_merged.value->revision == 4,
+            "blocked graph split must not partially restore entities");
+    const auto historical = repository.loadWorldVersion(published.value->id);
+    require(historical.ok() && historical.value->content_hash == published.value->content_hash,
+            "merge must not rewrite immutable published versions");
+    for (const auto& member : historical.value->members) require(member.entity_revision == 1, "historical entity membership must retain revision one");
+
+    for (const auto& id : {"loop-source", "loop-target", "map-source", "map-target"}) {
+        WorldEntity entity;
+        entity.id = "merge-reference-" + std::string(id); entity.world_id = "merge-reference-world";
+        entity.name = "显式独立条目" + std::string(id); entity.kind = std::string(id).starts_with("map-") ? "location" : "character";
+        require(repository.createEntity("create-" + entity.id, entity).ok(), "conflict fixtures must create independent entities");
+    }
+    auto loop = outgoing;
+    loop.id = "merge-reference-loop"; loop.from_entity_id = "merge-reference-loop-source"; loop.to_entity_id = "merge-reference-loop-target";
+    require(repository.saveDirectedRelation("merge-reference-loop-create", loop, 0).ok(), "self-loop risk relation must save before merge");
+    const auto self_loop = repository.mergeEntities("merge-reference-self-loop", loop.from_entity_id, 1, loop.to_entity_id, 1);
+    require(!self_loop.ok() && self_loop.error->code == ErrorCode::rule_conflict,
+            "merge must not silently delete or create a self relationship between alleged duplicate entities");
+    loop.to_entity_id = "merge-reference-third";
+    require(repository.saveDirectedRelation("merge-reference-loop-adjust", loop, 1).ok(), "explicitly edited loop fixture must save");
+    execute("UPDATE directed_relation SET world_id='another-world' WHERE id='merge-reference-loop';");
+    const auto cross_world = repository.mergeEntities("merge-reference-cross-world", "merge-reference-loop-source", 1, "merge-reference-loop-target", 1);
+    require(!cross_world.ok() && cross_world.error->code == ErrorCode::rule_conflict,
+            "merge must refuse corrupt cross-world relationship references without altering entities");
+    execute("UPDATE directed_relation SET world_id='merge-reference-world' WHERE id='merge-reference-loop';"
+        " DELETE FROM relation_semantics WHERE relation_id='merge-reference-loop';");
+    const auto missing_semantics = repository.mergeEntities("merge-reference-missing-semantics", "merge-reference-loop-source", 1, "merge-reference-loop-target", 1);
+    require(!missing_semantics.ok() && missing_semantics.error->code == ErrorCode::rule_conflict,
+            "merge must not conceal missing relationship semantics");
+    xuyan::domain::LocationPlacement mapped;
+    mapped.location_id = "merge-reference-map-source";
+    require(repository.saveLocationPlacement("merge-reference-map-create", mapped, 0).ok(), "dedicated map node fixture must save");
+    const auto map_conflict = repository.mergeEntities("merge-reference-map-conflict", mapped.location_id, 1, "merge-reference-map-target", 1);
+    require(!map_conflict.ok() && map_conflict.error->code == ErrorCode::rule_conflict
+        && sqliteScalar(sql.get(), "SELECT deleted FROM world_entity WHERE id='merge-reference-map-source'") == 0,
+        "generic merge must not silently hide a dedicated map node before specialized conflict resolution exists");
+
+    // 用另一自有数据库复现29版本：历史合并只迁移证据，没有任何关系改写检查点。
+    const auto legacy_database = directory / "legacy.sqlite";
+    {
+        xuyan::storage::WorkspaceRepository legacy(legacy_database);
+        require(legacy.createWorldTemplate("merge-legacy-world", "旧合并迁移回归").ok(), "legacy merge world must create");
+        for (const auto& id : {"source", "target", "third"}) {
+            WorldEntity entity;
+            entity.id = "merge-legacy-" + std::string(id); entity.world_id = "merge-legacy-world";
+            entity.name = "旧合并条目" + std::string(id); entity.kind = "character";
+            require(legacy.createEntity("create-" + entity.id, entity).ok(), "legacy fixture entity must create");
+        }
+        auto relation = outgoing; relation.id = "merge-legacy-relation"; relation.world_id = "merge-legacy-world";
+        relation.from_entity_id = "merge-legacy-source"; relation.to_entity_id = "merge-legacy-third";
+        require(legacy.saveDirectedRelation("merge-legacy-relation-create", relation, 0).ok(), "legacy relationship must save");
+        require(legacy.mergeEntities("merge-legacy-command", "merge-legacy-source", 1, "merge-legacy-target", 1).ok(), "owned legacy merge must create its history");
+    }
+    opened = nullptr;
+    const auto legacy_status = sqlite3_open(legacy_database.string().c_str(), &opened);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> legacy_sql(opened, &sqlite3_close);
+    require(legacy_status == SQLITE_OK && legacy_sql, "legacy fixture database must open");
+    require(sqlite3_exec(legacy_sql.get(), "DROP TABLE entity_relation_rewrite; DROP TABLE entity_merge_graph_checkpoint;"
+        " UPDATE directed_relation SET from_entity_id='merge-legacy-source',revision=1 WHERE id='merge-legacy-relation';"
+        " UPDATE entity_merge_command_log SET payload_hash='merge|merge-legacy-source|1|merge-legacy-target|1';"
+        " CREATE TABLE entity_relation_rewrite(wrong_column INTEGER); PRAGMA user_version=29;", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "legacy fixture must downgrade only its owned schema and log semantics");
+    bool rejected = false;
+    try { xuyan::storage::WorkspaceRepository invalid(legacy_database); } catch (const std::exception&) { rejected = true; }
+    require(rejected && sqliteScalar(legacy_sql.get(), "PRAGMA user_version") == 29
+        && sqliteScalar(legacy_sql.get(), "SELECT COUNT(*) FROM world_entity") == 3
+        && sqliteScalar(legacy_sql.get(), "SELECT COUNT(*) FROM directed_relation") == 1,
+        "faulty29 migration must keep old version, relationships and entities intact");
+    require(sqlite3_exec(legacy_sql.get(), "DROP TABLE entity_relation_rewrite", nullptr, nullptr, nullptr) == SQLITE_OK, "owned migration fault must be removable");
+    xuyan::storage::WorkspaceRepository migrated(legacy_database);
+    require(sqliteScalar(legacy_sql.get(), "PRAGMA user_version") == 30
+        && sqliteScalar(legacy_sql.get(), "SELECT COUNT(*) FROM entity_merge_graph_checkpoint") == 0
+        && sqliteScalar(legacy_sql.get(), "SELECT COUNT(*) FROM entity_relation_rewrite") == 0,
+        "29to30 migration must not guess graph rewrites for historical merges");
+    const auto legacy_replay = migrated.mergeEntities("merge-legacy-command", "merge-legacy-source", 1, "merge-legacy-target", 1);
+    require(legacy_replay.ok(), "legacy merge command must still replay read-only");
+    const auto legacy_split = migrated.splitEntityMerge("merge-legacy-split", legacy_replay.value->merge_id, 2, 2);
+    require(legacy_split.ok(), "legacy entity-and-evidence split must preserve its original scope");
+    const auto legacy_relations = migrated.listDirectedRelations("merge-legacy-world", {}, std::nullopt, {}, true);
+    require(legacy_relations.ok() && legacy_relations.value->size() == 1 && legacy_relations.value->front().from_entity_id == "merge-legacy-source"
+        && legacy_relations.value->front().revision == 1, "legacy replay or split must not invent or rewrite historical graph data");
+    const auto current_merge = migrated.mergeEntities("merge-legacy-current", "merge-legacy-source", 3, "merge-legacy-target", 3);
+    require(current_merge.ok(), "migrated workspace must support a new graph-aware merge");
+    auto author_edit = current_merge.value->target; author_edit.description = "合并后的作者修改必须保留";
+    const auto edited_target = migrated.saveEntity("merge-legacy-author-edit", author_edit, 4);
+    require(edited_target.ok() && edited_target.value->revision == 5, "explicit author edit must advance target revision");
+    const auto edited_entity_split = migrated.splitEntityMerge("merge-legacy-edited-entity-split", current_merge.value->merge_id, 4, 5);
+    require(!edited_entity_split.ok() && edited_entity_split.error->code == ErrorCode::revision_conflict,
+            "passing current entity revisions must not authorize overwriting post-merge author edits");
+    const auto retained_target = migrated.loadEntity("merge-legacy-target");
+    require(retained_target.ok() && retained_target.value->description == author_edit.description && retained_target.value->revision == 5,
+            "blocked split must retain author description and its revision");
 }
 
 /** @brief 验证实体审核保留逐字别名，关系端点只提供当前世界的精确、已确认匹配建议。 */
@@ -4570,6 +4798,7 @@ int main() {
         testScopedCandidatePaging();
         testGraphSemanticsMigrationAndExplicitWrites();
         testAcceptedRelationAndLocationProjection();
+        testEntityMergeRelationReferenceRepair();
         testAcceptedEntityAliasesAndEndpointMatches();
         testAcceptedEventTimelineProjection();
         testNarrativeBackbonePreviewAndEvidenceMapping();

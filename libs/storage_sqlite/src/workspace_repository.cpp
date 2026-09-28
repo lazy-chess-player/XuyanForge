@@ -749,6 +749,122 @@ std::string graphSemanticsUpgradeSql() {
         "CREATE INDEX IF NOT EXISTS idx_candidate_acceptance_entity ON candidate_acceptance(entity_id);";
 }
 
+/** @brief 增加实体合并的关系引用检查点与不可变改写日志，不推断或回填历史合并的图操作。 */
+std::string entityRelationRewriteUpgradeSql() {
+    return "CREATE TABLE IF NOT EXISTS entity_merge_graph_checkpoint("
+        "merge_id TEXT PRIMARY KEY,algorithm_version TEXT NOT NULL,relation_count INTEGER NOT NULL CHECK(relation_count>=0),"
+        "FOREIGN KEY(merge_id) REFERENCES entity_merge(id));"
+        "CREATE TABLE IF NOT EXISTS entity_relation_rewrite("
+        "merge_id TEXT NOT NULL,relation_id TEXT NOT NULL,previous_from TEXT NOT NULL,previous_to TEXT NOT NULL,"
+        "merged_from TEXT NOT NULL,merged_to TEXT NOT NULL,previous_revision INTEGER NOT NULL,merged_revision INTEGER NOT NULL,"
+        "PRIMARY KEY(merge_id,relation_id),FOREIGN KEY(merge_id) REFERENCES entity_merge(id),"
+        "FOREIGN KEY(relation_id) REFERENCES directed_relation(id));"
+        "CREATE INDEX IF NOT EXISTS idx_entity_relation_rewrite_record ON entity_relation_rewrite(relation_id);"
+        "CREATE INDEX IF NOT EXISTS idx_entity_merge_command_merge ON entity_merge_command_log(merge_id);"
+        "CREATE INDEX IF NOT EXISTS idx_directed_relation_from_entity ON directed_relation(from_entity_id);"
+        "CREATE INDEX IF NOT EXISTS idx_directed_relation_to_entity ON directed_relation(to_entity_id);";
+}
+
+/** @brief 在合并事务内有界检查受影响关系，拒绝自环、跨世界、损坏语义及不能安全递增的修订。 */
+Result<int> preflightEntityRelationRewrite(sqlite3* database, const WorldEntity& source, const WorldEntity& target) {
+    // 地图/时间线本体的合并需要另行解决专用字段冲突；不能沿用只合并别名的通用路径。
+    Statement unsupported(database, "SELECT EXISTS(SELECT 1 FROM location_placement WHERE location_id=? OR parent_location_id=?)"
+        " OR EXISTS(SELECT 1 FROM travel_route WHERE from_location_id=? OR to_location_id=?)"
+        " OR EXISTS(SELECT 1 FROM timeline_event WHERE id=?)"
+        " OR EXISTS(SELECT 1 FROM timeline_event_edge WHERE event_id=? OR target_event_id=?)"
+        " OR EXISTS(SELECT 1 FROM directed_relation WHERE id=?)");
+    for (int index = 1; index <= 8; ++index) bindText(unsupported.get(), index, source.id);
+    if (sqlite3_step(unsupported.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database));
+    if (sqlite3_column_int(unsupported.get(), 0)) return Result<int>::failure({ErrorCode::rule_conflict,
+        "源条目含地图、时间线或关系本体，须先处理专用记录冲突，不能仅合并别名", false, "保留资料并校对专用记录"});
+    Statement check(database, "SELECT COUNT(*),COALESCE(MAX(r.world_id<>?),0),"
+        "COALESCE(MAX(r.from_entity_id=r.to_entity_id OR (r.from_entity_id=? AND r.to_entity_id=?) OR (r.from_entity_id=? AND r.to_entity_id=?)),0),"
+        "COALESCE(MAX(r.revision<1 OR r.revision>=?),0),COALESCE(MAX(s.relation_id IS NULL),0)"
+        " FROM directed_relation r LEFT JOIN relation_semantics s ON s.relation_id=r.id WHERE r.from_entity_id=? OR r.to_entity_id=?");
+    bindText(check.get(), 1, source.world_id); bindText(check.get(), 2, source.id); bindText(check.get(), 3, target.id);
+    bindText(check.get(), 4, target.id); bindText(check.get(), 5, source.id);
+    sqlite3_bind_int(check.get(), 6, std::numeric_limits<int>::max() - 1);
+    bindText(check.get(), 7, source.id); bindText(check.get(), 8, source.id);
+    if (sqlite3_step(check.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database));
+    if (sqlite3_column_int(check.get(), 1) || sqlite3_column_int(check.get(), 4))
+        return Result<int>::failure({ErrorCode::rule_conflict, "关系存在跨世界引用或缺失语义，不能合并", false, "先修复关系资料"});
+    if (sqlite3_column_int(check.get(), 2)) return Result<int>::failure({ErrorCode::rule_conflict,
+        "合并会把两个条目之间的关系变成自环，不能自动丢弃或改写该关系", false, "确认是否同一实体并先校对关系"});
+    const auto count = sqlite3_column_int64(check.get(), 0);
+    if (sqlite3_column_int(check.get(), 3) || count < 0 || count > std::numeric_limits<int>::max())
+        return Result<int>::failure({ErrorCode::revision_conflict, "关系修订或改写数量超过可安全处理范围", false, "检查关系修订后重试"});
+    return Result<int>::success(static_cast<int>(count));
+}
+
+/** @brief 在既有合并事务内先记录全部旧/新端点，再集合改写，避免把全量小说关系加载到内存。 */
+void applyEntityRelationRewrite(sqlite3* database, const std::string& merge_id,
+                                const std::string& source_id, const std::string& target_id, int expected_count) {
+    Statement checkpoint(database, "INSERT INTO entity_merge_graph_checkpoint(merge_id,algorithm_version,relation_count) VALUES(?,'entity-relations-v1',?)");
+    bindText(checkpoint.get(), 1, merge_id); sqlite3_bind_int(checkpoint.get(), 2, expected_count);
+    if (sqlite3_step(checkpoint.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
+    Statement journal(database, "INSERT INTO entity_relation_rewrite(merge_id,relation_id,previous_from,previous_to,merged_from,merged_to,previous_revision,merged_revision)"
+        " SELECT ?,id,from_entity_id,to_entity_id,CASE from_entity_id WHEN ? THEN ? ELSE from_entity_id END,"
+        "CASE to_entity_id WHEN ? THEN ? ELSE to_entity_id END,revision,revision+1 FROM directed_relation WHERE from_entity_id=? OR to_entity_id=?");
+    bindText(journal.get(), 1, merge_id); bindText(journal.get(), 2, source_id); bindText(journal.get(), 3, target_id);
+    bindText(journal.get(), 4, source_id); bindText(journal.get(), 5, target_id);
+    bindText(journal.get(), 6, source_id); bindText(journal.get(), 7, source_id);
+    if (sqlite3_step(journal.get()) != SQLITE_DONE || sqlite3_changes(database) != expected_count)
+        throw std::runtime_error("合并关系改写日志数量不一致");
+    Statement update(database, "UPDATE directed_relation SET from_entity_id=(SELECT j.merged_from FROM entity_relation_rewrite j WHERE j.merge_id=? AND j.relation_id=directed_relation.id),"
+        "to_entity_id=(SELECT j.merged_to FROM entity_relation_rewrite j WHERE j.merge_id=? AND j.relation_id=directed_relation.id),revision=revision+1"
+        " WHERE id IN(SELECT relation_id FROM entity_relation_rewrite WHERE merge_id=?)");
+    for (int index = 1; index <= 3; ++index) bindText(update.get(), index, merge_id);
+    if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database) != expected_count)
+        throw std::runtime_error("关系端点合并数量不一致");
+    // 不修改关系ID、专用语义、权限或原文锚点，也不将两条不同关系静默合并。
+}
+
+/** @brief 验证拆分所需的关系日志完整性和当前修订，拒绝覆盖合并之后的编辑或另一次合并。 */
+Result<int> preflightEntityRelationRestore(sqlite3* database, const std::string& merge_id) {
+    Statement checkpoint(database, "SELECT algorithm_version,relation_count FROM entity_merge_graph_checkpoint WHERE merge_id=?");
+    bindText(checkpoint.get(), 1, merge_id);
+    const auto step = sqlite3_step(checkpoint.get());
+    if (step == SQLITE_DONE) {
+        Statement current_format(database, "SELECT 1 FROM entity_merge_command_log WHERE merge_id=? AND payload_hash LIKE 'merge-v2:%' LIMIT 1");
+        bindText(current_format.get(), 1, merge_id);
+        const auto format_step = sqlite3_step(current_format.get());
+        if (format_step == SQLITE_ROW) return Result<int>::failure({ErrorCode::rule_conflict,
+            "本次合并缺少关系检查点，不能自动拆分", false, "保留工作区并检查合并历史"});
+        if (format_step != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
+        // 历史合并没有记录图改写，不根据当前关系猜测过去的端点。
+        return Result<int>::success(0);
+    }
+    if (step != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database));
+    const auto expected_count = sqlite3_column_int64(checkpoint.get(), 1);
+    if (columnText(checkpoint.get(), 0) != "entity-relations-v1" || expected_count < 0 || expected_count > std::numeric_limits<int>::max())
+        return Result<int>::failure({ErrorCode::rule_conflict, "合并关系检查点不受支持", false, "核对工作区版本与历史"});
+    Statement check(database, "SELECT COUNT(*),COALESCE(MAX(r.id IS NULL OR r.revision<>j.merged_revision OR r.from_entity_id<>j.merged_from"
+        " OR r.to_entity_id<>j.merged_to OR r.revision>=? OR r.world_id<>e.world_id OR s.relation_id IS NULL),0),"
+        "COALESCE(MAX((j.previous_from<>m.source_id AND j.previous_to<>m.source_id) OR j.previous_revision<1"
+        " OR j.merged_revision<>j.previous_revision+1 OR j.merged_from=j.merged_to"
+        " OR j.merged_from<>CASE j.previous_from WHEN m.source_id THEN m.target_id ELSE j.previous_from END"
+        " OR j.merged_to<>CASE j.previous_to WHEN m.source_id THEN m.target_id ELSE j.previous_to END),0)"
+        " FROM entity_relation_rewrite j JOIN entity_merge m ON m.id=j.merge_id JOIN world_entity e ON e.id=m.source_id"
+        " LEFT JOIN directed_relation r ON r.id=j.relation_id LEFT JOIN relation_semantics s ON s.relation_id=r.id WHERE j.merge_id=?");
+    sqlite3_bind_int(check.get(), 1, std::numeric_limits<int>::max()); bindText(check.get(), 2, merge_id);
+    if (sqlite3_step(check.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database));
+    if (sqlite3_column_int64(check.get(), 0) != expected_count || sqlite3_column_int(check.get(), 2))
+        return Result<int>::failure({ErrorCode::rule_conflict, "合并关系日志不完整，不能自动拆分", false, "保留资料并检查改写历史"});
+    if (sqlite3_column_int(check.get(), 1)) return Result<int>::failure({ErrorCode::revision_conflict,
+        "合并后关系已修改或再次合并，不能覆盖当前关系自动拆分", false, "先比较关系修订再处理"});
+    return Result<int>::success(static_cast<int>(expected_count));
+}
+
+/** @brief 只恢复日志内的旧端点并追加关系修订，保留合并后新增关系及不可变改写历史。 */
+void restoreEntityRelationRewrite(sqlite3* database, const std::string& merge_id, int expected_count) {
+    Statement update(database, "UPDATE directed_relation SET from_entity_id=(SELECT j.previous_from FROM entity_relation_rewrite j WHERE j.merge_id=? AND j.relation_id=directed_relation.id),"
+        "to_entity_id=(SELECT j.previous_to FROM entity_relation_rewrite j WHERE j.merge_id=? AND j.relation_id=directed_relation.id),revision=revision+1"
+        " WHERE id IN(SELECT relation_id FROM entity_relation_rewrite WHERE merge_id=?)");
+    for (int index = 1; index <= 3; ++index) bindText(update.get(), index, merge_id);
+    if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database) != expected_count)
+        throw std::runtime_error("关系端点拆分数量不一致");
+}
+
 /** @brief 在既有写事务中保存方向、强度已知位及真实性；候选首次投影禁止覆盖同标识语义。 */
 void writeRelationSemantics(sqlite3* database, const xuyan::domain::DirectedRelation& relation, bool insert_only = false) {
     const std::string sql = "INSERT INTO relation_semantics(relation_id,bidirectional,has_strength,truth_status) VALUES(?,?,?,?)"
@@ -912,7 +1028,7 @@ void WorkspaceRepository::migrate() {
         if (sqlite3_step(version.get()) != SQLITE_ROW) throw std::runtime_error("无法读取工作区版本");
         existing_version = sqlite3_column_int(version.get(), 0);
     }
-    if (existing_version > 29)
+    if (existing_version > 30)
         throw std::runtime_error("工作区由更新版本创建；原数据库未修改，请使用匹配的软件版本");
     // 旧版快照列依赖固定测试人物。只迁移没有任何提交的空表，保留用户的其他资料。
     std::vector<std::string> snapshot_columns;
@@ -922,7 +1038,7 @@ void WorkspaceRepository::migrate() {
     }
     const std::vector<std::string> current_columns{
         "branch_id", "commit_id", "parent_commit_id", "state_hash", "state_json", "created_at"};
-    if (existing_version == 29) {
+    if (existing_version == 30) {
         // 已完成迁移的数据库只恢复连接级外键开关，避免每次分页都重扫历史表。
         if (snapshot_columns != current_columns)
             throw std::runtime_error("工作区快照结构不受支持；原数据库未修改，请使用匹配的软件版本");
@@ -930,7 +1046,7 @@ void WorkspaceRepository::migrate() {
             throw std::runtime_error(sqlite3_errmsg(database_));
         return;
     }
-    if (existing_version == 26 || existing_version == 27 || existing_version == 28) {
+    if (existing_version == 26 || existing_version == 27 || existing_version == 28 || existing_version == 29) {
         if (snapshot_columns != current_columns)
             throw std::runtime_error("工作区快照结构不受支持；原数据库未修改，请使用匹配的软件版本");
         // 构造器已持迁移锁，不能再次获取写事务锁；27版本不能自动补齐损坏的输入快照。
@@ -947,7 +1063,8 @@ void WorkspaceRepository::migrate() {
             "INSERT OR IGNORE INTO extraction_job_generation_snapshot(job_id,reasoning_effort,output_format) "
             "SELECT id,'provider_default','provider_schema_v1' FROM extraction_job;";
         // 28只补图语义，不静默修复缺失的冻结输入或生成快照。
-        upgrade_input += graphSemanticsUpgradeSql() + "PRAGMA user_version=29; COMMIT;";
+        if (existing_version < 29) upgrade_input += graphSemanticsUpgradeSql();
+        upgrade_input += entityRelationRewriteUpgradeSql() + "PRAGMA user_version=30; COMMIT;";
         char* message = nullptr;
         if (sqlite3_exec(database_, upgrade_input.c_str(), nullptr, nullptr, &message) != SQLITE_OK) {
             const std::string detail = message == nullptr ? "无法升级解析输入快照" : message;
@@ -1320,7 +1437,7 @@ CREATE TABLE IF NOT EXISTS simulation_director_intervention(
   FOREIGN KEY(session_id) REFERENCES simulation_session(id)
 );
 )SQL";
-    const auto complete_sql = std::string{sql} + graphSemanticsUpgradeSql() + "PRAGMA user_version=29; COMMIT;";
+    const auto complete_sql = std::string{sql} + graphSemanticsUpgradeSql() + entityRelationRewriteUpgradeSql() + "PRAGMA user_version=30; COMMIT;";
     char* message = nullptr;
     if (sqlite3_exec(database_, complete_sql.c_str(), nullptr, nullptr, &message) != SQLITE_OK) {
         const std::string detail = message == nullptr ? "migration failed" : message;
@@ -1717,21 +1834,25 @@ Result<WorldEntity> WorkspaceRepository::deleteEntity(const std::string& command
     return saveEntity(command_id, std::move(*entity.value), expected_revision);
 }
 
+/** @brief 显式合并同世界同类型条目，原子迁移证据和关系端点，并保留可拆分的改写历史。 */
 Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
     const std::string& command_id, const std::string& source_id, int source_expected_revision,
     const std::string& target_id, int target_expected_revision) {
     using MergeResult = xuyan::domain::EntityMergeResult;
     if (source_id.empty() || target_id.empty() || source_id == target_id) return Result<MergeResult>::failure(
         {ErrorCode::validation_failed, "合并源和目标必须是不同的有效条目", false, "重新选择两个条目"});
-    const auto payload = "merge|" + source_id + '|' + std::to_string(source_expected_revision) + '|'
+    const auto legacy_payload = "merge|" + source_id + '|' + std::to_string(source_expected_revision) + '|'
         + target_id + '|' + std::to_string(target_expected_revision);
+    const auto payload = "merge-v2:" + xuyan::domain::sha256(xuyan::package::writeJson(xuyan::package::JsonValue::Object{
+        {"source", source_id}, {"source_revision", source_expected_revision}, {"target", target_id},
+        {"target_revision", target_expected_revision}, {"algorithm", "entity-relations-v1"}}));
     try {
         Transaction transaction(database_);
         {
             Statement replay(database_, "SELECT payload_hash,merge_id FROM entity_merge_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
             if (sqlite3_step(replay.get()) == SQLITE_ROW) {
-                if (columnText(replay.get(), 0) != payload) return Result<MergeResult>::failure(
+                if (columnText(replay.get(), 0) != payload && columnText(replay.get(), 0) != legacy_payload) return Result<MergeResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他合并", false, "生成新的命令标识"});
                 const auto existing_merge = columnText(replay.get(), 1);
                 Statement info(database_, "SELECT source_id,target_id,active FROM entity_merge WHERE id=?");
@@ -1749,6 +1870,11 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
             {ErrorCode::revision_conflict, "合并条目已被修改或删除", false, "刷新两个条目后重试"});
         if (source.world_id != target.world_id || source.kind != target.kind) return Result<MergeResult>::failure(
             {ErrorCode::validation_failed, "只能合并同一世界且类型相同的条目", false, "选择同类重复条目"});
+
+        if (source.revision >= std::numeric_limits<int>::max() || target.revision >= std::numeric_limits<int>::max())
+            return Result<MergeResult>::failure({ErrorCode::revision_conflict, "条目修订已达上限，不能继续合并", false, "检查条目历史"});
+        const auto relation_rewrite = preflightEntityRelationRewrite(database_, source, target);
+        if (!relation_rewrite.ok()) return Result<MergeResult>::failure(*relation_rewrite.error);
 
         const auto source_previous = source.revision; const auto target_previous = target.revision;
         if (source.name != target.name) target.aliases.push_back(source.name);
@@ -1782,6 +1908,8 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
         sqlite3_bind_int(history.get(), 6, source.revision); sqlite3_bind_int(history.get(), 7, target.revision);
         sqlite3_bind_int(history.get(), 8, 1); bindText(history.get(), 9, utcNow());
         if (sqlite3_step(history.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        // 历史、检查点、关系端点及原文证据共用当前事务；任何一步失败都不能留下半个合并。
+        applyEntityRelationRewrite(database_, merge_id, source_id, target_id, *relation_rewrite.value);
         Statement log(database_, "INSERT INTO entity_merge_command_log(command_id,payload_hash,merge_id,created_at) VALUES(?,?,?,?)");
         bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, merge_id); bindText(log.get(), 4, utcNow());
         if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
@@ -1790,19 +1918,23 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
     } catch (const std::exception& exception) { return Result<MergeResult>::failure(storageError(exception)); }
 }
 
+/** @brief 按显式合并历史恢复条目、证据及日志内关系端点，拒绝覆盖之后的图编辑。 */
 Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
     const std::string& command_id, const std::string& merge_id,
     int source_expected_revision, int target_expected_revision) {
     using MergeResult = xuyan::domain::EntityMergeResult;
-    const auto payload = "split|" + merge_id + '|' + std::to_string(source_expected_revision) + '|'
+    const auto legacy_payload = "split|" + merge_id + '|' + std::to_string(source_expected_revision) + '|'
         + std::to_string(target_expected_revision);
+    const auto payload = "split-v2:" + xuyan::domain::sha256(xuyan::package::writeJson(xuyan::package::JsonValue::Object{
+        {"merge", merge_id}, {"source_revision", source_expected_revision}, {"target_revision", target_expected_revision},
+        {"algorithm", "entity-relations-v1"}}));
     try {
         Transaction transaction(database_);
         {
             Statement replay(database_, "SELECT payload_hash FROM entity_merge_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
             if (sqlite3_step(replay.get()) == SQLITE_ROW) {
-                if (columnText(replay.get(), 0) != payload) return Result<MergeResult>::failure(
+                if (columnText(replay.get(), 0) != payload && columnText(replay.get(), 0) != legacy_payload) return Result<MergeResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他拆分", false, "生成新的命令标识"});
                 Statement replay_info(database_, "SELECT source_id,target_id,active FROM entity_merge WHERE id=?");
                 bindText(replay_info.get(), 1, merge_id);
@@ -1824,9 +1956,15 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
         if (target_expected_revision < 0) target_expected_revision = sqlite3_column_int(info.get(), 6);
         const auto source_current = readEntityRevision(database_, source_id);
         const auto target_current = readEntityRevision(database_, target_id);
-        if (source_current.revision != source_expected_revision || target_current.revision != target_expected_revision)
+        // 传入最新修订只证明看过当前条目，不代表授权丢弃合并后的作者修改。
+        if (source_current.revision != source_expected_revision || target_current.revision != target_expected_revision
+            || source_current.revision != sqlite3_column_int(info.get(), 5) || target_current.revision != sqlite3_column_int(info.get(), 6))
             return Result<MergeResult>::failure(
                 {ErrorCode::revision_conflict, "合并后条目已有新修订，不能自动拆分", false, "人工比较修订后处理"});
+        if (source_current.revision >= std::numeric_limits<int>::max() || target_current.revision >= std::numeric_limits<int>::max())
+            return Result<MergeResult>::failure({ErrorCode::revision_conflict, "条目修订已达上限，不能继续拆分", false, "检查条目历史"});
+        const auto relation_restore = preflightEntityRelationRestore(database_, merge_id);
+        if (!relation_restore.ok()) return Result<MergeResult>::failure(*relation_restore.error);
         auto source = readEntityRevision(database_, source_id, source_previous);
         auto target = readEntityRevision(database_, target_id, target_previous);
         source.revision = source_current.revision + 1; source.deleted = false;
@@ -1845,6 +1983,7 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
             if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1)
                 throw std::runtime_error("证据引用拆分失败");
         }
+        restoreEntityRelationRewrite(database_, merge_id, *relation_restore.value);
         Statement history(database_, "UPDATE entity_merge SET active=0,source_split_revision=?,target_split_revision=?,split_at=? WHERE id=? AND active=1");
         sqlite3_bind_int(history.get(), 1, source.revision); sqlite3_bind_int(history.get(), 2, target.revision);
         bindText(history.get(), 3, utcNow()); bindText(history.get(), 4, merge_id);

@@ -28,7 +28,7 @@ public:
     /** @brief 以软删除方式移除条目并保留版本冲突检查。 */
     xuyan::domain::Result<xuyan::domain::WorldEntity> remove(
         const std::string& command_id, const std::string& entity_id, int expected_revision);
-    /** @brief 合并两个条目并原子改写受影响的证据引用。 */
+    /** @brief 显式合并同世界同类条目，原子改写证据及关系端点，专用本体冲突需单独校对。 */
     xuyan::domain::Result<xuyan::domain::EntityMergeResult> merge(
         const std::string& command_id, const std::string& source_id, int source_expected_revision,
         const std::string& target_id, int target_expected_revision);

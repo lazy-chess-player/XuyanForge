@@ -95,7 +95,7 @@ public:
     /** @brief 按预期修订软删除世界实体。 */
     xuyan::domain::Result<xuyan::domain::WorldEntity> deleteEntity(
         const std::string& command_id, const std::string& entity_id, int expected_revision);
-    /** @brief 合并两个实体并保留可逆的来源与目标记录。 */
+    /** @brief 显式合并同类条目，原子改写证据及关系端点并保留历史；专用本体冲突需单独校对。 */
     xuyan::domain::Result<xuyan::domain::EntityMergeResult> mergeEntities(
         const std::string& command_id, const std::string& source_id, int source_expected_revision,
         const std::string& target_id, int target_expected_revision);
