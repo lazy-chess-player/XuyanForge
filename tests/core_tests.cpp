@@ -2527,6 +2527,270 @@ COMMIT;
             "deleted last page must return an empty page with updated total for pagination recovery");
 }
 
+/** @brief 验证实体审核保留逐字别名，关系端点只提供当前世界的精确、已确认匹配建议。 */
+void testAcceptedEntityAliasesAndEndpointMatches() {
+    using namespace xuyan::application;
+    using xuyan::package::JsonValue;
+    const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+    const auto directory = parent / ("xuyanforge-endpoint-review-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
+            "endpoint review must own an isolated temporary workspace");
+    struct Cleanup {
+        std::filesystem::path directory;
+        std::filesystem::path parent;
+        /** @brief 仅清理本次独占的测试目录，不触及用户小说或其他测试工作区。 */
+        ~Cleanup() {
+            if (directory.parent_path() == parent) {
+                std::error_code ignored;
+                std::filesystem::remove_all(directory, ignored);
+            }
+        }
+    } cleanup{directory, parent};
+    const auto database = directory / "workspace.sqlite";
+    xuyan::storage::WorkspaceRepository repository(database);
+    auto world = repository.createWorldTemplate("endpoint-review-world", "端点校对测试");
+    auto other_world = repository.createWorldTemplate("endpoint-review-other", "另一个测试世界");
+    require(world.ok() && other_world.ok(), "endpoint worlds must be created explicitly");
+    const auto file = directory / "private-runtime.md";
+    const std::string long_alias(512, 'a');
+    {
+        std::ofstream output(file, std::ios::binary);
+        output << "# 第一章\n林舟又称阿舟，也称" << long_alias << "。林舟与沈棠共同守门。\n";
+        require(output.good(), "endpoint runtime text must be written");
+    }
+    SourceImportService sources(database);
+    auto source = sources.importTextFile("endpoint-review-source", file, "1", world.value->id);
+    require(source.ok(), "endpoint source must import");
+    InMemoryCredentialStore credentials;
+    ProviderConnectionService connections(database, credentials);
+    xuyan::domain::ProviderConnection connection;
+    connection.id = "endpoint-review-provider"; connection.name = "无网络测试连接";
+    connection.kind = "deepseek"; connection.endpoint = "https://api.deepseek.com";
+    connection.default_model = "deepseek-flash"; connection.data_policy = "remote_allowed";
+    require(connections.save("endpoint-review-connection", connection, 0, std::string{"synthetic-test-secret"}).ok(),
+            "endpoint credentials must remain in memory without sending requests");
+    ExtractionJobService jobs(database);
+    auto job = jobs.create("endpoint-review-job", source.value->id, 6000, 0, 0, 1200, connection.id);
+    require(job.ok(), "endpoint typed job must create");
+    auto step = jobs.claimNext("endpoint-review-claim", job.value->id, job.value->revision);
+    require(step.ok(), "endpoint chapter must be claimable");
+    auto quote = sources.evidenceText(source.value->id, step.value->start_codepoint, step.value->end_codepoint);
+    require(quote.ok(), "endpoint quote must be readable");
+    JsonValue::Array items;
+    for (int index = 0; index < 4; ++index)
+        items.emplace_back(JsonValue::Object{{"type", "entity"}, {"name", "林舟"},
+            {"fields", JsonValue::Object{{"kind", "character"}, {"aliases", JsonValue::Array{"阿舟", long_alias}}}},
+            {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
+            {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
+            {"quote", *quote.value}, {"provenance_type", "model_inference"}});
+    items.emplace_back(JsonValue::Object{{"type", "relation"}, {"name", "共同守门"},
+        {"fields", JsonValue::Object{{"subject", "阿舟"}, {"predicate", "共同守门"}, {"object", "沈棠"}, {"directed", false}}},
+        {"start_codepoint", static_cast<std::int64_t>(step.value->start_codepoint)},
+        {"end_codepoint", static_cast<std::int64_t>(step.value->end_codepoint)},
+        {"quote", *quote.value}, {"provenance_type", "model_inference"}});
+    CandidateService service(database);
+    const auto output = xuyan::package::writeJson(JsonValue::Object{{"schema_version", "candidate-v2"},
+        {"prompt_version", "extract-v2"}, {"candidates", std::move(items)}});
+    require(service.ingestStepOutput("endpoint-review-output", job.value->id, step.value->ordinal,
+                step.value->attempt, output).ok(), "typed endpoint candidates must ingest");
+    auto page = service.listPage(world.value->id, source.value->id, "candidate", 20, 0);
+    require(page.ok() && page.value->total == 5, "endpoint candidates must await explicit review");
+    std::vector<xuyan::domain::ExtractionCandidate> entities;
+    xuyan::domain::ExtractionCandidate relation;
+    for (const auto& candidate : page.value->items) {
+        if (candidate.candidate_type == "entity") entities.push_back(candidate);
+        else relation = candidate;
+    }
+    require(entities.size() == 4 && !relation.id.empty(), "endpoint fixture must contain typed entities and a relation");
+    const std::array<std::string, 4> provenance{"original_fact", "author_setting", "in_text_claim", "model_inference"};
+    sqlite3* opened = nullptr;
+    const auto open_status = sqlite3_open(database.string().c_str(), &opened);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(opened, &sqlite3_close);
+    require(open_status == SQLITE_OK && sql, "endpoint review fault fixture must open its owned database");
+    for (std::size_t index = 0; index < entities.size(); ++index) {
+        const auto& candidate = entities[index];
+        const auto command = "endpoint-accept-" + std::to_string(index);
+        if (index == 0) {
+            require(sqlite3_exec(sql.get(), "CREATE TRIGGER fail_endpoint_evidence BEFORE INSERT ON evidence_reference "
+                "BEGIN SELECT RAISE(ABORT,'evidence failure'); END", nullptr, nullptr, nullptr) == SQLITE_OK,
+                "endpoint evidence failure trigger must install");
+            require(!service.review(command, candidate.id, 1, "accepted", candidate.name,
+                        candidate.fields_json, provenance[index]).ok(), "evidence failure must roll back alias acceptance");
+            const auto pending = repository.loadExtractionCandidate(candidate.id);
+            require(pending.ok() && pending.value->revision == 1 && pending.value->review_status == "candidate"
+                        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM world_entity") == 0
+                        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_acceptance") == 0
+                        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_command_log") == 0
+                        && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM candidate_review_history") == 5,
+                    "failed acceptance must leave no aliases, entities, acceptances, audit commands or new candidate history");
+            require(sqlite3_exec(sql.get(), "DROP TRIGGER fail_endpoint_evidence", nullptr, nullptr, nullptr) == SQLITE_OK,
+                    "endpoint evidence failure trigger must be removed before retrying the same command");
+        }
+        auto accepted = service.review(command, candidate.id, 1, "accepted", candidate.name,
+                                       candidate.fields_json, provenance[index]);
+        require(accepted.ok(), "typed entity aliases allowed by the extraction contract must accept");
+        auto entity = repository.loadEntity("entity-from-" + candidate.id);
+        require(entity.ok() && entity.value->aliases.size() == 2
+                    && std::find(entity.value->aliases.begin(), entity.value->aliases.end(), "阿舟") != entity.value->aliases.end()
+                    && std::find(entity.value->aliases.begin(), entity.value->aliases.end(), long_alias) != entity.value->aliases.end()
+                    && entity.value->kind == (index < 2 ? "character" : "other"),
+                "review must preserve all literal aliases without promoting claims or hypotheses to facts");
+        require(service.review(command, candidate.id, 1, "accepted", candidate.name,
+                    candidate.fields_json, provenance[index]).ok(), "entity alias review replay must be idempotent");
+    }
+    /** @brief 查询当前世界的匹配总数，先检查错误再读取结果，避免测试失败变成空指针访问。 */
+    const auto match_total = [&](const std::string& mention) {
+        const auto matches = service.matchRelationEndpoints(world.value->id, mention);
+        require(matches.ok(), "endpoint count query must succeed");
+        return matches.value->total;
+    };
+    const auto evidence = EvidenceService(database).listForSource(source.value->id);
+    require(evidence.ok() && evidence.value->size() == 4, "each accepted entity must preserve its exact original evidence");
+    for (const auto& item : *evidence.value)
+        require(item.quote == *quote.value && item.quote_hash == xuyan::domain::sha256(*quote.value)
+                    && item.start_codepoint == step.value->start_codepoint && item.end_codepoint == step.value->end_codepoint,
+                "alias acceptance must retain source codepoint ranges and quote hashes without rewriting original text");
+    auto aliases = service.matchRelationEndpoints(world.value->id, "阿舟", 1, 0);
+    require(aliases.ok() && aliases.value->total == 2 && aliases.value->items.size() == 1
+                && aliases.value->world_id == world.value->id && aliases.value->mention == "阿舟"
+                && aliases.value->items.front().alias_match && !aliases.value->items.front().name_match,
+            "only the two confirmed entities may match the exact alias; claims and hypotheses must not match");
+    auto second = service.matchRelationEndpoints(world.value->id, "阿舟", 1, 1);
+    require(second.ok() && second.value->total == 2 && second.value->items.size() == 1
+                && second.value->items.front().entity_id != aliases.value->items.front().entity_id,
+            "same-name endpoints must remain distinct and deterministic across bounded pages");
+    auto names = service.matchRelationEndpoints(world.value->id, "林舟");
+    auto long_names = service.matchRelationEndpoints(world.value->id, long_alias);
+    require(names.ok() && names.value->total == 2 && names.value->items.front().name_match
+                && long_names.ok() && long_names.value->total == 2,
+            "both literal primary names and contract-length aliases must match");
+    for (const auto& mention : {std::string{"舟"}, std::string{"阿"}, std::string{"阿舟%"}, std::string{"阿舟_"},
+                              std::string{"' OR 1=1 --"}, std::string{"阿舟 "}}) {
+        auto result = service.matchRelationEndpoints(world.value->id, mention);
+        require(result.ok() && result.value->total == 0, "substrings, wildcards and SQL text must not broaden exact matching");
+    }
+    /** @brief 显式创建测试条目，避免生产代码预置任何端点、世界或示例资料。 */
+    const auto create = [&](const std::string& id, const std::string& world_id,
+                            const std::string& kind, const std::string& status) {
+        xuyan::domain::WorldEntity value;
+        value.id = id; value.world_id = world_id; value.kind = kind;
+        value.name = "沈棠"; value.aliases = {"阿舟", "ShenTang"}; value.review_status = status;
+        value.description = std::string(10000, 'x');
+        auto created = repository.createEntity("create-" + id, value);
+        require(created.ok(), "endpoint manual fixture must create explicitly");
+        return *created.value;
+    };
+    const auto manual = create("endpoint-manual", world.value->id, "character", "accepted");
+    create("endpoint-other-world", other_world.value->id, "character", "accepted");
+    create("endpoint-event", world.value->id, "event", "accepted");
+    create("endpoint-rule", world.value->id, "rule", "accepted");
+    create("endpoint-pending", world.value->id, "character", "candidate");
+    create("endpoint-rejected", world.value->id, "character", "rejected");
+    create("endpoint-conflicted", world.value->id, "character", "conflicted");
+    auto deleted = create("endpoint-deleted", world.value->id, "character", "accepted");
+    require(repository.deleteEntity("endpoint-delete", deleted.id, 1).ok(), "deleted endpoint fixture must be soft deleted");
+    auto manual_match = service.matchRelationEndpoints(world.value->id, "沈棠");
+    require(manual_match.ok() && manual_match.value->total == 1 && manual_match.value->items.front().entity_id == manual.id,
+            "manual confirmed nouns may match; deleted, unreviewed, event, rule and other-world records must not match");
+    auto other_match = service.matchRelationEndpoints(other_world.value->id, "沈棠");
+    require(other_match.ok() && other_match.value->total == 1
+                && other_match.value->items.front().entity_id == "endpoint-other-world",
+            "each world must return only its own stable endpoint IDs");
+    require(match_total("ShenTang") == 1 && match_total("shentang") == 0,
+            "alias matching must not infer identity by case folding");
+    // 当前名称/别名和修订是建议的依据，历史版本或已删别名不能继续匹配。
+    auto edited = manual; edited.name = "改名后的条目"; edited.aliases = {"新别名"};
+    auto saved = repository.saveEntity("endpoint-edit", edited, 1);
+    require(saved.ok() && match_total("沈棠") == 0,
+            "endpoint suggestions must not match stale entity revisions");
+    auto renamed = service.matchRelationEndpoints(world.value->id, "新别名");
+    require(renamed.ok() && renamed.value->items.front().revision == 2
+                && renamed.value->items.front().name == edited.name, "suggestions must expose the current revision for later binding");
+    // 即使旧通用关系条目被编辑成名词分类，也不能冒充已确认实体端点。
+    require(service.review("endpoint-accept-relation", relation.id, 1, "accepted", relation.name,
+                relation.fields_json, "original_fact").ok(), "generic relation fixture must accept without automatic binding");
+    auto relation_entity = repository.loadEntity("entity-from-" + relation.id);
+    require(relation_entity.ok(), "accepted relation fixture must have a generic entity");
+    relation_entity.value->name = "阿舟"; relation_entity.value->kind = "character";
+    require(repository.saveEntity("endpoint-rename-relation", *relation_entity.value, 1).ok(),
+            "relation noun-disguise fixture must save");
+    require(match_total("阿舟") == 2,
+            "candidate acceptance origin must exclude relations disguised as noun entities");
+    auto hypothesis = repository.loadEntity("entity-from-" + entities[3].id);
+    require(hypothesis.ok(), "hypothesis fixture must load");
+    hypothesis.value->kind = "character"; hypothesis.value->attributes_json = "{}";
+    require(repository.saveEntity("endpoint-disguise-hypothesis", *hypothesis.value, 1).ok()
+                && match_total("林舟") == 2,
+            "candidate provenance must exclude hypotheses even after generic attributes are cleared");
+    for (int index = 0; index < 52; ++index)
+        create("endpoint-many-" + std::to_string(index), world.value->id, "other", "accepted");
+    auto many = service.matchRelationEndpoints(world.value->id, "阿舟", 50, 0);
+    auto tail = service.matchRelationEndpoints(world.value->id, "阿舟", 50, 50);
+    auto beyond = service.matchRelationEndpoints(world.value->id, "阿舟", 50, 1000);
+    require(many.ok() && many.value->total == 54 && many.value->items.size() == 50
+                && tail.ok() && tail.value->total == 54 && tail.value->items.size() == 4
+                && beyond.ok() && beyond.value->total == 54 && beyond.value->items.empty(),
+            "endpoint suggestions must page bounded metadata without truncating the reported ambiguity total");
+    require(!service.matchRelationEndpoints("", "阿舟").ok()
+                && !service.matchRelationEndpoints(world.value->id, "").ok()
+                && !service.matchRelationEndpoints(world.value->id, "   ").ok()
+                && !service.matchRelationEndpoints(world.value->id, std::string(513, 'x')).ok()
+                && !service.matchRelationEndpoints(world.value->id, "阿舟", 0).ok()
+                && !service.matchRelationEndpoints(world.value->id, "阿舟", 51).ok()
+                && !service.matchRelationEndpoints(world.value->id, "阿舟", 1, -1).ok()
+                && !repository.matchRelationEndpoints(world.value->id, std::string{"阿舟\x1f沈棠"}, 20, 0).ok()
+                && !repository.matchRelationEndpoints(world.value->id, std::string{"阿舟\0", 7}, 20, 0).ok(),
+            "both service and repository must reject invalid sizes, pages and delimiter/control injection");
+    const auto missing = service.matchRelationEndpoints("missing-world", "阿舟");
+    require(!missing.ok() && missing.error->code == xuyan::domain::ErrorCode::missing_context,
+            "missing world must not fall back to an unscoped endpoint search");
+    const auto fact = repository.loadExtractionCandidate(entities[0].id);
+    auto fact_entity = repository.loadEntity("entity-from-" + entities[0].id);
+    require(fact.ok() && fact_entity.ok(), "entity projection boundary fixture must load");
+    auto forged = *fact_entity.value; forged.aliases.clear();
+    require(!repository.reviewExtractionCandidate("endpoint-no-alias", *fact.value, 1, forged).ok(),
+            "direct repository review must not discard evidence-backed aliases");
+    forged = *fact_entity.value; forged.aliases.push_back("虚构别名");
+    require(!repository.reviewExtractionCandidate("endpoint-extra-alias", *fact.value, 1, forged).ok(),
+            "direct repository review must not invent aliases");
+    forged = *fact_entity.value; forged.description += "更改说明";
+    auto conflicting_replay = repository.reviewExtractionCandidate("endpoint-accept-0", *fact.value, 1, forged);
+    require(!conflicting_replay.ok() && conflicting_replay.error->code == xuyan::domain::ErrorCode::command_conflict,
+            "new typed entity command must bind accepted entity contents, not merely the candidate fields");
+    auto relation_after = repository.loadExtractionCandidate(relation.id);
+    auto relations = repository.listDirectedRelations(world.value->id, {}, std::nullopt, {}, true);
+    require(relation_after.ok() && relation_after.value->revision == 2 && relations.ok() && relations.value->empty(),
+            "read-only suggestions must never bind an endpoint, create a graph edge or advance candidate review");
+    xuyan::storage::WorkspaceRepository reopened(database);
+    auto persisted = reopened.matchRelationEndpoints(world.value->id, long_alias, 20, 0);
+    require(persisted.ok() && persisted.value->total == 2,
+            "accepted literal aliases and scoped matching must survive reopening the workspace");
+    // 旧审核只读重放：历史别名缺失不能在查询或重放中偷偷补写，需要另行明确修订。
+    const auto legacy_payload = entities[0].id + "|1|accepted|" + entities[0].name + '|'
+        + entities[0].fields_json + "|original_fact";
+    sqlite3_stmt* prepared = nullptr;
+    require(sqlite3_prepare_v2(sql.get(), "UPDATE candidate_review_command_log SET payload_hash=? WHERE command_id='endpoint-accept-0'",
+        -1, &prepared, nullptr) == SQLITE_OK, "legacy alias command fixture must prepare");
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> legacy_command(prepared, &sqlite3_finalize);
+    require(sqlite3_bind_text(legacy_command.get(), 1, legacy_payload.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK
+                && sqlite3_step(legacy_command.get()) == SQLITE_DONE && sqlite3_changes(sql.get()) == 1,
+            "legacy alias command fixture must update exactly one owned command");
+    legacy_command.reset(); prepared = nullptr;
+    require(sqlite3_prepare_v2(sql.get(), "UPDATE entity_revision SET aliases='' WHERE entity_id=? AND revision=1",
+        -1, &prepared, nullptr) == SQLITE_OK, "legacy missing alias fixture must prepare");
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> legacy_aliases(prepared, &sqlite3_finalize);
+    require(sqlite3_bind_text(legacy_aliases.get(), 1, fact_entity.value->id.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK
+                && sqlite3_step(legacy_aliases.get()) == SQLITE_DONE && sqlite3_changes(sql.get()) == 1,
+            "legacy missing alias fixture must update only its owned entity revision");
+    legacy_aliases.reset();
+    auto old_replay = service.review("endpoint-accept-0", entities[0].id, 1, "accepted", entities[0].name,
+                                    entities[0].fields_json, "original_fact");
+    const auto old_entity = repository.loadEntity(fact_entity.value->id);
+    require(old_replay.ok() && old_entity.ok() && old_entity.value->aliases.empty() && match_total(long_alias) == 1,
+            "legacy entity acceptance replay must return the old result without repairing historical aliases");
+}
+
 /** @brief 验证类型化事件审核原子生成带原文证据的时间线，并保留真实性和重放语义。 */
 void testAcceptedEventTimelineProjection() {
     using namespace xuyan::application;
@@ -3865,6 +4129,7 @@ int main() {
         testOfflineBatchCheckpoints();
         testPersistentExtractionQueue();
         testScopedCandidatePaging();
+        testAcceptedEntityAliasesAndEndpointMatches();
         testAcceptedEventTimelineProjection();
         testNarrativeBackbonePreviewAndEvidenceMapping();
         testCharacterBlueprintVersioning();

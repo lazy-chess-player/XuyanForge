@@ -31,6 +31,7 @@ bool isSupportedEntityKind(std::string_view kind) {
     return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
 }
 
+/** @brief 校验实体的有界字段、分类与审核状态，并规范化别名及标签集合。 */
 Result<WorldEntity> validateEntity(WorldEntity entity) {
     if (entity.name.empty() || entity.name.size() > 512 || containsControl(entity.name)) {
         return Result<WorldEntity>::failure(
@@ -49,7 +50,8 @@ Result<WorldEntity> validateEntity(WorldEntity entity) {
             {ErrorCode::validation_failed, "别名或标签数量超过上限", false, "减少别名或标签"});
     }
     for (const auto& value : entity.aliases) {
-        if (value.size() > 256 || containsControl(value)) {
+        // 与类型化提取的逐字标识上限一致，不在人工接受时截断合法别名。
+        if (value.size() > 512 || containsControl(value)) {
             return Result<WorldEntity>::failure(
                 {ErrorCode::validation_failed, "别名过长或包含控制字符", false, "修改别名"});
         }

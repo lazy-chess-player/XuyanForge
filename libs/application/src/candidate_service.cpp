@@ -165,7 +165,18 @@ Result<xuyan::domain::ExtractionCandidatePage> CandidateService::listPage(
     }
 }
 
-/** @brief 保存人工审核，按来源性质生成条目和类型化事件投影，并在同一仓储事务中提交。 */
+/** @brief 查询逐字名称或别名的端点建议，只读取作者已确认的当前世界条目。 */
+Result<xuyan::domain::RelationEndpointMatchPage> CandidateService::matchRelationEndpoints(
+    const std::string& world_id, const std::string& mention, int limit, std::int64_t offset) {
+    try {
+        return xuyan::storage::WorkspaceRepository(database_path_).matchRelationEndpoints(world_id, mention, limit, offset);
+    } catch (const std::exception& exception) {
+        return Result<xuyan::domain::RelationEndpointMatchPage>::failure(
+            {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"});
+    }
+}
+
+/** @brief 保存人工审核，保留实体逐字别名，按来源性质生成条目和事件投影并原子提交。 */
 Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
     const std::string& command_id, const std::string& candidate_id, int expected_revision,
     const std::string& review_status, const std::string& name,
@@ -198,6 +209,10 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
             if (candidate.candidate_type == "entity") {
                 const auto* kind = fields.value->find("kind");
                 if (kind != nullptr && kind->isString() && xuyan::domain::isSupportedEntityKind(kind->string())) value.kind = kind->string();
+                if (candidate.schema_version == typedCandidateSchemaVersion) {
+                    // 别名已通过逐字证据校验；保存为正式别名用于消歧，但不据此合并同名条目。
+                    for (const auto& alias : fields.value->find("aliases")->array()) value.aliases.push_back(alias.string());
+                }
             }
             auto enriched_fields = *fields.value;
             enriched_fields.object()["xuyan_provenance_type"] = candidate.provenance_type;

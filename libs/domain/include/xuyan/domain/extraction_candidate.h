@@ -36,6 +36,27 @@ struct ExtractionCandidatePage {
     std::int64_t offset{0};
 };
 
+/** @brief 表示当前已确认实体的轻量端点建议；稳定ID和修订必须由作者明确选择。 */
+struct RelationEndpointMatch {
+    std::string entity_id;
+    std::string name;
+    std::string kind;
+    std::vector<std::string> aliases;
+    int revision{0};
+    bool name_match{false};
+    bool alias_match{false};
+};
+
+/** @brief 保存同一读快照中按世界及逐字标识匹配的有界端点页，不作自动绑定。 */
+struct RelationEndpointMatchPage {
+    std::string world_id;
+    std::string mention;
+    std::vector<RelationEndpointMatch> items;
+    std::uint64_t total{0};
+    int limit{0};
+    std::int64_t offset{0};
+};
+
 /** @brief 校验待审核抽取候选及其原文证据范围。 */
 Result<ExtractionCandidate> validateExtractionCandidate(ExtractionCandidate candidate);
 

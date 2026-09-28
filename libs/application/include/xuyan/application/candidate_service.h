@@ -28,7 +28,10 @@ public:
     xuyan::domain::Result<xuyan::domain::ExtractionCandidatePage> listPage(
         const std::string& world_id, const std::string& source_id,
         const std::string& review_status, int limit, std::int64_t offset);
-    /** @brief 以乐观锁审核候选；接受类型化事件时原子创建带证据时间线，不推定故事日期或因果。 */
+    /** @brief 提供当前世界已确认实体的精确名称/别名建议，分页返回稳定ID，不自动绑定或合并。 */
+    xuyan::domain::Result<xuyan::domain::RelationEndpointMatchPage> matchRelationEndpoints(
+        const std::string& world_id, const std::string& mention, int limit = 20, std::int64_t offset = 0);
+    /** @brief 以乐观锁审核候选；保留实体逐字别名，事件原子创建带证据时间线，不推定日期或因果。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> review(
         const std::string& command_id, const std::string& candidate_id, int expected_revision,
         const std::string& review_status, const std::string& name,

@@ -2994,6 +2994,70 @@ Result<xuyan::domain::ExtractionCandidatePage> WorkspaceRepository::listExtracti
     }
 }
 
+/** @brief 精确匹配当前世界已确认的名称或完整别名，同一读快照返回总数和有界轻量结果。 */
+Result<xuyan::domain::RelationEndpointMatchPage> WorkspaceRepository::matchRelationEndpoints(
+    const std::string& world_id, const std::string& mention, int limit, std::int64_t offset) {
+    using Page = xuyan::domain::RelationEndpointMatchPage;
+    // 别名采用单元分隔符存储，必须拒绝控制字符，不能让查询拆出另一条标识。
+    /** @brief 检查匹配输入的大小及控制字符，防止别名分隔符被解释为数据。 */
+    const auto invalid_text = [](const std::string& text) {
+        return text.empty() || text.size() > 512 || std::any_of(text.begin(), text.end(), [](unsigned char value) {
+            return value < 0x20 || value == 0x7f;
+        });
+    };
+    if (invalid_text(world_id) || invalid_text(mention) || limit < 1 || limit > 50 || offset < 0
+        || std::all_of(mention.begin(), mention.end(), [](unsigned char value) { return value == ' '; }))
+        return Result<Page>::failure({ErrorCode::validation_failed,
+            "端点匹配的世界、标识或分页参数无效", false, "选择世界及完整标识，每页限制为1—50项"});
+    try {
+        ReadTransaction snapshot(database_);
+        Statement world(database_, "SELECT 1 FROM world_template WHERE id=?");
+        bindText(world.get(), 1, world_id);
+        const auto world_step = sqlite3_step(world.get());
+        if (world_step == SQLITE_DONE)
+            return Result<Page>::failure({ErrorCode::missing_context, "端点匹配的世界不存在", false, "刷新世界列表"});
+        if (world_step != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+        // 不按子串、模糊词或大小写推测端点，也不把通用接受条目的事件/关系/规则当作实体。
+        // 排除集合一次读取候选接受映射，避免对每个同名条目逐一加载原文或大属性。
+        const std::string scope =
+            " FROM world_entity e JOIN entity_revision r ON r.entity_id=e.id AND r.revision=e.head_revision"
+            " WHERE e.world_id=? AND e.deleted=0 AND r.review_status='accepted' AND r.kind NOT IN('event','rule')"
+            " AND e.id NOT IN(SELECT a.entity_id FROM candidate_acceptance a JOIN extraction_candidate c ON c.id=a.candidate_id"
+            " WHERE c.candidate_type<>'entity' OR c.review_status<>'accepted' OR c.provenance_type NOT IN('original_fact','author_setting'))"
+            " AND (r.name=? OR instr(char(31)||r.aliases||char(31),char(31)||?||char(31))>0)";
+        /** @brief 为总数和分页查询绑定同一世界及逐字标识，不拼接用户输入到SQL。 */
+        const auto bind_scope = [&](sqlite3_stmt* statement) {
+            bindText(statement, 1, world_id); bindText(statement, 2, mention); bindText(statement, 3, mention);
+        };
+        Page page;
+        page.world_id = world_id; page.mention = mention; page.limit = limit; page.offset = offset;
+        {
+            const auto sql = "SELECT COUNT(*)" + scope;
+            Statement count(database_, sql.c_str()); bind_scope(count.get());
+            if (sqlite3_step(count.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+            page.total = static_cast<std::uint64_t>(sqlite3_column_int64(count.get(), 0));
+        }
+        {
+            const auto sql = "SELECT e.id,r.name,r.kind,r.aliases,r.revision" + scope + " ORDER BY e.id LIMIT ? OFFSET ?";
+            Statement query(database_, sql.c_str()); bind_scope(query.get());
+            sqlite3_bind_int(query.get(), 4, limit); sqlite3_bind_int64(query.get(), 5, offset);
+            while (true) {
+                const auto step = sqlite3_step(query.get());
+                if (step == SQLITE_DONE) break;
+                if (step != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+                xuyan::domain::RelationEndpointMatch item;
+                item.entity_id = columnText(query.get(), 0); item.name = columnText(query.get(), 1);
+                item.kind = columnText(query.get(), 2); item.aliases = splitValues(columnText(query.get(), 3));
+                item.revision = sqlite3_column_int(query.get(), 4); item.name_match = item.name == mention;
+                item.alias_match = std::find(item.aliases.begin(), item.aliases.end(), mention) != item.aliases.end();
+                page.items.push_back(std::move(item));
+            }
+        }
+        snapshot.commit();
+        return Result<Page>::success(std::move(page));
+    } catch (const std::exception& exception) { return Result<Page>::failure(storageError(exception)); }
+}
+
 Result<std::vector<xuyan::domain::ExtractionCandidate>> WorkspaceRepository::listExtractionCandidatesForJob(
     const std::string& job_id, int limit) {
     if (job_id.empty() || limit < 1 || limit > 1000) return Result<std::vector<xuyan::domain::ExtractionCandidate>>::failure(
@@ -3017,7 +3081,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::loadExtractionCa
     } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionCandidate>::failure(storageError(exception)); }
 }
 
-/** @brief 原子提交候选审核、接受条目、原文证据和可选事件投影，重放不产生第二份资料。 */
+/** @brief 原子提交审核、带证据实体别名和可选事件投影，验证投影一致性并保证重放不产生新资料。 */
 Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtractionCandidate(
     const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,
     std::optional<WorldEntity> accepted_entity, std::optional<xuyan::domain::TimelineEvent> accepted_timeline) {
@@ -3044,6 +3108,51 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
     const auto legacy_payload = candidate.id + '|' + std::to_string(expected_revision) + '|' + candidate.review_status + '|'
         + candidate.name + '|' + candidate.fields_json + '|' + candidate.provenance_type;
     auto payload = legacy_payload;
+    const bool typed_entity_acceptance = candidate.review_status == "accepted"
+        && candidate.schema_version == "candidate-v2" && candidate.candidate_type == "entity";
+    if (typed_entity_acceptance) {
+        using xuyan::package::JsonValue;
+        auto fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
+        const auto* kind = fields.ok() ? fields.value->find("kind") : nullptr;
+        const auto* aliases = fields.ok() ? fields.value->find("aliases") : nullptr;
+        const auto truth = candidate.provenance_type == "in_text_claim" ? "claim"
+            : candidate.provenance_type == "model_inference" ? "hypothesis" : "fact";
+        // 仓储入口不能省略或追加未经候选证据支持的别名，也不能把说法或假设升级为事实。
+        if (!fields.ok() || !fields.value->isObject() || fields.value->object().size() != 2
+            || !kind || !kind->isString() || !xuyan::domain::isSupportedEntityKind(kind->string())
+            || kind->string() == "event" || kind->string() == "rule" || !aliases || !aliases->isArray()
+            || aliases->array().size() > 16 || candidate.quote.find(candidate.name) == std::string::npos)
+            return Result<xuyan::domain::ExtractionCandidate>::failure(
+                {ErrorCode::validation_failed, "实体投影缺少合法分类或逐字标识", false, "从当前候选重新生成条目"});
+        std::set<std::string> expected_aliases;
+        for (const auto& alias : aliases->array()) {
+            if (!alias.isString() || alias.string().empty() || candidate.quote.find(alias.string()) == std::string::npos
+                || !expected_aliases.insert(alias.string()).second)
+                return Result<xuyan::domain::ExtractionCandidate>::failure(
+                    {ErrorCode::validation_failed, "实体别名缺少逐字证据或重复", false, "核对候选别名"});
+        }
+        const std::vector<std::string> alias_list(expected_aliases.begin(), expected_aliases.end());
+        auto attributes = xuyan::package::parseJson(accepted_entity->attributes_json, 16, 2000);
+        auto expected_attributes = *fields.value;
+        expected_attributes.object()["xuyan_provenance_type"] = candidate.provenance_type;
+        expected_attributes.object()["xuyan_truth_status"] = truth;
+        if (!attributes.ok() || xuyan::package::writeJson(*attributes.value) != xuyan::package::writeJson(expected_attributes)
+            || accepted_entity->aliases != alias_list || accepted_entity->name != candidate.name
+            || accepted_entity->review_status != "accepted" || accepted_entity->deleted
+            || accepted_entity->kind != (std::string_view(truth) == "fact" ? kind->string() : "other"))
+            return Result<xuyan::domain::ExtractionCandidate>::failure(
+                {ErrorCode::validation_failed, "实体条目与别名、审核字段或真实性不一致", false, "从当前候选重新生成条目"});
+        JsonValue::Array entity_aliases, tags;
+        for (const auto& alias : accepted_entity->aliases) entity_aliases.emplace_back(alias);
+        for (const auto& tag : accepted_entity->tags) tags.emplace_back(tag);
+        // 新实体审核绑定所有条目内容；保留既有事件摘要格式，不改变已提交事件的重放语义。
+        payload = "entity-review-v1:" + xuyan::domain::sha256(xuyan::package::writeJson(JsonValue::Object{
+            {"candidate_id", candidate.id}, {"expected_revision", expected_revision}, {"name", candidate.name},
+            {"fields", *fields.value}, {"provenance", candidate.provenance_type},
+            {"entity_id", accepted_entity->id}, {"world_id", accepted_entity->world_id},
+            {"description", accepted_entity->description}, {"attributes", *attributes.value},
+            {"aliases", std::move(entity_aliases)}, {"tags", std::move(tags)}}));
+    }
     if (accepted_timeline) {
         using xuyan::package::JsonValue;
         auto fields = xuyan::package::parseJson(candidate.fields_json, 16, 2000);
@@ -3111,10 +3220,10 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
         bindText(replay.get(), 1, command_id);
         if (sqlite3_step(replay.get()) == SQLITE_ROW) {
             const auto stored_payload = columnText(replay.get(), 0);
-            // 历史审核命令只返回已有结果，不借重放补写过去没有的事件记录。
-            const bool historical_event_replay = requires_timeline && stored_payload == legacy_payload
+            // 历史审核只返回已有结果，不借重放补写过去没有的事件记录或实体别名。
+            const bool historical_typed_replay = (requires_timeline || typed_entity_acceptance) && stored_payload == legacy_payload
                 && current.review_status == "accepted" && columnText(replay.get(), 1) == candidate.id;
-            if (stored_payload != payload && !historical_event_replay) return Result<xuyan::domain::ExtractionCandidate>::failure(
+            if (stored_payload != payload && !historical_typed_replay) return Result<xuyan::domain::ExtractionCandidate>::failure(
                 {ErrorCode::command_conflict, "命令标识已用于其他候选审核", false, "生成新的命令标识"});
             Statement query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE id=?");
             bindText(query.get(), 1, columnText(replay.get(), 1));

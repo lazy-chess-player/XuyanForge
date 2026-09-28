@@ -218,13 +218,16 @@ public:
     xuyan::domain::Result<xuyan::domain::ExtractionCandidatePage> listExtractionCandidatesPage(
         const std::string& world_id, const std::string& source_id, const std::string& review_status,
         int limit, std::int64_t offset);
+    /** @brief 在同一只读快照中精确匹配当前世界已确认端点，排除事件、规则、说法和模型假设。 */
+    xuyan::domain::Result<xuyan::domain::RelationEndpointMatchPage> matchRelationEndpoints(
+        const std::string& world_id, const std::string& mention, int limit, std::int64_t offset);
     /** @brief 限量读取某解析任务产生的候选。 */
     xuyan::domain::Result<std::vector<xuyan::domain::ExtractionCandidate>> listExtractionCandidatesForJob(
         const std::string& job_id, int limit);
     /** @brief 读取单个抽取候选及其原文证据元数据。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> loadExtractionCandidate(
         const std::string& candidate_id);
-    /** @brief 按预期修订原子保存候选、条目及证据；类型化事件接受时必须同时提交一致的时间线投影。 */
+    /** @brief 按修订原子保存审核、条目及证据；类型化实体别名和事件时间线必须与候选一致。 */
     xuyan::domain::Result<xuyan::domain::ExtractionCandidate> reviewExtractionCandidate(
         const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,
         std::optional<xuyan::domain::WorldEntity> accepted_entity,
