@@ -171,3 +171,6 @@ AC 编号是[验收定义](03-roadmap-and-acceptance.md)，不是勾选清单的
 - 自动化显式清空外部小说开关，不读取用户工作区或凭据、不发模型请求；报告脚本仅读取白名单配置和版本，差异仅记录摘要。4项Python回归验证缓存白名单、编译器路径排除、构建目录边界与报告路径碰撞，全部通过。
 - 工作流通过actionlint 1.7.12检查（未启用本机缺失的shellcheck）；Windows内嵌PowerShell脚本均通过解析检查。本机Windows一键构建与CTest **5/5通过**，19.65秒。以上只证明本机基线和配置静态检查；MSVC `/utf-8`及远端两平台构建需在推送后实际验证。
 - 上传产物限定为构建摘要、版本、JUnit及测试日志，不上传缓存、源码素材、数据库或程序包；保留14天。Python缓存已列入Git忽略，不加入阶段提交。当前远端流水线尚未运行，XF-28未标记完成。
+- 阶段提交`4e162a7`已上传`codex/quality-gates`。首次[远端运行](https://github.com/lazy-chess-player/XuyanForge/actions/runs/36374205326)中Linux核心CTest **3/3通过**，工具记录为GCC 13.3.0、CMake 3.31.6、SQLite 3.45.1、Python 3.12.10，输入提交匹配且无工作树差异。Windows在存储编译时报C2026，汇总检查如实失败；未合入主分支。
+- 故障来自迁移SQL的单个21,545字节原始字符串，超过[MSVC单字面量限制](https://learn.microsoft.com/en-us/cpp/error-messages/compiler-errors-1/compiler-error-c2026?view=msvc-170)。拆成6,487 / 6,674 / 8,384字节的三个相邻字面量，编译期拼接后仍一次执行；对照归一化换行后的SQL SHA256完全一致，未改变SQL语句、版本或数据库行为。实际MSVC修复结果待下一次远端构建，不能以字节核对代替运行。
+- 拆分后本机Windows一键构建与CTest **5/5通过**，16.59秒；报告边界回归4/4、actionlint及`git diff --check`均通过。迁移兼容、空白初始化与既有业务回归沿用完整核心测试执行，不新建或清除用户数据库。

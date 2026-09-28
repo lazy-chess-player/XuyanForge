@@ -820,6 +820,7 @@ void WorkspaceRepository::migrate() {
             throw std::runtime_error(detail);
         }
     }
+    // MSVC 限制单个字面量长度；相邻原始字符串在编译期拼接，仍一次执行同一份迁移 SQL。
     constexpr auto sql = R"SQL(
 PRAGMA foreign_keys=ON;
 PRAGMA journal_mode=WAL;
@@ -929,7 +930,8 @@ INSERT OR IGNORE INTO source_chapter_head(source_id,revision) SELECT id,1 FROM s
 CREATE TABLE IF NOT EXISTS source_chapter_command_log(
   command_id TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,source_id TEXT NOT NULL,revision INTEGER NOT NULL,created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS extraction_job(
+)SQL"
+    R"SQL(CREATE TABLE IF NOT EXISTS extraction_job(
   id TEXT PRIMARY KEY,source_id TEXT NOT NULL,status TEXT NOT NULL,schema_version TEXT NOT NULL,prompt_version TEXT NOT NULL,
   provider_connection_id TEXT NOT NULL,model_id TEXT NOT NULL,total_steps INTEGER NOT NULL,completed_steps INTEGER NOT NULL,
   cancel_requested INTEGER NOT NULL,revision INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
@@ -1018,7 +1020,8 @@ INSERT OR IGNORE INTO extraction_budget(job_id,estimated_input_tokens,output_tok
 SELECT j.id,COALESCE((SELECT SUM((end_codepoint-start_codepoint)*3/2+1) FROM extraction_step s WHERE s.job_id=j.id),0),
   1200,j.total_steps+MAX(1,j.total_steps/10),COALESCE((SELECT SUM(attempt) FROM extraction_step s WHERE s.job_id=j.id),0),
   MIN(3,j.total_steps),0,0,'' FROM extraction_job j;
-CREATE TABLE IF NOT EXISTS world_version(
+)SQL"
+    R"SQL(CREATE TABLE IF NOT EXISTS world_version(
   id TEXT PRIMARY KEY,world_id TEXT NOT NULL,parent_id TEXT NOT NULL,status TEXT NOT NULL,
   content_hash TEXT NOT NULL,published_at TEXT NOT NULL
 );
