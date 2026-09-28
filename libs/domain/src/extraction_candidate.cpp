@@ -7,6 +7,10 @@
 namespace xuyan::domain {
 
 Result<ExtractionCandidate> validateExtractionCandidate(ExtractionCandidate candidate) {
+    if (!((candidate.schema_version == "candidate-v1" && candidate.prompt_version == "extract-v1")
+        || (candidate.schema_version == "candidate-v2" && candidate.prompt_version == "extract-v2")))
+        return Result<ExtractionCandidate>::failure(
+            {ErrorCode::validation_failed, "候选协议版本不受支持", false, "保留原数据并核对协议版本"});
     constexpr std::array types{std::string_view{"entity"}, std::string_view{"event"},
         std::string_view{"relation"}, std::string_view{"rule"}};
     constexpr std::array provenance{std::string_view{"original_fact"}, std::string_view{"in_text_claim"},

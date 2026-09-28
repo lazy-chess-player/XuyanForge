@@ -1,6 +1,7 @@
 #include "xuyan/application/extraction_job_service.h"
 
 #include "xuyan/application/source_import_service.h"
+#include "xuyan/application/extraction_output_contract.h"
 #include "xuyan/domain/hash.h"
 #include "xuyan/domain/provider_connection.h"
 #include "xuyan/domain/source_document.h"
@@ -118,6 +119,9 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> ExtractionJobService::create
         job.provider_connection_id = provider_connection_id;
         job.model_id = connection.value->default_model;
         job.provider_connection_fingerprint = xuyan::domain::providerConnectionFingerprint(*connection.value);
+        // 协议在建任务时固定，并进入既有缓存参数摘要；旧候选不自动升级或重用。
+        job.schema_version = typedCandidateSchemaVersion;
+        job.prompt_version = typedCandidatePromptVersion;
     }
     int ordinal = 1;
     for (const auto& [segment_start, segment_end] : segments) {

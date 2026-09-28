@@ -71,6 +71,10 @@ xuyan::domain::Result<xuyan::domain::ExtractionJob> MockExtractionProcessor::pro
     auto job = jobs.load(job_id);
     if (!job.ok()) return job;
     if (job.value->status == "completed" || job.value->status == "cancelled") return job;
+    if (job.value->schema_version != "candidate-v1" || job.value->prompt_version != "extract-v1")
+        return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(
+            {xuyan::domain::ErrorCode::validation_failed, "此任务不能用离线规则替代类型化模型提取", false,
+             "使用任务绑定的模型协议或新建离线任务"});
     auto claimed = jobs.claimNext(commandId("mock-claim", job_id, job.value->revision), job_id, job.value->revision);
     if (!claimed.ok()) return xuyan::domain::Result<xuyan::domain::ExtractionJob>::failure(*claimed.error);
     SourceImportService sources(database_path_);

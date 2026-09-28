@@ -81,6 +81,7 @@ add_library(xuyan_application STATIC
     libs/application/src/backup_service.cpp
     libs/application/src/evidence_service.cpp
     libs/application/src/candidate_service.cpp
+    libs/application/src/extraction_output_contract.cpp
     libs/application/src/extraction_job_service.cpp
     libs/application/src/mock_extraction_processor.cpp
     libs/application/src/remote_extraction_processor.cpp
