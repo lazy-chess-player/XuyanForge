@@ -8,25 +8,37 @@ Item {
     required property var uiTheme
     FileDialog {
         id: importDialog
+        options: FileDialog.DontUseNativeDialog
         title: qsTr("导入世界包")
+        acceptLabel: qsTr("导入")
+        rejectLabel: qsTr("取消")
         fileMode: FileDialog.OpenFile
         onAccepted: packages.importWorld(selectedFile)
     }
     FileDialog {
         id: exportDialog
+        options: FileDialog.DontUseNativeDialog
         title: qsTr("导出世界包")
+        acceptLabel: qsTr("保存")
+        rejectLabel: qsTr("取消")
         fileMode: FileDialog.SaveFile
         nameFilters: [qsTr("世界包 (*.zip)")]
         onAccepted: packages.exportWorld(selectedFile)
     }
     FolderDialog {
         id: backupDialog
+        options: FolderDialog.DontUseNativeDialog
         title: qsTr("选择备份保存位置")
+        acceptLabel: qsTr("选择")
+        rejectLabel: qsTr("取消")
         onAccepted: packages.createBackup(selectedFolder)
     }
     FolderDialog {
         id: restoreDialog
+        options: FolderDialog.DontUseNativeDialog
         title: qsTr("选择备份目录")
+        acceptLabel: qsTr("选择")
+        rejectLabel: qsTr("取消")
         onAccepted: packages.restoreBackup(selectedFolder)
     }
     ColumnLayout {

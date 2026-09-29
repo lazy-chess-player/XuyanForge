@@ -14,8 +14,12 @@ Rectangle {
     border.color: uiTheme.border
 
     FileDialog {
+        // 使用 Qt 中文翻译的文件框，避免系统语言改变内置选项。
+        options: FileDialog.DontUseNativeDialog
         id: workspaceDialog
         title: qsTr("打开工作区")
+        acceptLabel: qsTr("打开")
+        rejectLabel: qsTr("取消")
         fileMode: FileDialog.OpenFile
         nameFilters: [qsTr("工作区数据库 (*.sqlite *.db)")]
         onAccepted: workspaceCatalog.openWorkspace(selectedFile)

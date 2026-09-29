@@ -17,24 +17,51 @@
 #include <QQuickWindow>
 #include <QTimer>
 #include <QTranslator>
+#include <QLibraryInfo>
+#include <QLocale>
+#include <QTemporaryDir>
+#include <array>
+#include <memory>
 
-// 初始化本地工作区和界面服务，并按需生成无样例数据的界面预览。
+/*
+ * 功能：启动中文桌面程序，组装本地工作区服务及界面，或生成隔离的界面截图。
+ * 参数：argc 为进程参数数量；argv 为有效期覆盖整个调用的参数数组，由运行时拥有。
+ * 返回：正常关闭为 0；界面加载失败为 -1；截图或临时目录创建失败为 2。
+ * 副作用：初始化指定数据库、读取设置并运行 GUI 事件循环；启动本身不发送模型请求。
+ * 生命周期：视图模型、翻译器及引擎均由栈管理；无显式工作区的截图使用独占临时目录。
+ */
 int main(int argc, char* argv[]) {
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QGuiApplication application(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("XuyanForge"));
     QCoreApplication::setApplicationName(QStringLiteral("叙演工坊"));
 
-    const auto dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    QDir().mkpath(dataRoot);
     const auto arguments = application.arguments();
     const auto screenshotIndex = arguments.indexOf(QStringLiteral("--screenshot"));
     if (screenshotIndex >= 0)
         QCoreApplication::setOrganizationName(QStringLiteral("XuyanForgePreview"));
+    const auto dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    QDir().mkpath(dataRoot);
+    // 截图不复用真实用户数据库；临时目录最后析构，晚于视图模型和界面。
+    const auto previewDirectory = screenshotIndex >= 0
+        ? std::make_unique<QTemporaryDir>(QDir::tempPath() + QStringLiteral("/xuyan-preview-XXXXXX")) : nullptr;
+    if (previewDirectory && !previewDirectory->isValid()) return 2;
+
+    // Qt 控件的内置动作也必须中文；部署目录优先，SDK 目录仅供本机构建运行。
+    QLocale::setDefault(QLocale(QLocale::Chinese, QLocale::China));
+    std::array<QTranslator, 3> frameworkTranslators;
+    const QStringList translationNames{QStringLiteral("qt_zh_CN"), QStringLiteral("qtbase_zh_CN"),
+                                       QStringLiteral("qtdeclarative_zh_CN")};
+    for (int index = 0; index < translationNames.size(); ++index) {
+        auto& translator = frameworkTranslators[static_cast<std::size_t>(index)];
+        if (translator.load(translationNames.at(index), application.applicationDirPath() + QStringLiteral("/translations"))
+            || translator.load(translationNames.at(index), QLibraryInfo::path(QLibraryInfo::TranslationsPath)))
+            application.installTranslator(&translator);
+    }
     const auto workspaceArgument = arguments.indexOf(QStringLiteral("--workspace"));
     const auto databaseText = workspaceArgument >= 0 && workspaceArgument + 1 < arguments.size()
         ? QFileInfo(arguments.at(workspaceArgument + 1)).absoluteFilePath()
-        : dataRoot + QStringLiteral("/workspace.sqlite");
+        : (previewDirectory ? previewDirectory->path() : dataRoot) + QStringLiteral("/workspace.sqlite");
     const auto databasePath = databaseText.toStdWString();
     WorkspaceCatalogViewModel workspaceCatalog(databasePath);
     const auto themePreviewIndex = arguments.indexOf(QStringLiteral("--theme-preview"));

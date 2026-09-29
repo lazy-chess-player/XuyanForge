@@ -24,7 +24,7 @@ WorkspaceCatalogViewModel::WorkspaceCatalogViewModel(std::filesystem::path datab
     language_id_ = QSettings().value(QStringLiteral("appearance/languageId"), QStringLiteral("zh-CN")).toString();
     if (language_id_ != QStringLiteral("zh-CN")) language_id_ = QStringLiteral("zh-CN");
     if (!QCoreApplication::arguments().contains(QStringLiteral("--screenshot")))
-        registerRecent(QString::fromStdWString(database_path_.stem().wstring()), currentPath());
+        registerRecent({}, currentPath());
     refreshWorlds();
 }
 
@@ -137,8 +137,13 @@ void WorkspaceCatalogViewModel::loadRecent() {
         if (portable_path.contains(QStringLiteral("/build/"), Qt::CaseInsensitive)
             || (QDir::fromNativeSeparators(QFileInfo(path).absolutePath()) == QDir::cleanPath(data_root)
                 && QFileInfo(path).fileName() != QStringLiteral("workspace.sqlite"))) continue;
+        auto name = settings.value(QStringLiteral("name")).toString();
+        // 只迁移旧版自动生成的默认标签，不翻译用户给自定义工作区起的名称。
+        if (name.isEmpty() || (name == QStringLiteral("workspace")
+            && QFileInfo(path).fileName() == QStringLiteral("workspace.sqlite")))
+            name = tr("默认工作区");
         if (!path.isEmpty() && QFileInfo::exists(path)) recent_.push_back(QVariantMap{
-            {"name", settings.value(QStringLiteral("name")).toString()}, {"path", path},
+            {"name", name}, {"path", path},
             {"lastOpened", settings.value(QStringLiteral("lastOpened")).toString()}});
     }
     settings.endArray();
@@ -158,10 +163,16 @@ void WorkspaceCatalogViewModel::saveRecent() {
 
 void WorkspaceCatalogViewModel::registerRecent(QString name, const QString& path) {
     const auto canonical = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
-    for (int index = recent_.size() - 1; index >= 0; --index)
+    for (int index = recent_.size() - 1; index >= 0; --index) {
         if (QFileInfo(recent_.at(index).toMap().value(QStringLiteral("path")).toString()).absoluteFilePath()
-            == QFileInfo(canonical).absoluteFilePath()) recent_.removeAt(index);
-    if (name.trimmed().isEmpty()) name = QFileInfo(canonical).completeBaseName();
+            == QFileInfo(canonical).absoluteFilePath()) {
+            // 自动登记或重新打开不覆盖此前保存的用户自定义名称。
+            if (name.trimmed().isEmpty()) name = recent_.at(index).toMap().value(QStringLiteral("name")).toString();
+            recent_.removeAt(index);
+        }
+    }
+    if (name.trimmed().isEmpty()) name = QFileInfo(canonical).fileName() == QStringLiteral("workspace.sqlite")
+        ? tr("默认工作区") : QFileInfo(canonical).completeBaseName();
     recent_.push_front(QVariantMap{{"name", name.trimmed()}, {"path", canonical},
         {"lastOpened", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}});
     while (recent_.size() > 20) recent_.removeLast();
@@ -208,7 +219,7 @@ void WorkspaceCatalogViewModel::createWorkspace(QString name) {
 void WorkspaceCatalogViewModel::openWorkspace(const QUrl& source) {
     if (!source.isLocalFile()) { error_text_ = QStringLiteral("请选择本机工作区数据库文件"); emit changed(); return; }
     const auto path = source.toLocalFile();
-    initializeAndSwitch(QFileInfo(path).completeBaseName(), std::filesystem::path(path.toStdWString()));
+    initializeAndSwitch({}, std::filesystem::path(path.toStdWString()));
 }
 
 void WorkspaceCatalogViewModel::switchToRecent(int index) {

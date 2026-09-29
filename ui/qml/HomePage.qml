@@ -11,15 +11,23 @@ Flickable {
     contentHeight: content.implicitHeight + 96
     clip: true
 
-    // 从本地文件地址提取可读名称；特殊百分号文件名保持原样而不阻断导入。
+    /* 功能：从文件地址提取显示用文件名，不改变交给导入服务的完整地址。
+     * 参数：fileUrl 为文件选择框返回的URL，可转换为字符串。
+     * 返回：URL最后一段解码后的名称；百分号转义不合法时返回未解码名称。
+     * 副作用：无，不读取文件、不创建世界、不发送网络请求。
+     */
     function novelFileName(fileUrl) {
         const name = fileUrl.toString().split("/").pop()
         try { return decodeURIComponent(name) } catch (error) { return name }
     }
 
     FileDialog {
+        // 使用 Qt 中文翻译的文件框，避免系统语言改变内置选项。
+        options: FileDialog.DontUseNativeDialog
         id: novelDialog
         title: qsTr("选择要解析的小说")
+        acceptLabel: qsTr("选择")
+        rejectLabel: qsTr("取消")
         fileMode: FileDialog.OpenFile
         nameFilters: [qsTr("小说文本 (*.txt *.md *.markdown)"), qsTr("所有文件 (*)")]
         // 只显示文件名；创建时仍将完整本地地址交给导入服务。
@@ -78,7 +86,7 @@ Flickable {
             AppButton { uiTheme: page.uiTheme; text: qsTr("选择小说"); onClicked: novelDialog.open() }
         }
         Label {
-            text: qsTr("支持纯文本和标记文本。原文保存在本地，只有主动抽样时才发送给模型。")
+            text: qsTr("支持纯文本和标记文本。原文保存在本地，只有确认开始模型解析或抽样后才发送片段。")
             color: page.uiTheme.muted
             font.pointSize: 9
             wrapMode: Text.Wrap

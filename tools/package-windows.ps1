@@ -36,9 +36,12 @@ if (-not (Get-Command windeployqt -ErrorAction SilentlyContinue)) {
 New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
 $deployedExecutable = Join-Path $outputPath "xuyanforge_app.exe"
 Copy-Item -LiteralPath $executable -Destination $deployedExecutable -Force
-& windeployqt --release --qmldir (Join-Path $projectRoot "ui/qml") --dir $outputPath $deployedExecutable
+& windeployqt --release --translations zh_CN --qmldir (Join-Path $projectRoot "ui/qml") --dir $outputPath $deployedExecutable
 if ($LASTEXITCODE -ne 0) {
     throw "windeployqt failed with exit code $LASTEXITCODE"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $outputPath 'translations/qt_zh_CN.qm'))) {
+    throw '部署缺少 Qt 简体中文翻译，不能发布。'
 }
 
 $blockedExtensions = @('.sqlite', '.db', '.wal', '.shm', '.txt', '.md', '.key', '.pem')
@@ -83,6 +86,7 @@ if ($CreateInstaller) {
     $escapedInstaller = $installerPath.Replace('$', '$$')
     $nsis = @"
 Unicode True
+LoadLanguageFile "`${NSISDIR}\Contrib\Language files\SimpChinese.nlf"
 Name "叙演工坊"
 OutFile "$escapedInstaller"
 InstallDir "`$PROGRAMFILES64\XuyanForge"
@@ -91,7 +95,7 @@ Page directory
 Page instfiles
 UninstPage uninstConfirm
 UninstPage instfiles
-Section "XuyanForge" SEC_MAIN
+Section "安装叙演工坊" SEC_MAIN
   SetOutPath "`$INSTDIR"
   File /r "$escapedOutput\*"
   CreateDirectory "`$SMPROGRAMS\XuyanForge"
@@ -100,7 +104,7 @@ Section "XuyanForge" SEC_MAIN
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\XuyanForge" "DisplayName" "叙演工坊"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\XuyanForge" "UninstallString" '"`$INSTDIR\Uninstall.exe"'
 SectionEnd
-Section "Uninstall"
+Section "卸载"
   Delete "`$SMPROGRAMS\XuyanForge\叙演工坊.lnk"
   RMDir "`$SMPROGRAMS\XuyanForge"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\XuyanForge"

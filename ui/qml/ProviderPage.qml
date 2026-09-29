@@ -99,7 +99,7 @@ Item {
                         }
                         AppButton { uiTheme: page.uiTheme; text: qsTr("测试连接"); enabled: page.selectedId.length > 0; onClicked: providers.probeConnection(page.selectedId) }
                     }
-                    Label { text: qsTr("连接测试会访问所填服务；小说内容仅在你主动运行模型抽样时发送。")
+                    Label { text: qsTr("连接测试会访问所填服务；小说片段仅在你确认开始模型解析或抽样后发送。")
                             color: page.uiTheme.muted; wrapMode: Text.Wrap; Layout.fillWidth: true }
                     Label { text: providers.errorText.length > 0 ? providers.errorText : providers.statusText; color: providers.errorText.length > 0 ? page.uiTheme.danger : page.uiTheme.muted; wrapMode: Text.Wrap; Layout.fillWidth: true }
                 }

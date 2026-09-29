@@ -44,8 +44,12 @@ Item {
     Component.onCompleted: loadSelectedChapter()
 
     FileDialog {
+        // 使用 Qt 中文翻译的文件框，避免系统语言改变内置选项。
+        options: FileDialog.DontUseNativeDialog
         id: importDialog
         title: qsTr("导入小说")
+        acceptLabel: qsTr("导入")
+        rejectLabel: qsTr("取消")
         fileMode: FileDialog.OpenFile
         nameFilters: [qsTr("小说文本 (*.txt *.md *.markdown)"), qsTr("所有文件 (*)")]
         onAccepted: sources.importFile(selectedFile, workspaceCatalog.activeWorldId)
