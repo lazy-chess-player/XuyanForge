@@ -11,7 +11,14 @@
 namespace xuyan::test {
 namespace {
 
-/** @brief 应用测试意图并推进回合，保持已提交事实与叙述的分阶段语义。 */
+/*
+ * 功能：将合成意图应用于当前状态，成功后推进回合及逻辑时钟，不替代持久化提交。
+ * 参数：current：输入，只读状态引用；intent：输入，待执行人物意图；均仅在调用期间借用。
+ * 返回：成功为独立下一状态；说话仅推进修订，其他操作先经领域规则校验。
+ * 失败：意图转换或领域操作错误返回失败；复制/分配异常向外传播。
+ * 副作用：不修改输入、不读写数据库；结束标记来自 intent，逻辑时钟单位为 tick。
+ * 线程与生命周期：调用线程同步执行；返回状态拥有字段，不保存输入引用或在后台执行。
+ */
 domain::Result<domain::ScenarioState> advanceSyntheticState(
     const domain::ScenarioState& current, const domain::ActorIntent& intent) {
     domain::ScenarioState next;
@@ -80,6 +87,13 @@ domain::Result<domain::SimulationSession> stepSyntheticSession(
     auto loaded = repository.loadSimulationSession(session_id);
     if (!loaded.ok()) return loaded;
     auto& current_session = *loaded.value;
+    /*
+     * 功能：寻找本命令预留的历史回合，避免重放时再消耗测试预算。
+     * 参数：turn：输入，当前会话数组中的只读回合引用。
+     * 返回：请求摘要以 command_id 加分隔符开头时为 true。
+     * 失败：字符串构造异常向外传播；不校验历史回合状态。
+     * 副作用：无；同步借用 command_id，闭包不逃逸当前查找。
+     */
     const auto replay_turn = std::find_if(current_session.turns.begin(), current_session.turns.end(), [&](const auto& turn) {
         return turn.call.request_hash.starts_with(command_id + ':');
     });
@@ -100,6 +114,13 @@ domain::Result<domain::SimulationSession> stepSyntheticSession(
             {domain::ErrorCode::rule_conflict, "当前会话不能继续执行", false, "恢复会话或新建推演"});
     auto head = repository.loadHead(current_session.branch_id);
     if (!head.ok()) return domain::Result<domain::SimulationSession>::failure(*head.error);
+    /*
+     * 功能：定位已返回意图但待人工审核的回合，走恢复提交路径。
+     * 参数：turn：输入，会话数组中的只读回合引用。
+     * 返回：状态为 needs_review 时为 true；无匹配由 find_if 返回尾迭代器。
+     * 失败：无显式失败路径。
+     * 副作用：无；无捕获，同步调用，不保存回合引用。
+     */
     const auto pending = std::find_if(current_session.turns.begin(), current_session.turns.end(), [](const auto& turn) {
         return turn.status == "needs_review";
     });
@@ -134,6 +155,13 @@ domain::Result<domain::SimulationSession> stepSyntheticSession(
         command_id + ":commit", reserved.value->id, current_session.revision + 1,
         *proposed.value, std::move(*next.value), draft, input_tokens, output_tokens);
     if (!committed.ok()) return committed;
+    /*
+     * 功能：从事实提交结果中找回本次预留回合，决定是否完成叙述。
+     * 参数：turn：输入，提交后会话中的只读回合引用。
+     * 返回：回合 ID 与 reserved 中的预留 ID 一致时为 true。
+     * 失败：无显式失败路径；缺失匹配由调用方转为存储错误。
+     * 副作用：无；同步借用 reserved，其结果在查找期间保持有效。
+     */
     const auto committed_turn = std::find_if(committed.value->turns.begin(), committed.value->turns.end(), [&](const auto& turn) {
         return turn.id == reserved.value->id;
     });

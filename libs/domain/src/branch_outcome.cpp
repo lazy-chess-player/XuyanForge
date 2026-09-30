@@ -1,4 +1,3 @@
 #include "xuyan/domain/branch_outcome.h"
 
-// Branch outcome records are plain immutable transfer objects; comparison rules
-// live in the application service because they require persisted commit chains.
+// 分支结果是独立值快照；比较规则需要读取持久化提交链，因此由应用服务实现。

@@ -2,6 +2,7 @@
 #include "candidate_review_view_model.h"
 #include "source_view_model.h"
 #include "extraction_job_view_model.h"
+#include "view_model_text.h"
 
 #include "xuyan/application/world_graph_service.h"
 #include "xuyan/application/extraction_job_service.h"
@@ -29,69 +30,150 @@
 #include <string>
 #include <atomic>
 
-/** @brief 仅在测试程序内等待工作线程结束，刻意保留尚未执行的界面结束回调。 */
+/*
+ * 职责：测试专用友元入口，只等待解析模型自有线程，不消费界面结束回调，以复现末尾竞态。
+ * 生命周期与线程：无成员资源；测试主线程调用，所借模型及其线程池须存活。
+ */
 struct ExtractionJobViewModelTestAccess {
-    /** @brief 等待已排队的自有线程，不处理Qt事件，以稳定复现检查点末尾竞态。 */
+    /*
+     * 功能：等待已排队的自有线程，不处理Qt事件，以稳定复现检查点末尾竞态。
+     * 参数：model：输入，仍存活的视图模型引用，仅借用；允许 worker 已结束而界面回调未处理。
+     * 返回：无。
+     * 失败：10000 毫秒内线程池未结束抛 runtime_error。
+     * 副作用：等待自有线程池，不处理 Qt 事件、不执行排队的结束回调。
+     * 线程与生命周期：测试主线程同步调用，模型须覆盖 waitForDone；用于稳定制造末尾竞态。
+     */
     static void joinWorker(ExtractionJobViewModel& model) {
-        if (!model.worker_pool_.waitForDone(10000)) throw std::runtime_error("worker join timed out");
+        if (!model.worker_pool_.waitForDone(10000)) throw std::runtime_error("等待解析工作线程退出超时");
     }
 };
 
 namespace {
 
-/** @brief 在断言失败时给出具体的回归场景。 */
+/*
+ * 功能：在断言失败时给出具体的回归场景。
+ * 参数：condition：输入，true 为通过；message：输入，非空零结尾失败说明，仅本调用借用。
+ * 返回：无。
+ * 失败：condition 为 false 抛 runtime_error，异常构造失败继续传播。
+ * 副作用：只生成失败异常，不改变视图模型或测试数据。
+ * 线程与生命周期：在调用线程同步执行，不保存指针。
+ */
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-/** @brief 为本次进程创建独立的临时数据库目录并在退出时清理。 */
+/*
+ * 职责：持有 UUID 独占的系统临时目录清理责任，向用例提供数据库路径，不拥有活动连接。
+ * 生命周期与线程：主线程用例作用域内创建、最后销毁；不得复制出第二份清理责任。
+ */
 class TemporaryWorkspace final {
 public:
+    /*
+     * 功能：创建带 UUID 的独占测试目录。
+     * 参数：无。
+     * 返回：初始化 directory_ 并尝试建立目录。
+     * 失败：临时路径、UUID 字符串或建目录异常传播；不单独检查 create_directories 的布尔返回。
+     * 副作用：只在系统临时根写目录，不读取用户工作区或预置资料。
+     * 线程与生命周期：主线程同步执行，目录寿命由本守卫覆盖所有服务/线程。
+     */
     TemporaryWorkspace() {
         directory_ = std::filesystem::temp_directory_path() /
             ("xuyan-vm-test-" + QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString());
         std::filesystem::create_directories(directory_);
     }
+    /*
+     * 功能：清理当前用例的 UUID 临时目录及内容。
+     * 参数：无。
+     * 返回：完成删除尝试及守卫销毁。
+     * 失败：删除错误通过 error_code 忽略，无失败上报；不重试。
+     * 副作用：递归删除本对象创建的 directory_，不删除临时根。
+     * 线程与生命周期：主线程同步析构；所有模型、文件和工作线程必须先退出，不接管用户目录。
+     */
     ~TemporaryWorkspace() { std::error_code ignored; std::filesystem::remove_all(directory_, ignored); }
-    /** @brief 返回仅供当前测试使用的数据库文件路径。 */
+    /*
+     * 功能：返回仅供当前测试使用的数据库文件路径。
+     * 参数：无。
+     * 返回：本对象独占目录下 workspace.sqlite 的路径值，尚未建库也可返回。
+     * 失败：路径构造/分配异常传播。
+     * 副作用：只生成路径，不读取文件或创建数据库。
+     * 线程与生命周期：调用线程同步只读；路径所指目录只在 TemporaryWorkspace 存活期间有效。
+     */
     std::filesystem::path database() const { return directory_ / "workspace.sqlite"; }
 private:
+    /* 自有 UUID 临时目录绝对路径，构造时赋值、无外部默认目录；database 读取、析构清理，寿命随守卫。 */
     std::filesystem::path directory_;
 };
 
-/** @brief 循环处理 Qt 事件直到任一视图模型的异步读取结束或超时。 */
+/*
+ * 功能：循环处理 Qt 事件直到任一视图模型的异步读取结束或超时。
+ * 参数：view_model：输入，调用线程拥有的视图模型引用，须有 busy 与 changed 接口。
+ * 返回：无；返回时 busy 为 false，不代表 errorText 为空。
+ * 失败：事件循环超时且仍 busy 时断言抛 runtime_error；未单独检查业务错误。
+ * 副作用：必要时运行最多 10000 毫秒 Qt 局部事件循环，处理读取回调与信号。
+ * 线程与生命周期：主线程执行；临时 loop 为连接上下文，销毁时断开借用捕获，模型须全程存活。
+ */
 template <typename ViewModel>
 void waitUntilIdle(ViewModel& view_model) {
     if (!view_model.busy()) return;
     QEventLoop loop;
     QTimer timeout;
     timeout.setSingleShot(true);
+    /*
+     * 功能：收到 changed 后结束已空闲模型的局部等待。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无显式失败路径。
+     * 副作用：busy 为 false 时调用 loop.quit。
+     * 线程与生命周期：主线程信号回调；loop 是连接上下文，销毁自动断开；模型及 loop 引用仅等待期间有效。
+     */
     QObject::connect(&view_model, &ViewModel::changed, &loop, [&] {
         if (!view_model.busy()) loop.quit();
     });
     QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
     timeout.start(10000);
     loop.exec();
-    require(!view_model.busy(), "world view asynchronous read timed out");
+    require(!view_model.busy(), "等待视图模型异步读取超时");
 }
 
-/** @brief 等待来源片段异步落地，避免用固定休眠掩盖回调时序问题。 */
+/*
+ * 功能：等待来源片段异步落地，避免用固定休眠掩盖回调时序问题。
+ * 参数：view_model：输入，来源视图模型可变引用，测试主线程对象，调用期间存活。
+ * 返回：无；previewLoading 为 false 且 errorText 为空时返回。
+ * 失败：10000 毫秒后仍加载或错误文本非空时断言抛 runtime_error。
+ * 副作用：必要时运行局部事件循环处理预览结果，不主动改源文。
+ * 线程与生命周期：主线程执行；连接以上下文 loop 管理，捕获只在等待期间有效。
+ */
 void waitUntilPreviewReady(SourceViewModel& view_model) {
     if (!view_model.previewLoading()) return;
     QEventLoop loop;
     QTimer timeout;
     timeout.setSingleShot(true);
+    /*
+     * 功能：收到 changed 后结束预览等待。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无显式失败路径。
+     * 副作用：previewLoading 为 false 时退出 loop。
+     * 线程与生命周期：主线程信号回调，loop 上下文管理连接和借用生命周期。
+     */
     QObject::connect(&view_model, &SourceViewModel::changed, &loop, [&] {
         if (!view_model.previewLoading()) loop.quit();
     });
     QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
     timeout.start(10000);
     loop.exec();
-    require(!view_model.previewLoading(), "source preview read timed out");
-    require(view_model.errorText().isEmpty(), "source preview read failed");
+    require(!view_model.previewLoading(), "等待来源预览读取超时");
+    require(view_model.errorText().isEmpty(), "来源预览读取失败");
 }
 
-/** @brief 执行仅用于当前临时数据库的合成 SQL，失败时携带 SQLite 原因。 */
+/*
+ * 功能：执行仅用于当前临时数据库的合成 SQL，失败时携带 SQLite 原因。
+ * 参数：database：输入，测试独占且结构已初始化的 SQLite 路径，只读借用；sql：输入，非空零结尾自有 SQL，不接受用户文本。
+ * 返回：无。
+ * 失败：连接失败断言抛异常；SQL 失败关闭正常打开的连接后抛 SQLite 原因；不包装任意其他异常。
+ * 副作用：打开测试连接并执行 SQL，可写数据；不自行加事务，语句是否原子由传入 SQL 决定。
+ * 线程与生命周期：调用线程同步执行，正常执行路径关闭连接，不接管数据库文件。
+ */
 void executeFixtureSql(const std::filesystem::path& database, const char* sql) {
     sqlite3* handle = nullptr;
     require(sqlite3_open(database.string().c_str(), &handle) == SQLITE_OK && handle != nullptr,
@@ -102,7 +184,14 @@ void executeFixtureSql(const std::filesystem::path& database, const char* sql) {
     if (status != SQLITE_OK) throw std::runtime_error("candidate fixture SQL failed: " + error);
 }
 
-/** @brief 构造超过一页的两世界候选及完整原文任务快照，仅用于离线列表回归。 */
+/*
+ * 功能：构造超过一页的两世界候选及完整原文任务快照，仅用于离线列表回归。
+ * 参数：database：输入，测试独占且已建两世界的库路径，须无同标识来源/任务/候选，只借用本次调用。
+ * 返回：无。
+ * 失败：SQL 建立失败经 executeFixtureSql 抛异常，不转换成空列表。
+ * 副作用：在单事务插入甲世界 101 条、乙世界 1 条候选及来源/任务/输入和生成快照。
+ * 线程与生命周期：同步调用，不访问模型或用户工作区；所有文本为测试自有。
+ */
 void seedCandidates(const std::filesystem::path& database) {
     executeFixtureSql(database, R"SQL(
 PRAGMA foreign_keys=ON;
@@ -129,7 +218,14 @@ COMMIT;
 )SQL");
 }
 
-/** @brief 给两个世界分别写入一条合成时间事件，以检查跨世界隔离。 */
+/*
+ * 功能：给两个世界分别写入一条合成时间事件，以检查跨世界隔离。
+ * 参数：database：输入，当前测试专用库路径，不得已有 world-a/world-b，调用期间借用。
+ * 返回：无。
+ * 失败：创建世界或事件失败时断言抛异常，前面已成功的独立命令不会整体回滚。
+ * 副作用：显式创建两个世界及各一个时间事件，不注入生产初始化路径。
+ * 线程与生命周期：同步执行本线程仓储，连接由局部服务释放。
+ */
 void seedWorlds(const std::filesystem::path& database) {
     xuyan::storage::WorkspaceRepository repository(database);
     require(repository.createWorldTemplate("world-a", "测试世界甲").ok(), "seed world A failed");
@@ -145,7 +241,14 @@ void seedWorlds(const std::filesystem::path& database) {
     }
 }
 
-/** @brief 验证关系/地点到界面数据的映射保留未知值、已知零、方向及真实性，不修改可见控件。 */
+/*
+ * 功能：验证关系/地点到界面数据的映射保留未知值、已知零、方向及真实性，不修改可见控件。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：新建独占世界，写已知零/未知关系和位置，断言 QVariant 映射保留方向和真实性。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testGraphSemanticMapping() {
     TemporaryWorkspace workspace;
     xuyan::storage::WorkspaceRepository repository(workspace.database());
@@ -204,7 +307,14 @@ void testGraphSemanticMapping() {
     require(model.relations().isEmpty() && model.locations().isEmpty(), "clearing world must clear graph semantic values");
 }
 
-/** @brief 检查空选择不回退首个世界，以及 A→B→A 切换不串数据。 */
+/*
+ * 功能：检查空选择不回退首个世界，以及 A→B→A 切换不串数据。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：只读共享夹具库，异步选择 A→B→A 和清空，不回退首个世界。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testSelectionAndIsolation(const std::filesystem::path& database) {
     WorldViewsViewModel view_model(database);
     require(!view_model.busy() && view_model.timeline().isEmpty(), "empty selection must not load data");
@@ -230,17 +340,37 @@ void testSelectionAndIsolation(const std::filesystem::path& database) {
     require(!view_model.busy() && view_model.timeline().isEmpty(), "refresh must not select first world");
 }
 
-/** @brief 阻塞线程池后排队两次读取，验证迟到的 A 回调不能覆盖 B。 */
+/*
+ * 功能：阻塞线程池后排队两次读取，验证迟到的 A 回调不能覆盖 B。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：临时把全局池设一线程，阻塞后排队 A/B 读取，放行等待并核对迟到结果；正常路径恢复池上限。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testLateCallbackIsolation(const std::filesystem::path& database) {
     auto* pool = QThreadPool::globalInstance();
     const auto old_limit = pool->maxThreadCount();
     pool->setMaxThreadCount(1);
     QSemaphore started, release;
+    /*
+     * 功能：为世界视图迟到结果占用唯一池线程。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无超时检查，release 未放行时 acquire 会持续阻塞。
+     * 副作用：先通知 started 再等待 release；不读库或触发业务发送。
+     * 线程与生命周期：全局线程池执行；信号量引用须存活到正常路径 waitForDone，主线程放行后恢复池上限。
+     */
     pool->start([&] { started.release(); release.acquire(); });
     started.acquire();
     WorldViewsViewModel view_model(database);
     view_model.setWorldId("world-a");
+    /* 忙碌期间重复刷新不能另开读取；世界切换须推进有效代次，使已排队的甲世界回调失效。 */
+    view_model.refresh();
+    view_model.refresh();
     view_model.setWorldId("world-b");
+    view_model.refresh();
+    require(view_model.busy() && view_model.timeline().isEmpty(), "重复刷新须保持新世界读取忙碌且不显示旧结果");
     require(view_model.timeline().isEmpty(), "world switch must clear stale data immediately");
     release.release();
     waitUntilIdle(view_model);
@@ -255,7 +385,57 @@ void testLateCallbackIsolation(const std::filesystem::path& database) {
     pool->setMaxThreadCount(old_limit);
 }
 
-/** @brief 检查候选校对在世界、页码和末页删除后的数据隔离。 */
+/*
+ * 功能：验证世界视图仓储构造失败会回主线程报错、结束忙碌态，并能在修复临时路径后刷新。
+ * 参数：无。
+ * 返回：无；目录碰撞失败及修复后的时间线读取均满足断言时返回。
+ * 失败：独占目录创建/删除、修复建库或异步等待失败抛异常；未捕获的工作线程异常属于被测缺陷。
+ * 副作用：将自有 workspace.sqlite 路径暂建为空目录以制造 SQLite 打开错误，再只删除该空目录；
+ *   在相同路径显式创建测试世界和一条事件，刷新并检查成功；不触碰用户资料、不开网络。
+ * 线程与生命周期：测试主线程创建模型和运行事件循环；仓储初始化在模型后台执行。
+ *   目录守卫覆盖模型及后台读取，所有引用仅在当前用例存活，退出由守卫清理。
+ */
+void testWorldRefreshFailureAndRetry() {
+    TemporaryWorkspace workspace;
+    const auto database = workspace.database();
+    require(std::filesystem::create_directory(database), "世界视图失败回归必须在独占目录创建空目录碰撞");
+    WorldViewsViewModel view_model(database);
+    view_model.setWorldId("world-refresh-retry");
+    waitUntilIdle(view_model);
+    require(!view_model.busy() && !view_model.errorText().isEmpty()
+                && view_model.versions().isEmpty() && view_model.timeline().isEmpty()
+                && view_model.relations().isEmpty() && view_model.locations().isEmpty()
+                && view_model.routes().isEmpty() && view_model.instances().isEmpty(),
+            "世界视图读取失败必须结束忙碌态、显示错误并保持所有列表为空");
+    /* 这里只删除刚创建且仍为空的精确碰撞目录；SQLite 构造失败已结束，不递归操作父目录。 */
+    require(std::filesystem::remove(database), "世界视图失败回归必须移除本例创建的空碰撞目录");
+    {
+        xuyan::storage::WorkspaceRepository repository(database);
+        require(repository.createWorldTemplate("world-refresh-retry", "视图刷新重试测试").ok(),
+                "刷新重试必须显式创建临时世界");
+        xuyan::domain::TimelineEvent event;
+        event.id = "world-refresh-retry-event";
+        event.world_id = "world-refresh-retry";
+        event.name = "修复后的测试事件";
+        require(repository.saveTimelineEvent("world-refresh-retry-create", std::move(event), 0).ok(),
+                "刷新重试必须显式创建一条临时时间事件");
+    }
+    view_model.refresh();
+    waitUntilIdle(view_model);
+    require(!view_model.busy() && view_model.errorText().isEmpty()
+                && view_model.timeline().size() == 1
+                && view_model.timeline().front().toMap().value("id").toString() == "world-refresh-retry-event",
+            "修复测试路径后世界视图刷新必须成功并清除旧错误");
+}
+
+/*
+ * 功能：检查候选校对在世界、页码和末页删除后的数据隔离。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：读取两页并删除甲世界末条候选，刷新后恢复页码，检查切世界及清空。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testCandidatePaging(const std::filesystem::path& database) {
     CandidateReviewViewModel view_model(database);
     require(!view_model.busy() && view_model.candidates().isEmpty(), "empty candidate selection must not load data");
@@ -300,12 +480,27 @@ void testCandidatePaging(const std::filesystem::path& database) {
             "empty world must clear candidate queue");
 }
 
-/** @brief 验证排队的旧世界候选读取不能覆盖当前世界的队列。 */
+/*
+ * 功能：验证排队的旧世界候选读取不能覆盖当前世界的队列。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：阻塞单线程全局池，排队旧世界候选读取，检查新世界列表不被覆盖；正常路径恢复池配置。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testCandidateLateCallback(const std::filesystem::path& database) {
     auto* pool = QThreadPool::globalInstance();
     const auto old_limit = pool->maxThreadCount();
     pool->setMaxThreadCount(1);
     QSemaphore started, release;
+    /*
+     * 功能：为候选迟到结果占用唯一池线程。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无超时检查，release 未放行时 acquire 会持续阻塞。
+     * 副作用：先通知 started 再等待 release；不读库或触发业务发送。
+     * 线程与生命周期：全局线程池执行；信号量引用须存活到正常路径 waitForDone，主线程放行后恢复池上限。
+     */
     pool->start([&] { started.release(); release.acquire(); });
     started.acquire();
     CandidateReviewViewModel view_model(database);
@@ -320,12 +515,27 @@ void testCandidateLateCallback(const std::filesystem::path& database) {
     pool->setMaxThreadCount(old_limit);
 }
 
-/** @brief 在旧页读取尚未开始时切换审核筛选，确保旧结果不能回填。 */
+/*
+ * 功能：在旧页读取尚未开始时切换审核筛选，确保旧结果不能回填。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：阻塞读取后切审核筛选，检查旧待审结果不回填；正常路径恢复全局池配置。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testCandidateFilterDuringRead(const std::filesystem::path& database) {
     auto* pool = QThreadPool::globalInstance();
     const auto old_limit = pool->maxThreadCount();
     pool->setMaxThreadCount(1);
     QSemaphore started, release;
+    /*
+     * 功能：为候选筛选竞态占用唯一池线程。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无超时检查，release 未放行时 acquire 会持续阻塞。
+     * 副作用：先通知 started 再等待 release；不读库或触发业务发送。
+     * 线程与生命周期：全局线程池执行；信号量引用须存活到正常路径 waitForDone，主线程放行后恢复池上限。
+     */
     pool->start([&] { started.release(); release.acquire(); });
     started.acquire();
     CandidateReviewViewModel view_model(database);
@@ -345,7 +555,14 @@ void testCandidateFilterDuringRead(const std::filesystem::path& database) {
     pool->setMaxThreadCount(old_limit);
 }
 
-/** @brief 删除末页全部候选后，页码和翻页状态都恢复为空队列。 */
+/*
+ * 功能：删除末页全部候选后，页码和翻页状态都恢复为空队列。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：删除甲世界全部候选后刷新，核对页码、总数、按钮状态和列表为空。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testCandidateEmptyLastPage(const std::filesystem::path& database) {
     CandidateReviewViewModel view_model(database);
     view_model.setWorldId("world-a");
@@ -363,7 +580,14 @@ void testCandidateEmptyLastPage(const std::filesystem::path& database) {
             "empty last page must reset navigation and visible candidates");
 }
 
-/** @brief 验证来源列表只展示当前世界，空世界不会回退或泄露旧章节。 */
+/*
+ * 功能：验证来源列表只展示当前世界，空世界不会回退或泄露旧章节。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：只读夹具来源列表，切世界/清空后核对无旧来源泄露。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testSourceSelection(const std::filesystem::path& database) {
     SourceViewModel view_model(database);
     require(view_model.sourceItems().isEmpty(), "empty source selection must not load data");
@@ -380,12 +604,27 @@ void testSourceSelection(const std::filesystem::path& database) {
             "empty world must clear source list");
 }
 
-/** @brief 验证来源后台读取经历 A→B→A 后不会重放第一轮的结果。 */
+/*
+ * 功能：验证来源后台读取经历 A→B→A 后不会重放第一轮的结果。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：阻塞池后排队 A→B→A，核对代次隔离；正常路径恢复线程池配置。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testSourceLateCallback(const std::filesystem::path& database) {
     auto* pool = QThreadPool::globalInstance();
     const auto old_limit = pool->maxThreadCount();
     pool->setMaxThreadCount(1);
     QSemaphore started, release;
+    /*
+     * 功能：为来源代次隔离占用唯一池线程。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无超时检查，release 未放行时 acquire 会持续阻塞。
+     * 副作用：先通知 started 再等待 release；不读库或触发业务发送。
+     * 线程与生命周期：全局线程池执行；信号量引用须存活到正常路径 waitForDone，主线程放行后恢复池上限。
+     */
     pool->start([&] { started.release(); release.acquire(); });
     started.acquire();
     SourceViewModel view_model(database);
@@ -402,7 +641,14 @@ void testSourceLateCallback(const std::filesystem::path& database) {
     pool->setMaxThreadCount(old_limit);
 }
 
-/** @brief 验证导入和章节保存失败会结束忙碌态，并能在修复本地文件后重试。 */
+/*
+ * 功能：验证导入和章节保存失败会结束忙碌态，并能在修复本地文件后重试。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：独占目录先导入缺失文件，再写合成正文重试；临时改名标准化资产制造章节保存失败，恢复后再保存。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testSourceFailureAndRetry() {
     TemporaryWorkspace workspace;
     const auto database = workspace.database();
@@ -456,7 +702,14 @@ void testSourceFailureAndRetry() {
             "chapter save retry must succeed after restoring the local source asset");
 }
 
-/** @brief 用运行时生成的长章节验证窗口边界、跨章证据定位和过期回调隔离。 */
+/*
+ * 功能：用运行时生成的长章节验证窗口边界、跨章证据定位和过期回调隔离。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：独占目录生成两章长文本及表情证据，检查 50000 码点窗口、跨章高亮、阅读位置恢复、外部改章和旧预览回调。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testLongChapterWindows() {
     TemporaryWorkspace workspace;
     const auto database = workspace.database();
@@ -483,7 +736,14 @@ void testLongChapterWindows() {
     auto imported = importer.importTextFile("preview-source-command", manuscript, "1", "world-preview");
     require(imported.ok() && imported.value->chapters.size() == 2, "long chapter import failed");
     xuyan::application::EvidenceService evidence_service(database);
-    /** @brief 以标准化文本的真实码点坐标创建临时证据，不在产品内置样例。 */
+    /*
+     * 功能：从合成原文换算码点并创建逐字证据。
+     * 参数：command：输入，幂等测试命令标识；quote：输入，自有逐字引文，不能为空且须在 raw 存在；均只读借用。
+     * 返回：引文的绝对 Unicode 码点起点，非字节或 UTF-16 下标。
+     * 失败：找不到引文或证据创建/内容不符时断言抛异常。
+     * 副作用：写当前临时库证据，保留原文不变。
+     * 线程与生命周期：主线程同步调用；raw/服务/实体/来源捕获仅在当前用例存活。
+     */
     const auto make_evidence = [&](const std::string& command, const std::string& quote) {
         const auto byte = raw.find(quote);
         require(byte != std::string::npos, "synthetic quote missing");
@@ -517,7 +777,14 @@ void testLongChapterWindows() {
     require(view_model.previewStart() == 0 && !view_model.canPreviousWindow(),
             "previous window must restore first chapter start");
 
-    /** @brief 从当前来源的证据列表按绝对码点坐标取得稳定下标。 */
+    /*
+     * 功能：按绝对码点起点查当前来源的证据下标。
+     * 参数：start：输入，非负 Unicode 码点起点，非字节。
+     * 返回：当前列表从 0 开始的首个匹配下标，未找到为 -1。
+     * 失败：无显式失败路径，不保证列表在异步刷新期间保持下标。
+     * 副作用：只读 evidenceItems，不保存元素引用。
+     * 线程与生命周期：主线程同步执行，view_model 引用只在当前用例借用。
+     */
     const auto find_evidence = [&](std::size_t start) {
         for (int index = 0; index < view_model.evidenceItems().size(); ++index) {
             if (view_model.evidenceItems()[index].toMap().value("start").toLongLong()
@@ -551,7 +818,14 @@ void testLongChapterWindows() {
                 == QString::fromStdString(second_quote),
             "second evidence must jump across chapters with UTF-16 selection");
     bool flashed_first_chapter = false;
-    /** @brief 记录刷新与保存期间是否曾把阅读位置错误地公布为第一章。 */
+    /*
+     * 功能：观察刷新/保存是否短暂回到错误首章。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无显式失败路径。
+     * 副作用：selectedChapterIndex 为 0 时将 flashed_first_chapter 置 true，不复位。
+     * 线程与生命周期：主线程 changed 回调；测试显式 disconnect 后才释放局部标记，模型为连接上下文。
+     */
     const auto chapter_observer = QObject::connect(&view_model, &SourceViewModel::changed, &view_model, [&] {
         if (view_model.selectedChapterIndex() == 0) flashed_first_chapter = true;
     });
@@ -593,6 +867,14 @@ void testLongChapterWindows() {
     const auto old_limit = pool->maxThreadCount();
     pool->setMaxThreadCount(1);
     QSemaphore started, release;
+    /*
+     * 功能：为长章窗口旧回调占用唯一池线程。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无超时检查，release 未放行时 acquire 会持续阻塞。
+     * 副作用：先通知 started 再等待 release；不读库或触发业务发送。
+     * 线程与生命周期：全局线程池执行；信号量引用须存活到正常路径 waitForDone，主线程放行后恢复池上限。
+     */
     pool->start([&] { started.release(); release.acquire(); });
     started.acquire();
     view_model.selectChapter(0);
@@ -657,7 +939,14 @@ void testLongChapterWindows() {
             "manual source choice must supersede a previous ID-based selection after refresh");
 }
 
-/** @brief 验证任务列表只显示当前世界，外界传入其他世界任务编号时不执行操作。 */
+/*
+ * 功能：验证任务列表只显示当前世界，外界传入其他世界任务编号时不执行操作。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：只读夹具任务列表，传入异世界任务标识测试取消/抽样被拒绝，不向真实模型发送。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testJobSelection(const std::filesystem::path& database) {
     ExtractionJobViewModel view_model(database);
     waitUntilIdle(view_model);
@@ -680,7 +969,14 @@ void testJobSelection(const std::filesystem::path& database) {
     require(view_model.jobs().isEmpty() && !view_model.busy(), "empty world must clear task list");
 }
 
-/** @brief 验证旧任务读取迟到时当前世界列表保持隔离。 */
+/*
+ * 功能：验证旧任务读取迟到时当前世界列表保持隔离。
+ * 参数：database：输入，主入口为本进程创建且已播种的独占测试库路径，只借用本次调用，部分用例会修改候选。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：阻塞池并排队世界任务读取，核对旧结果不能回填；正常路径恢复池上限。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testJobLateCallback(const std::filesystem::path& database) {
     ExtractionJobViewModel view_model(database);
     waitUntilIdle(view_model);
@@ -688,6 +984,14 @@ void testJobLateCallback(const std::filesystem::path& database) {
     const auto old_limit = pool->maxThreadCount();
     pool->setMaxThreadCount(1);
     QSemaphore started, release;
+    /*
+     * 功能：为任务世界隔离占用唯一池线程。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无超时检查，release 未放行时 acquire 会持续阻塞。
+     * 副作用：先通知 started 再等待 release；不读库或触发业务发送。
+     * 线程与生命周期：全局线程池执行；信号量引用须存活到正常路径 waitForDone，主线程放行后恢复池上限。
+     */
     pool->start([&] { started.release(); release.acquire(); });
     started.acquire();
     view_model.setWorldId("world-a");
@@ -703,12 +1007,27 @@ void testJobLateCallback(const std::filesystem::path& database) {
     pool->setMaxThreadCount(old_limit);
 }
 
-/** @brief 等待自有解析批次及其结束后的列表刷新，不依赖固定休眠。 */
+/*
+ * 功能：等待自有解析批次及其结束后的列表刷新，不依赖固定休眠。
+ * 参数：model：输入，当前主线程仍存活的解析视图模型可变引用。
+ * 返回：无；running/busy 均结束才通过。
+ * 失败：局部事件循环限时 10000 毫秒，后续 waitUntilIdle 超时或仍 running 时抛异常。
+ * 副作用：处理 Qt 事件、等待批次结束及刷新；不主动暂停或取消任务。
+ * 线程与生命周期：主线程同步等待；loop 上下文销毁解除捕获，工作线程由模型拥有和等待。
+ */
 void waitUntilBatchStopped(ExtractionJobViewModel& model) {
     if (model.running() || model.busy()) {
         QEventLoop loop;
         QTimer timeout;
         timeout.setSingleShot(true);
+        /*
+         * 功能：等待解析与列表刷新同时结束。
+         * 参数：无。
+         * 返回：无。
+         * 失败：无显式失败路径。
+         * 副作用：running/busy 都为 false 时退出 loop。
+         * 线程与生命周期：主线程信号回调；loop 上下文销毁断开，model 须覆盖整个等待。
+         */
         QObject::connect(&model, &ExtractionJobViewModel::changed, &loop, [&] {
             if (!model.running() && !model.busy()) loop.quit();
         });
@@ -717,10 +1036,17 @@ void waitUntilBatchStopped(ExtractionJobViewModel& model) {
     }
     QCoreApplication::processEvents();
     waitUntilIdle(model);
-    require(!model.running(), "background batch failed to stop");
+    require(!model.running(), "后台解析批次未能停止");
 }
 
-/** @brief 在私有临时目录生成多片章节并创建离线任务，正式程序不携带这些数据。 */
+/*
+ * 功能：在私有临时目录生成多片章节并创建离线任务，正式程序不携带这些数据。
+ * 参数：database：输入，调用方拥有的独占临时数据库路径，父目录已存在且无同名夹具，只借用本调用。
+ * 返回：拥有完整步骤的离线任务值，断言至少四片。
+ * 失败：文件写入、导入或切片断言失败抛异常，仓储/文件异常传播。
+ * 副作用：写 batch.md 合成两章，显式创建两个世界、导入并建立离线任务，不发模型。
+ * 线程与生命周期：调用线程同步执行，文件由外层 TemporaryWorkspace 最终清理。
+ */
 xuyan::domain::ExtractionJob createBatchFixture(const std::filesystem::path& database) {
     seedWorlds(database);
     const auto manuscript = database.parent_path() / "batch.md";
@@ -739,11 +1065,34 @@ xuyan::domain::ExtractionJob createBatchFixture(const std::filesystem::path& dat
     return *job.value;
 }
 
-/** @brief 在第一个持久化检查点阻塞调度，测试可明确控制暂停与取消的先后顺序。 */
+/*
+ * 功能：在第一个持久化检查点阻塞调度，测试可明确控制暂停与取消的先后顺序。
+ * 参数：checkpoint：输入输出，首片到达通知信号量引用；release：输入输出，测试发许可的阻塞信号量引用；starts：输入输出，累计启动次数的原子整数引用，初始由用例设 0。
+ * 返回：借用这些对象的 BatchRunner，首轮首片可被测试关卡暂停。
+ * 失败：返回闭包内关卡 10000 毫秒超时抛异常；复制选项/调用进度回调的异常向模型工作线程传播。
+ * 副作用：创建闭包时不启动工作；执行时原子增加启动数、同步调度离线批次并阻塞首片检查点。
+ * 线程与生命周期：主线程创建，模型自有工作线程执行；三个捕获须晚于模型及线程退出销毁，闭包不能跨用例保存。
+ */
 ExtractionJobViewModel::BatchRunner gatedBatch(QSemaphore& checkpoint, QSemaphore& release, std::atomic<int>& starts) {
+    /*
+     * 功能：运行受首片关卡控制的离线批次。
+     * 参数：path：输入，独占测试库路径引用；id：输入，任务标识引用；options：输入，离线选项只读引用，on_progress 须可调用且 stop_token 来自模型。
+     * 返回：离线处理器 Result，成功含持久化任务/处理数/停止原因，失败按错误返回。
+     * 失败：选项复制、处理器或进度回调异常传播到模型工作线程，关卡超时抛异常。
+     * 副作用：原子增加 starts，首轮第一片通知 checkpoint 并等待 release，写离线检查点。
+     * 线程与生命周期：模型工作线程同步执行；返回闭包借用信号量和 starts 到模型 join 结束；本次 options/first_run 覆盖内层回调。
+     */
     return [&](const auto& path, const auto& id, const xuyan::application::OfflineBatchOptions& options) {
         const bool first_run = starts.fetch_add(1) == 0;
         auto gated = options;
+        /*
+         * 功能：将离线进度透传并阻塞首轮首片检查点。
+         * 参数：progress：输入，本次检查点的只读进度，processed_steps 为本批累计片数。
+         * 返回：第二次 options.on_progress 的调度动作。
+         * 失败：关卡 10000 毫秒超时断言抛异常；原进度回调异常传播。
+         * 副作用：原回调调用两次；首轮第一片通知 checkpoint 并等待 release，不改原文。
+         * 线程与生命周期：工作线程在 processBatch 内同步回调；first_run/options 引用不逃逸外层 BatchRunner。
+         */
         gated.on_progress = [&](const auto& progress) {
             options.on_progress(progress);
             if (first_run && progress.processed_steps == 1) {
@@ -756,7 +1105,14 @@ ExtractionJobViewModel::BatchRunner gatedBatch(QSemaphore& checkpoint, QSemaphor
     };
 }
 
-/** @brief 验证显式启动、重复点击防护、片段级暂停及跨进程可读取的续跑检查点。 */
+/*
+ * 功能：验证显式启动、重复点击防护、片段级暂停及跨进程可读取的续跑检查点。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：独占目录生成任务，通过信号量控制首片，检查重复启动拒绝、暂停落库和续跑不重做已完成片。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testBatchPauseAndResume() {
     TemporaryWorkspace workspace;
     const auto job = createBatchFixture(workspace.database());
@@ -789,7 +1145,14 @@ void testBatchPauseAndResume() {
             "all chapters must finish after remaining slices commit");
 }
 
-/** @brief 验证运行中可取消，随后点暂停不能把永久取消降级，已提交片段不删除。 */
+/*
+ * 功能：验证运行中可取消，随后点暂停不能把永久取消降级，已提交片段不删除。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：在首片检查点取消再暂停，检查永久取消不降级且保留已提交片，不能恢复发送。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testBatchCancel() {
     TemporaryWorkspace workspace;
     const auto job = createBatchFixture(workspace.database());
@@ -807,7 +1170,14 @@ void testBatchCancel() {
     require(!model.running() && starts == 1, "cancelled queue must not restart");
 }
 
-/** @brief 验证后台解析期间切换世界不会污染新世界列表或偷偷开始另一个任务。 */
+/*
+ * 功能：验证后台解析期间切换世界不会污染新世界列表或偷偷开始另一个任务。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：后台首片阻塞时切世界，核对旧任务结果仍持久化但不填入新世界列表或启动另一任务。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testBatchWorldIsolation() {
     TemporaryWorkspace workspace;
     const auto job = createBatchFixture(workspace.database());
@@ -826,11 +1196,26 @@ void testBatchWorldIsolation() {
     require(model.jobs().front().toMap().value("status").toString() == "completed", "old world result must remain persisted");
 }
 
-/** @brief 验证未知异常隐藏私有内容并清理运行态，随后可以重新启动同一任务。 */
+/*
+ * 功能：验证未知异常隐藏私有内容并清理运行态，随后可以重新启动同一任务。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：首轮工作闭包抛合成私密标记异常，核对错误脱敏及运行态清理，重启后完成。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testBatchFailureRecovery() {
     TemporaryWorkspace workspace;
     const auto job = createBatchFixture(workspace.database());
     std::atomic<int> calls{0};
+    /*
+     * 功能：首次执行注入异常，重试改为正常离线批次。
+     * 参数：path：输入，测试库路径；id：输入，任务标识；options：输入，离线选项；均只借用本次执行。
+     * 返回：正常重试返回 processBatch 的 Result。
+     * 失败：calls 原子递增前值为 0 时抛合成私密标记 runtime_error，其余异常传播。
+     * 副作用：原子增加 calls，重试写离线检查点，不联网。
+     * 线程与生命周期：模型工作线程执行；calls 生命周期覆盖模型销毁与线程 join。
+     */
     ExtractionJobViewModel model(workspace.database(), nullptr, [&](const auto& path, const auto& id, const auto& options) {
         if (calls.fetch_add(1) == 0) throw std::runtime_error("private-worker-detail");
         return xuyan::application::MockExtractionProcessor(path).processBatch(id, options);
@@ -843,14 +1228,37 @@ void testBatchFailureRecovery() {
     require(model.jobs().front().toMap().value("status").toString() == "completed", "worker failure must remain recoverable");
 }
 
-/** @brief 验证视图模型销毁时请求停止并真正等待自有工作线程，不遗留后台执行者。 */
+/*
+ * 功能：验证视图模型销毁时请求停止并真正等待自有工作线程，不遗留后台执行者。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：关卡阻塞模型自有线程，销毁模型请求停止并解除关卡，核对退出已 join 且无新片。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testBatchDestructionJoinsWorker() {
     TemporaryWorkspace workspace;
     const auto job = createBatchFixture(workspace.database());
     QSemaphore started, release;
     std::atomic<bool> exited{false};
     auto model = std::make_unique<ExtractionJobViewModel>(workspace.database(), nullptr,
+        /*
+         * 功能：等待销毁停止请求后退出工作线程。
+         * 参数：path：输入，测试库路径；id：输入，任务标识；options：输入，含模型 stop_token 的只读选项；引用仅本次执行有效。
+         * 返回：停止令牌已请求时离线处理结果。
+         * 失败：关卡 10000 毫秒未放行抛异常；处理器异常传播，exited 不会提前置 true。
+         * 副作用：注册停止回调唤醒关卡，通知 started，等待后调用处理器并原子设置 exited。
+         * 线程与生命周期：模型自有工作线程运行；捕获信号量/exited 在模型.reset 后仍存活，局部 stop_callback 在返回时注销。
+         */
         [&](const auto& path, const auto& id, const xuyan::application::OfflineBatchOptions& options) {
+            /*
+             * 功能：停止请求唤醒析构等待的工作线程。
+             * 参数：无。
+             * 返回：无。
+             * 失败：QSemaphore::release 无显式业务失败路径。
+             * 副作用：为 release 增加一个许可。
+             * 线程与生命周期：可能在主线程 request_stop 或已请求 token 的注册线程同步调用；回调注册期覆盖所借信号量。
+             */
             std::stop_callback wake(options.stop_token, [&] { release.release(); });
             started.release();
             require(release.tryAcquire(1, 10000), "destructor must request stop");
@@ -866,7 +1274,14 @@ void testBatchDestructionJoinsWorker() {
             "destructor must join before source lifetime ends without sending new slices");
 }
 
-/** @brief 使用真实远程处理器和无网络传输替身，验证显式启动与在途暂停、恢复。 */
+/*
+ * 功能：使用真实远程处理器和无网络传输替身，验证显式启动与在途暂停、恢复。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：临时库保存内存伪凭据，使用真实远程处理器和无网络传输替身，首请求关卡控制暂停/恢复。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testRemoteBatchControls() {
     using namespace xuyan::application;
     TemporaryWorkspace workspace;
@@ -881,11 +1296,29 @@ void testRemoteBatchControls() {
     auto job = ExtractionJobService(workspace.database()).create("vm-remote-job", offline.source_id, 1000, 0, 0, 2048, connection.id);
     require(job.ok(), "remote fixture job failed");
     QSemaphore sending, release;
+    /*
+     * 职责：以第一请求关卡和空候选合成响应模拟远程在途控制，拥有计数而不拥有网络。
+     * 生命周期与线程：局部于当前用例，模型工作线程调用；两信号量由主线程持有，必须晚于模型销毁。
+     */
     class Transport final : public IProviderTransport {
     public:
-        /** @brief 绑定可控的在途请求关卡；只返回合成的空候选，不访问网络。 */
+        /*
+         * 功能：借用第一请求到达通知与放行关卡。
+         * 参数：started：输入输出，到达信号量引用；gate：输入输出，放行信号量引用；均由用例持有。
+         * 返回：初始化两个引用和从零开始的调用计数。
+         * 失败：无显式校验或失败路径。
+         * 副作用：只保存借用引用，不执行发送、不获取许可。
+         * 线程与生命周期：主线程构造，信号量寿命须覆盖模型工作线程调用。
+         */
         Transport(QSemaphore& started, QSemaphore& gate) : started_(started), gate_(gate) {}
-        /** @brief 第一请求等待测试指令，后续请求直接返回合法的空结构化结果。 */
+        /*
+         * 功能：模拟第一请求在途等待，随后返回空 v3 候选。
+         * 参数：第一个未命名 ProviderHttpRequest 引用为请求，第二个未命名 string 引用为伪凭据，第三个未命名 int 为毫秒超时；均忽略，不保存。
+         * 返回：固定成功 HTTP 200、四类空候选结构，无真实网络。
+         * 失败：第一请求关卡 10000 毫秒未获许可时断言抛异常，响应构造/分配异常传播。
+         * 副作用：原子递增 calls；首请求通知 started_ 并阻塞 gate_，取消不打断在途模拟响应。
+         * 线程与生命周期：模型工作线程同步调用；两信号量借用至调用结束，主线程通过关卡控制。
+         */
         xuyan::domain::Result<ProviderTransportResponse> send(const xuyan::providers::ProviderHttpRequest&,
             const std::string&, int) override {
             if (calls.fetch_add(1) == 0) {
@@ -895,14 +1328,33 @@ void testRemoteBatchControls() {
             return xuyan::domain::Result<ProviderTransportResponse>::success({200, false, false,
                 R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v3\",\"prompt_version\":\"extract-v3\",\"entities\":[],\"events\":[],\"relations\":[],\"rules\":[]}"}]}]})"});
         }
+        /* 累计 send 次数，单位次，默认 0；工作线程原子增加，主线程读取断言。 */
         std::atomic<int> calls{0};
     private:
+        /* 借用的首请求到达信号量，无默认值，由构造绑定；工作线程 release，主线程等待，不拥有。 */
         QSemaphore& started_;
+        /* 借用的放行信号量，无默认值，由构造绑定；主线程 release，首请求等待，须覆盖模型寿命。 */
         QSemaphore& gate_;
     } transport(sending, release);
+    /*
+     * 功能：把界面离线批次接口转接到伪传输远程处理器。
+     * 参数：path：输入，测试库路径；id：输入，任务标识；options：输入，片数上限、停止令牌和有效 on_progress，均只读借用。
+     * 返回：转为 OfflineBatchResult 的 Result，远程失败原样传播；非完成/暂停停止归 needs_attention。
+     * 失败：远程处理器、配置复制及进度回调异常向模型工作线程传播。
+     * 副作用：用内存 credentials 和无网络 transport 处理远程队列，写预算/片段检查点，构造停止原因映射。
+     * 线程与生命周期：模型工作线程同步执行；凭据/传输先于模型构造、晚于模型销毁；内层进度捕获不逃逸。
+     */
     ExtractionJobViewModel model(workspace.database(), nullptr, [&](const auto& path, const auto& id, const OfflineBatchOptions& options) {
         RemoteBatchOptions remote;
         remote.maximum_steps = options.maximum_steps; remote.stop_token = options.stop_token;
+        /*
+         * 功能：将远程持久化进度转换为界面离线动作。
+         * 参数：progress：输入，远程进度只读引用，计数按原值传递。
+         * 返回：离线 cancel/pause 分别映射远程 cancel/pause，其余为 proceed。
+         * 失败：原 options.on_progress 异常传播。
+         * 副作用：调用原进度回调，不直接写库或接触响应正文。
+         * 线程与生命周期：工作线程 processBatch 内同步调用，options 引用只在外层转接调用有效。
+         */
         remote.on_progress = [&](const auto& progress) {
             const auto action = options.on_progress({progress.job_id, progress.total_steps,
                 progress.completed_steps, progress.processed_steps, progress.revision});
@@ -931,10 +1383,25 @@ void testRemoteBatchControls() {
             "remote resume must send only remaining slices");
 }
 
-/** @brief 后台已让出而结束通知仍排队时，取消不能被最终状态刷新吞掉。 */
+/*
+ * 功能：后台已让出而结束通知仍排队时，取消不能被最终状态刷新吞掉。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：工作线程结束但 Qt 完成回调尚未处理时取消，核对持久化取消不被刷新吞掉。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testLateCheckpointCancellation() {
     TemporaryWorkspace workspace;
     const auto job = createBatchFixture(workspace.database());
+    /*
+     * 功能：单次只处理一个片段以制造结束回调排队窗口。
+     * 参数：path：输入，测试库路径；id：输入，任务标识；options：输入，当前离线选项，只读借用。
+     * 返回：processBatch 的 Result，最多处理一片。
+     * 失败：选项复制或处理器异常传播到模型工作线程。
+     * 副作用：复制选项并将 maximum_steps 设 1，不改变调用方 options；写最多一片检查点。
+     * 线程与生命周期：无捕获，模型工作线程同步执行；选项副本覆盖处理期。
+     */
     ExtractionJobViewModel model(workspace.database(), nullptr, [](const auto& path, const auto& id, const auto& options) {
         auto one_step = options;
         one_step.maximum_steps = 1;
@@ -952,11 +1419,26 @@ void testLateCheckpointCancellation() {
             "late checkpoint cancellation must persist without losing committed output");
 }
 
-/** @brief 明确取消后立即关闭视图模型，尚未处理的结束回调不应丢失取消意图。 */
+/*
+ * 功能：明确取消后立即关闭视图模型，尚未处理的结束回调不应丢失取消意图。
+ * 参数：无。
+ * 返回：无；全部断言满足时正常返回。
+ * 失败：断言、10000 毫秒等待超时或未预期的文件/仓储异常向入口传播；预期业务失败须按断言保持拒绝。
+ * 副作用：工作线程结束后取消并立即销毁模型，核对取消落库及迟到回调安全。
+ * 线程与生命周期：测试主线程调用，Qt 回调回主线程；后台由测试池或模型拥有，引用捕获须覆盖线程等待；失败路径不承诺恢复所有全局池设置。
+ */
 void testLateCancellationBeforeExit() {
     TemporaryWorkspace workspace;
     const auto job = createBatchFixture(workspace.database());
     auto model = std::make_unique<ExtractionJobViewModel>(workspace.database(), nullptr,
+        /*
+         * 功能：单片处理后保留排队结束通知供立即关闭回归。
+         * 参数：path：输入，测试库路径；id：输入，任务标识；options：输入，当前离线选项，均只读借用。
+         * 返回：processBatch 的 Result，片数上限固定一片。
+         * 失败：选项复制或处理器异常传播到模型工作线程。
+         * 副作用：只改选项副本上限、写一片检查点，不修改原选项。
+         * 线程与生命周期：无捕获，工作线程执行，模型销毁时等待结束，不留下后台对象。
+         */
         [](const auto& path, const auto& id, const auto& options) {
             auto one_step = options; one_step.maximum_steps = 1;
             return xuyan::application::MockExtractionProcessor(path).processBatch(id, one_step);
@@ -973,18 +1455,44 @@ void testLateCancellationBeforeExit() {
     QCoreApplication::processEvents();
 }
 
+/*
+ * 功能：确认凭据补偿失败显示独立中文警示，不把底层详情或秘密直接送上界面。
+ * 参数：无。
+ * 返回：无；断言满足则正常结束。
+ * 失败：错误分类映射丢失或泄露错误正文时由 require 抛异常。
+ * 副作用：仅构造内存错误值，不访问凭据设施、数据库或网络。
+ */
+void testCredentialConsistencyDisplayText() {
+    const xuyan::domain::Error error{xuyan::domain::ErrorCode::credential_consistency_failed,
+        "private-error-detail", false, "private-action-detail"};
+    const auto displayed = view_model_text::errorText(error);
+    require(displayed.contains(QStringLiteral("人工核对"))
+            && !displayed.contains(QStringLiteral("private-error-detail"))
+            && !displayed.contains(QStringLiteral("private-action-detail")),
+            "compensation failure must show a distinct safe Chinese instruction");
+}
+
 } // namespace
 
-/** @brief 运行世界视图模型的异步选择与回调隔离回归。 */
+/*
+ * 功能：运行世界视图模型的异步选择与回调隔离回归。
+ * 参数：argc：输入输出，命令行参数数目，Qt 可修改；argv：输入输出，命令行字符指针数组，由调用环境提供并须覆盖应用寿命。
+ * 返回：所有所执行断言满足返回 0；捕获 std::exception 打印失败后返回 1。
+ * 失败：用例异常进入入口 catch，非标准异常不捕获。
+ * 副作用：建立 Qt Core 应用、独占临时库并运行异步回归，打印结果；使用伪传输，不访问付费网络。
+ * 线程与生命周期：入口主线程运行事件循环等待，测试模型负责线程退出，目录晚于模型释放。
+ */
 int main(int argc, char* argv[]) {
     QCoreApplication application(argc, argv);
     try {
         TemporaryWorkspace workspace;
         seedWorlds(workspace.database());
         seedCandidates(workspace.database());
+        testCredentialConsistencyDisplayText();
         testGraphSemanticMapping();
         testSelectionAndIsolation(workspace.database());
         testLateCallbackIsolation(workspace.database());
+        testWorldRefreshFailureAndRetry();
         testCandidatePaging(workspace.database());
         testCandidateLateCallback(workspace.database());
         testCandidateFilterDuringRead(workspace.database());
@@ -1008,7 +1516,7 @@ int main(int argc, char* argv[]) {
             seedCandidates(empty_page_workspace.database());
             testCandidateEmptyLastPage(empty_page_workspace.database());
         }
-        std::cout << "World, candidate, source and job view-model tests passed\n";
+        std::cout << "世界、候选、来源与任务视图模型测试通过\n";
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << exception.what() << '\n';

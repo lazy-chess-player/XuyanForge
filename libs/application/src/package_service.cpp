@@ -20,19 +20,34 @@ using xuyan::domain::Result;
 using xuyan::domain::WorldEntity;
 using xuyan::package::JsonValue;
 
-/** @brief 把包格式或内容校验失败转换为用户可处理的错误。 */
+/*
+ * 功能：将世界包或人物包的格式校验失败包装为中文领域错误。
+ * 参数：message 为按值接收的原因，不应包含私密包正文。
+ * 返回：带检查建议、不可自动重试的错误值。失败：分配异常可传播。
+ * 副作用：仅构造内存对象；线程：同步，不保存输入引用。
+ */
 Error packageError(std::string message) {
     return Error{ErrorCode::validation_failed, std::move(message), false, "检查包版本、摘要和内容后重试"};
 }
 
-/** @brief 把字符串向量转换成包协议的 JSON 数组。 */
+/*
+ * 功能：按原顺序把字符串列表编码为 JSON 数组值。
+ * 参数：values 为调用期间借用的字符串向量，允许为空。
+ * 返回：独立拥有的 JSON 数组；空列表得到空数组。失败：分配异常可传播。
+ * 副作用：只读输入，不写包；线程：同步，不保存向量引用。
+ */
 JsonValue strings(const std::vector<std::string>& values) {
     JsonValue::Array array;
     for (const auto& value : values) array.emplace_back(value);
     return JsonValue(std::move(array));
 }
 
-/** @brief 序列化一个世界条目及其修订、删除和扩展字段。 */
+/*
+ * 功能：把一条世界资料记录编码为包内 JSON 对象，保留修订和扩展字段。
+ * 参数：entity 为调用期间借用的已存在条目。
+ * 返回：独立拥有的 JSON 对象。失败：分配异常可传播。
+ * 副作用：只读条目，不写数据库或文件；线程：同步，不保存引用。
+ */
 JsonValue encodeEntity(const WorldEntity& entity) {
     return JsonValue::Object{
         {"aliases", strings(entity.aliases)}, {"attributes_json", entity.attributes_json},
@@ -42,7 +57,12 @@ JsonValue encodeEntity(const WorldEntity& entity) {
     };
 }
 
-/** @brief 序列化人物卡，并按导出选项移除私人备注。 */
+/*
+ * 功能：把人物卡版本编码为包内 JSON 对象，并按导出选择处理私人备注。
+ * 参数：card 为借用的人物卡；include_private 为真时保留私人备注，否则写空串。
+ * 返回：独立拥有的 JSON 对象。失败：分配异常可传播。
+ * 副作用：只读人物卡，不更改原备注；线程：同步，不保存引用。
+ */
 JsonValue encodeBlueprint(const xuyan::domain::CharacterBlueprint& card, bool include_private) {
     return JsonValue::Object{
         {"abilities_json", card.abilities_json}, {"background", card.background},
@@ -56,14 +76,24 @@ JsonValue encodeBlueprint(const xuyan::domain::CharacterBlueprint& card, bool in
     };
 }
 
-/** @brief 读取包对象的必需字符串字段，缺失时返回协议错误。 */
+/*
+ * 功能：从包对象读取必需字符串字段并保留字段级错误。
+ * 参数：object 为借用的 JSON 对象；key 为借用的字段名视图，调用期间有效。
+ * 返回：成功时为字段字符串副本；缺失或类型错误时为失败 Result。
+ * 失败：分配异常可传播；副作用：只读包对象；线程：同步，不保存引用。
+ */
 Result<std::string> requiredString(const JsonValue& object, std::string_view key) {
     const auto* value = object.find(key);
     if (value == nullptr || !value->isString()) return Result<std::string>::failure(packageError("包字段缺失或类型错误：" + std::string(key)));
     return Result<std::string>::success(value->string());
 }
 
-/** @brief 读取包对象的字符串数组并逐项检查类型。 */
+/*
+ * 功能：读取包对象的字符串数组，逐项拒绝非字符串成员。
+ * 参数：object 为借用的 JSON 对象；key 为借用的数组字段名。
+ * 返回：成功时为独立字符串向量，空数组可成功；无效字段返回错误。
+ * 失败：容器分配异常可传播；副作用：只读输入；线程：同步，不保存引用。
+ */
 Result<std::vector<std::string>> stringArray(const JsonValue& object, std::string_view key) {
     const auto* value = object.find(key);
     if (value == nullptr || !value->isArray()) return Result<std::vector<std::string>>::failure(packageError("包数组字段无效：" + std::string(key)));
@@ -75,7 +105,12 @@ Result<std::vector<std::string>> stringArray(const JsonValue& object, std::strin
     return Result<std::vector<std::string>>::success(std::move(result));
 }
 
-/** @brief 解码并校验 JSON 世界条目，不信任包中的修订和扩展字段。 */
+/*
+ * 功能：从包内 JSON 还原世界条目，并校验修订、扩展对象及领域约束。
+ * 参数：value 为调用期间借用的单条 JSON 值，必须是对象。
+ * 返回：成功时为独立条目；字段、类型、修订或领域规则无效时为失败 Result。
+ * 失败：解析或分配异常可传播；副作用：仅内存校验，不写仓储；线程：同步。
+ */
 Result<WorldEntity> decodeEntity(const JsonValue& value) {
     if (!value.isObject()) return Result<WorldEntity>::failure(packageError("实体行必须是 JSON 对象"));
     WorldEntity entity;
@@ -106,7 +141,12 @@ Result<WorldEntity> decodeEntity(const JsonValue& value) {
     return xuyan::domain::validateEntity(std::move(entity));
 }
 
-/** @brief 解码并校验版本化人物卡及其扩展字段。 */
+/*
+ * 功能：从包内 JSON 还原单个人物卡版本，校验版本号和 JSON 扩展字段。
+ * 参数：value 为借用的单条 JSON 值，必须是对象。
+ * 返回：成功时为独立人物卡；缺字段、类型或领域规则错误时为失败 Result。
+ * 失败：解析或分配异常可传播；副作用：仅内存校验，不写仓储；线程：同步。
+ */
 Result<xuyan::domain::CharacterBlueprint> decodeBlueprint(const JsonValue& value) {
     if (!value.isObject()) return Result<xuyan::domain::CharacterBlueprint>::failure(packageError("人物卡版本必须是 JSON 对象"));
     xuyan::domain::CharacterBlueprint card;
@@ -141,14 +181,25 @@ Result<xuyan::domain::CharacterBlueprint> decodeBlueprint(const JsonValue& value
     return xuyan::domain::validateBlueprint(std::move(card));
 }
 
-/** @brief 将世界条目按一行一个 JSON 对象编码为包内容。 */
+/*
+ * 功能：把世界条目按一行一对象编码为 JSONL 载荷。
+ * 参数：entities 为借用的有序条目列表，允许为空。
+ * 返回：独立拥有的 UTF-8 字符串，空列表返回空串。
+ * 失败：编码或分配异常可传播；副作用：只读条目，不写包；线程：同步。
+ */
 std::string entitiesJsonl(const std::vector<WorldEntity>& entities) {
     std::string output;
     for (const auto& entity : entities) { output += xuyan::package::writeJson(encodeEntity(entity)); output.push_back('\n'); }
     return output;
 }
 
-/** @brief 逐行解析世界条目，校验每行协议并限制总数量。 */
+/*
+ * 功能：逐行解析 JSONL 世界条目并限制最多 100000 条。
+ * 参数：jsonl 为调用期间有效的包载荷视图；空行跳过，空载荷可成功。
+ * 返回：独立拥有的条目列表，协议或数量无效时为失败 Result。
+ * 失败：JSON 解析、条目验证失败返回错误；分配异常可传播。
+ * 副作用：仅内存解析；线程：同步，不保存载荷视图。
+ */
 Result<std::vector<WorldEntity>> parseEntities(std::string_view jsonl) {
     std::vector<WorldEntity> result;
     std::size_t begin = 0;
@@ -170,7 +221,13 @@ Result<std::vector<WorldEntity>> parseEntities(std::string_view jsonl) {
     return Result<std::vector<WorldEntity>>::success(std::move(result));
 }
 
-/** @brief 逐行解析人物卡版本，校验每行协议并限制总数量。 */
+/*
+ * 功能：逐行解析 JSONL 人物卡版本并限制最多 10000 条。
+ * 参数：jsonl 为调用期间有效的包载荷视图；空行跳过，空载荷可成功。
+ * 返回：独立拥有的卡片列表，协议或数量无效时为失败 Result。
+ * 失败：JSON 解析、卡片验证失败返回错误；分配异常可传播。
+ * 副作用：仅内存解析；线程：同步，不保存载荷视图。
+ */
 Result<std::vector<xuyan::domain::CharacterBlueprint>> parseBlueprints(std::string_view jsonl) {
     std::vector<xuyan::domain::CharacterBlueprint> result;
     std::size_t begin = 0;
@@ -214,6 +271,12 @@ Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& d
                         : !entities.empty() ? entities.front().world_id : std::string{};
     if (world_id.empty()) return Result<PackageReport>::failure(
         {xuyan::domain::ErrorCode::validation_failed, "还没有可导出的世界", false, "先创建世界并校对资料"});
+    /*
+     * 功能：仅保留目标世界的条目，避免把其他项目资料导入同一包。
+     * 参数：entity 为当前借用条目；world_id 为本次导出的只读世界 ID，调用期间有效。
+     * 返回：不属于目标世界时为真。失败：比较无主动错误。
+     * 副作用：lambda 只读，外层 erase_if 原位删除非目标条目；线程：同步，捕获不逃逸。
+     */
     std::erase_if(entities, [&](const auto& entity) { return entity.world_id != world_id; });
     // 清单记录每个载荷的长度与摘要，导入端据此校验完整性。
     const auto entity_data = entitiesJsonl(entities);

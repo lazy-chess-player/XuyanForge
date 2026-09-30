@@ -5,15 +5,37 @@
 
 namespace xuyan::domain {
 namespace {
-/** @brief 判断地图或关系证据状态是否属于允许值。 */
+/*
+ * 功能：判断图资料证据状态是否受支持。
+ * 参数：
+ *   value：借用内部状态，只接受evidence或assumption。
+ * 返回：合法为true，未知值为false。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：只读参数，不把合法性当成真实证据验证。
+ */
 bool validEvidence(std::string_view value) { return value == "evidence" || value == "assumption"; }
-/** @brief 规范化人工旧调用的真实性，拒绝把说法/假设与事实证据状态混用。 */
+/*
+ * 功能：规范化空真实性并校验证据性质与真实性的组合。
+ * 参数：
+ *   truth：输入输出真实性引用；空值依证据映射为fact或hypothesis。
+ *   evidence：借用证据性质内部值，调用者先检查有效性。
+ * 返回：允许组合为true，不一致为false；失败不还原对空truth的规范化。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：可能修改truth，不写数据库或升级说法为事实。
+ */
 bool normalizeTruth(std::string& truth, std::string_view evidence) {
     if (truth.empty()) truth = evidence == "evidence" ? "fact" : "hypothesis";
     return (truth == "fact" && evidence == "evidence")
         || ((truth == "claim" || truth == "hypothesis") && evidence == "assumption");
 }
-/** @brief 对关系与事件的多值引用删除空项并去重。 */
+/*
+ * 功能：删除集合的空项，按字节序排序并去重。
+ * 参数：
+ *   values：可变字符串集合引用；调用者拥有容器，元素顺序允许改变。
+ * 返回：无；原集合成为有序唯一的非空项集合。
+ * 失败：字符串或容器分配可抛标准异常。
+ * 副作用：原地修改容器并使迭代器失效，不读写文件。
+ */
 void normalize(std::vector<std::string>& values) {
     values.erase(std::remove_if(values.begin(), values.end(), [](const auto& v) { return v.empty(); }), values.end());
     std::sort(values.begin(), values.end()); values.erase(std::unique(values.begin(), values.end()), values.end());
@@ -32,7 +54,7 @@ Result<TimelineEvent> validateTimelineEvent(TimelineEvent event) {
     return Result<TimelineEvent>::success(std::move(event));
 }
 
-/** @brief 校验关系端点、可选强度、时间、方向与可见范围，并保留明确的事实/说法/假设状态。 */
+
 Result<DirectedRelation> validateDirectedRelation(DirectedRelation relation) {
     constexpr std::array visibility{std::string_view{"public"}, std::string_view{"author"}, std::string_view{"restricted"}};
     if (relation.id.empty() || relation.world_id.empty() || relation.from_entity_id.empty() || relation.to_entity_id.empty()
@@ -51,7 +73,7 @@ Result<DirectedRelation> validateDirectedRelation(DirectedRelation relation) {
     return Result<DirectedRelation>::success(std::move(relation));
 }
 
-/** @brief 校验地点层级、成对的可选坐标和真实性，不用零坐标代替未知位置。 */
+
 Result<LocationPlacement> validateLocationPlacement(LocationPlacement placement) {
     if (placement.location_id.empty() || placement.location_id == placement.parent_location_id
         || placement.image_x.has_value() != placement.image_y.has_value()

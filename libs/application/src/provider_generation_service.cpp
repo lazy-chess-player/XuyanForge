@@ -1,5 +1,7 @@
 #include "xuyan/application/provider_generation_service.h"
 
+#include "credential_scope.h"
+
 #include "xuyan/domain/provider_connection.h"
 #include "xuyan/package/json.h"
 #include "xuyan/storage/workspace_repository.h"
@@ -12,26 +14,16 @@ namespace {
 
 using xuyan::domain::ErrorCode;
 
-/** @brief 把连接参数或权限问题转换为可展示的校验错误。 */
+/*
+ * 功能：构造连接配置校验错误。参数：message 为已脱敏中文说明；action 为中文纠正建议，均按值取得。
+ * 返回：不可自动重试的 validation_failed 错误。失败：分配异常可传播。
+ * 副作用：仅构造值，不写日志；线程：同步纯函数，不保留外部引用。
+ */
 xuyan::domain::Error configurationError(std::string message, std::string action) {
     return {ErrorCode::validation_failed, std::move(message), false, std::move(action)};
 }
 
-/** @brief 在成功或异常退出时尽力覆盖本地凭据副本，不负责传输层内部副本。 */
-class SecretWiper final {
-public:
-    /** @brief 借用本次调用的凭据字符串，析构时在其销毁前覆盖内容。 */
-    explicit SecretWiper(std::string& secret) noexcept : secret_(secret) {}
-    SecretWiper(const SecretWiper&) = delete;
-    SecretWiper& operator=(const SecretWiper&) = delete;
-    /** @brief 无论生成调用如何退出，都尽力擦除当前凭据副本。 */
-    ~SecretWiper() noexcept {
-        std::fill(secret_.begin(), secret_.end(), '\0');
-        secret_.clear();
-    }
-private:
-    std::string& secret_;
-};
+/* 凭据清除由同目录 CredentialScope 统一处理，守卫须晚于字符串构造、早于其销毁。 */
 
 } // namespace
 
@@ -62,7 +54,7 @@ xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> ProviderGenera
             configurationError("模型连接未指定默认模型", "填写实际模型标识"));
         if (connection.value->kind != "local" && connection.value->data_policy != "remote_allowed")
             return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(
-                configurationError("当前数据策略不允许发送到远程提供商", "明确设为 remote_allowed"));
+                configurationError("当前数据策略不允许发送到远程提供商", "明确允许远程发送后重试"));
 
         auto protocol = xuyan::providers::protocolForProviderKind(connection.value->kind);
         if (!protocol.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*protocol.error);
@@ -81,7 +73,7 @@ xuyan::domain::Result<xuyan::providers::ProviderGenerationResult> ProviderGenera
 
         // 凭据仅在本次传输调用期间取出，不进入请求正文或工作区数据库。
         std::string secret;
-        const SecretWiper wipe_secret(secret);
+        const detail::CredentialScope wipe_secret(secret);
         if (connection.value->kind != "local") {
             auto credential = credentials_.get(connection.value->credential_ref);
             if (!credential.ok()) return xuyan::domain::Result<xuyan::providers::ProviderGenerationResult>::failure(*credential.error);

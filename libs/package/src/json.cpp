@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 
 namespace xuyan::package {
 namespace {
@@ -13,12 +14,17 @@ namespace {
 using xuyan::domain::Error;
 using xuyan::domain::ErrorCode;
 
-/** @brief 将 JSON 格式错误转换为可展示的非重试领域错误。 */
+/* 功能：包装不包含输入正文的 JSON 错误。参数：message 为按值接收的中文原因。
+ * 返回：不可自动重试的校验错误。失败：分配异常传播。
+ * 副作用：只分配错误值，不记录正文，在调用线程执行。 */
 Error jsonError(std::string message) {
     return Error{ErrorCode::validation_failed, std::move(message), false, "修正 JSON 后重试"};
 }
 
-/** @brief 将已校验的 Unicode 码点编码并追加到 UTF-8 字符串。 */
+/* 功能：把已确认合法的 Unicode 标量追加为 UTF-8。
+ * 参数：output 为输出字符串引用，原内容保留；codepoint 为 0—0x10ffff 的非代理项标量。
+ * 返回：无。失败：分配异常传播；不再次校验标量范围。
+ * 副作用：增加 output 的字节内容，可能使其旧视图失效；不保存引用，同步执行。 */
 void appendUtf8(std::string& output, std::uint32_t codepoint) {
     if (codepoint <= 0x7f) output.push_back(static_cast<char>(codepoint));
     else if (codepoint <= 0x7ff) {
@@ -36,13 +42,19 @@ void appendUtf8(std::string& output, std::uint32_t codepoint) {
     }
 }
 
+/* 单份 JSON 的同步递归下降解析器，借用输入并拥有位置/资源计数。
+ * 仅由 parseJson 在编码预检后创建，运行一次后销毁；失败不回滚游标，不用于恢复或并发解析。 */
 class Parser {
 public:
-    /** @brief 绑定只读输入及解析深度、节点数量上限；输入须在解析器存活期间有效。 */
+    /* 功能：建立一次解析状态。参数：input 为编码已校验且存活至 run 返回的视图；
+     *       depth 为从根 0 起的递归上限；nodes 为包含根的值节点上限，0 拒绝根。
+     * 返回：完成初始化。失败：无校验。副作用：不复制输入，游标/计数从 0 开始，无 I/O。 */
     Parser(std::string_view input, std::size_t depth, std::size_t nodes)
         : input_(input), maximum_depth_(depth), maximum_nodes_(nodes) {}
 
-    /** @brief 解析唯一根值并拒绝末尾多余内容。 */
+    /* 功能：从初始游标解析唯一根值，末尾仅允许空白。参数：无。
+     * 返回：拥有型根节点或中文校验错误。失败：语法/上限/数字错误经 Result，分配异常传播。
+     * 副作用：推进游标和累计节点；失败状态不重置，全部工作在调用线程。 */
     xuyan::domain::Result<JsonValue> run() {
         auto result = value(0);
         if (!result.ok()) return result;
@@ -52,16 +64,21 @@ public:
     }
 
 private:
-    /** @brief 跳过 JSON 语法允许的空白字符。 */
+    /* 功能：跳过当前游标的空格、换行、回车及制表符。参数：无。返回：无。
+     * 失败：无，到输入末尾即停止。副作用：只推进字节游标，不将其他 Unicode 空白当 JSON 分隔符。 */
     void whitespace() {
         while (position_ < input_.size() && (input_[position_] == ' ' || input_[position_] == '\n'
                || input_[position_] == '\r' || input_[position_] == '\t')) ++position_;
     }
 
-    /** @brief 在深度和节点上限内分派解析一个 JSON 值。 */
+    /* 功能：核对资源额度并分派当前 JSON 值。
+     * 参数：depth 为本值从根 0 起的递归层次，不是字节或容器容量。
+     * 返回：拥有型值节点或错误。失败：超深度/节点数、输入结束或非法 token；分配异常传播。
+     * 副作用：递增累计值数量、推进游标；失败不回滚，键字符串不单独计入节点数。 */
     xuyan::domain::Result<JsonValue> value(std::size_t depth) {
         whitespace();
-        if (++nodes_ > maximum_nodes_) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 节点数量超过上限"));
+        if (nodes_ >= maximum_nodes_) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 节点数量超过上限"));
+        ++nodes_;
         if (depth > maximum_depth_) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 嵌套深度超过上限"));
         if (position_ >= input_.size()) return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 意外结束"));
         const auto token = input_[position_];
@@ -79,7 +96,11 @@ private:
         return xuyan::domain::Result<JsonValue>::failure(jsonError("JSON 包含无效值"));
     }
 
-    /** @brief 解析字符串转义与 UTF-16 代理项，返回解码后的 UTF-8。 */
+    /* 功能：解码引号内的字符串，包括转义与成对 UTF-16 代理项。
+     * 参数：无，前置条件为游标指向已确认存在的双引号；原始非转义 UTF-8 已全局预检。
+     * 返回：拥有型 UTF-8 字节串，可空或含解码后的零字节。
+     * 失败：控制字节、未知/截断转义、代理项错误及未闭合引号；分配异常传播。
+     * 副作用：消耗字符串字节，失败不恢复游标，不持有返回串的引用。 */
     xuyan::domain::Result<std::string> string() {
         if (input_[position_++] != '"') return xuyan::domain::Result<std::string>::failure(jsonError("需要 JSON 字符串"));
         std::string output;
@@ -118,9 +139,11 @@ private:
         return xuyan::domain::Result<std::string>::failure(jsonError("JSON 字符串未闭合"));
     }
 
-    /** @brief 将反斜杠 u 后的四个十六进制字符解析为码点单元。 */
+    /* 功能：解码紧随反斜杠 u 的四位十六进制单元。参数：无，游标已越过 u。
+     * 返回：0—65535 的 UTF-16 单元，代理项合法性由 string 处理。
+     * 失败：不足四字节或非十六进制返回校验错误。副作用：消耗字节，失败不回滚。 */
     xuyan::domain::Result<std::uint32_t> hexCodepoint() {
-        if (position_ + 4 > input_.size()) return xuyan::domain::Result<std::uint32_t>::failure(jsonError("Unicode 转义被截断"));
+        if (input_.size() - position_ < 4) return xuyan::domain::Result<std::uint32_t>::failure(jsonError("Unicode 转义被截断"));
         std::uint32_t result = 0;
         for (int index = 0; index < 4; ++index) {
             const auto character = input_[position_++];
@@ -133,7 +156,10 @@ private:
         return xuyan::domain::Result<std::uint32_t>::success(result);
     }
 
-    /** @brief 严格解析 JSON 整数或有限实数，并拒绝溢出。 */
+    /* 功能：解析负号、整数、小数及指数，严格区分整数/实数类型。
+     * 参数：无，游标须指向负号或十进制数字。返回：int64_t 或有限 double 节点。
+     * 失败：缺数字、小数/指数不完整、数字超范围返回错误；分配异常传播。
+     * 副作用：推进字节游标；前导零后的多余数字由外层边界校验拒绝，不使用本地化数字格式。 */
     xuyan::domain::Result<JsonValue> number() {
         const auto begin = position_;
         if (input_[position_] == '-') ++position_;
@@ -169,7 +195,9 @@ private:
         return xuyan::domain::Result<JsonValue>::success(JsonValue(parsed));
     }
 
-    /** @brief 递归解析数组元素，直到闭合方括号。 */
+    /* 功能：解析当前方括号数组。参数：depth 为其直接子节点的层次，调用前游标指向 '['。
+     * 返回：拥有型有序数组，空数组成功。失败：子节点错误、缺逗号/闭合符；分配异常传播。
+     * 副作用：推进游标并累计子节点；半成品仅在本地，失败不会返回部分数组。 */
     xuyan::domain::Result<JsonValue> array(std::size_t depth) {
         ++position_;
         JsonValue::Array result;
@@ -187,7 +215,11 @@ private:
         return xuyan::domain::Result<JsonValue>::success(JsonValue(std::move(result)));
     }
 
-    /** @brief 递归解析对象键值并拒绝重复键。 */
+    /* 功能：解析当前花括号对象，保留唯一键。
+     * 参数：depth 为直接成员值的层次，调用前游标指向 '{'。
+     * 返回：拥有型排序映射，空对象成功；解码后相同键视为重复。
+     * 失败：键/冒号/逗号/闭合错误、重复键或子节点错误；分配异常传播。
+     * 副作用：推进游标和节点计数，不将半成品暴露给调用方。 */
     xuyan::domain::Result<JsonValue> object(std::size_t depth) {
         ++position_;
         JsonValue::Object result;
@@ -214,19 +246,28 @@ private:
         return xuyan::domain::Result<JsonValue>::success(JsonValue(std::move(result)));
     }
 
+    /* 借用编码已校验的原始字节，构造时绑定；parseJson 返回前必须持续有效，不被修改。 */
     std::string_view input_;
+    /* 下一个待解析字节偏移，初始 0；各解析函数推进，始终不大于输入大小。 */
     std::size_t position_{0};
+    /* 根从 0 起的允许层次，构造时设定；递归分派只读，不在失败后扩大。 */
     std::size_t maximum_depth_;
+    /* 本次允许的总值节点数，构造时设定；value 读取，键不计数。 */
     std::size_t maximum_nodes_;
+    /* 已开始解析的值数量，初始 0；value 递增，失败也保留已消耗额度，不回绕。 */
     std::size_t nodes_{0};
 };
 
-/** @brief 递归向输出缓冲追加紧凑 JSON，字符串交由转义函数处理。 */
+/* 功能：递归追加单个节点的紧凑 JSON 表示。
+ * 参数：value 为调用期间只读树；output 为输出引用，保留已有前缀，不能别名 value 中的字符串。
+ * 返回：无。失败：非有限数、格式化失败抛中文 runtime_error，分配异常传播；异常后 output 可能仅有前缀。
+ * 副作用：追加字节并递归访问树，无独立深度上限，由调用方保证树有界；不执行 I/O。 */
 void writeValue(const JsonValue& value, std::string& output) {
     if (value.isNull()) output += "null";
     else if (value.isBool()) output += value.boolean() ? "true" : "false";
     else if (value.isInteger()) output += std::to_string(value.integer());
     else if (value.isReal()) {
+        if (!std::isfinite(value.real())) throw std::runtime_error("JSON 实数必须是有限值");
         char buffer[64];
         const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value.real(),
                                           std::chars_format::general, std::numeric_limits<double>::max_digits10);

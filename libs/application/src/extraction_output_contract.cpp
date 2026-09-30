@@ -11,19 +11,35 @@ namespace xuyan::application {
 namespace {
 
 using xuyan::package::JsonValue;
+/* 冻结提取协议中的复数容器名与单项类型名映射；进程常量，解析器只读，不含实例资料。 */
 constexpr std::array groups{
     std::pair{std::string_view{"entities"}, std::string_view{"entity"}},
     std::pair{std::string_view{"events"}, std::string_view{"event"}},
     std::pair{std::string_view{"relations"}, std::string_view{"relation"}},
     std::pair{std::string_view{"rules"}, std::string_view{"rule"}}};
 
-/** @brief 检查对象恰好包含所列必需键，额外属性和缺失属性都不被静默丢弃。 */
+/*
+ * 功能：验证 JSON 对象的字段集合与协议要求完全一致。
+ * 参数：value 为借用的 JSON 值；keys 为本次调用期间有效的必需字段名集合。
+ * 返回：对象、数量及每个字段都匹配时为真，否则为假。
+ * 失败：无主动错误；副作用：只读 JSON；线程：同步，内部闭包不逃逸。
+ */
 bool exactKeys(const JsonValue& value, std::initializer_list<std::string_view> keys) {
+    /*
+     * 功能：确认当前必需字段出现在被检对象中。
+     * 参数：key 为字段名视图；value 由外层借用，算法完成前有效。
+     * 返回：存在时为真。失败：无主动错误；副作用：只读，闭包不逃逸当前调用。
+     */
     return value.isObject() && value.object().size() == keys.size()
         && std::all_of(keys.begin(), keys.end(), [&](auto key) { return value.find(key) != nullptr; });
 }
 
-/** @brief 验证UTF-8单行字段，拒绝非法编码、控制字符及只有Unicode空白的必需值。 */
+/*
+ * 功能：逐码点核对单行 UTF-8 字段，拒绝非法编码、控制字符和纯空白。
+ * 参数：text 为调用期间有效的字节视图；空串作为必需字段无效。
+ * 返回：存在至少一个可见码点且全部编码合法时为真，否则为假。
+ * 失败：非法字节或禁用码点用假值表示；副作用：只读；线程：同步，不保存视图。
+ */
 bool plainUtf8Text(std::string_view text) {
     bool visible = false;
     for (std::size_t offset = 0; offset < text.size();) {
@@ -49,25 +65,46 @@ bool plainUtf8Text(std::string_view text) {
     return visible;
 }
 
-/** @brief 检查字段为有界单行文本；未知字段允许空串，必需文本仍需合法编码和可见字符。 */
+/*
+ * 功能：检查可选 JSON 字段为有界 UTF-8 单行文本。
+ * 参数：value 为可为空的观察指针；maximum 为 UTF-8 字节上限；allow_empty 为真时允许空串。
+ * 返回：类型、长度与文本规则全部满足时为真。失败：空指针或无效字段返回假。
+ * 副作用：只读字段；线程：同步，不保存指针。
+ */
 bool boundedText(const JsonValue* value, std::size_t maximum, bool allow_empty = false) {
     return value != nullptr && value->isString() && value->string().size() <= maximum
         && ((allow_empty && value->string().empty()) || plainUtf8Text(value->string()));
 }
 
-/** @brief 检查枚举文本是否属于明确允许的集合。 */
+/*
+ * 功能：校验 JSON 字符串为当前协议允许的枚举值。
+ * 参数：value 为可为空的字段观察指针；choices 为调用期间有效的候选字符串视图集合。
+ * 返回：类型为字符串且等于某一选项时为真；缺失或不匹配时为假。
+ * 失败：无主动错误；副作用：只读；线程：同步，不保存输入。
+ */
 bool enumText(const JsonValue* value, std::initializer_list<std::string_view> choices) {
     return value != nullptr && value->isString()
         && std::find(choices.begin(), choices.end(), value->string()) != choices.end();
 }
 
-/** @brief 检查实体标识在证据中逐字出现；未知的可选标识须显式留空。 */
+/*
+ * 功能：校验标识字段有界，并在引文中存在完全相同的字节序列。
+ * 参数：value 为可为空字段指针；quote 为借用的逐字引文；allow_empty 为真时空串代表未知。
+ * 返回：文本合法且非空值出现在 quote 中时为真；否则为假。
+ * 失败：无主动错误；副作用：只读，不保留指针/视图；线程：同步。
+ */
 bool quotedText(const JsonValue* value, std::string_view quote, bool allow_empty = false) {
     return boundedText(value, 512, allow_empty)
         && (value->string().empty() || quote.find(value->string()) != std::string_view::npos);
 }
 
-/** @brief 检查有界且无重复的逐字标识数组，拒绝臆造参与者和别名。 */
+/*
+ * 功能：校验至多 16 个逐字引文标识且不允许重复。
+ * 参数：value 为可为空数组字段指针；quote 为调用期间有效的原文引文。
+ * 返回：数组类型、数量、逐项文本及唯一性均满足时为真；空数组可成功。
+ * 失败：无效输入返回假，临时集合分配异常可传播；副作用：只读 JSON，临时去重集合于返回销毁。
+ * 线程：同步，不保存输入引用。
+ */
 bool quotedList(const JsonValue* value, std::string_view quote) {
     if (value == nullptr || !value->isArray() || value->array().size() > 16) return false;
     std::set<std::string> seen;
@@ -76,9 +113,18 @@ bool quotedList(const JsonValue* value, std::string_view quote) {
     return true;
 }
 
-/** @brief 去除响应两端ASCII空白，避免厂商在结构化正文外附加无意义换行。 */
+/*
+ * 功能：剔除模型响应外围的空格、制表、回车和换行，不修改正文。
+ * 参数：text 为调用期间有效的响应视图，允许为空。
+ * 返回：指向同一字节存储的子视图，不能超过原响应寿命。
+ * 失败：无主动错误；副作用：只改变局部视图边界；线程：同步。
+ */
 std::string_view trimAsciiWhitespace(std::string_view text) {
-    /** @brief 判断协议外围允许忽略的四种ASCII空白。 */
+    /*
+     * 功能：判断单个字节是否为协议外围允许忽略的 ASCII 空白。
+     * 参数：value 为按值传入的字节。返回：属于四种外围空白时为真。
+     * 失败：无；副作用：纯计算；线程：同步，不捕获外部状态。
+     */
     const auto whitespace = [](char value) {
         return value == ' ' || value == '\t' || value == '\r' || value == '\n';
     };
@@ -87,7 +133,12 @@ std::string_view trimAsciiWhitespace(std::string_view text) {
     return text;
 }
 
-/** @brief 仅剥离包住整份响应的单个JSON代码围栏，不接受前后解释或多个代码块。 */
+/*
+ * 功能：只剥离包住整个响应的单个 JSON 代码围栏，不接受夹杂解释或多个围栏。
+ * 参数：text 为借用至返回的模型响应字节视图。
+ * 返回：符合围栏格式时为内部正文视图，否则为原响应去外围空白后的视图；均借用输入存储。
+ * 失败：无主动错误；副作用：只读；线程：同步，不保存视图。
+ */
 std::string_view unwrapSingleJsonFence(std::string_view text) {
     text = trimAsciiWhitespace(text);
     if (!text.starts_with("```")) return text;
@@ -103,13 +154,22 @@ std::string_view unwrapSingleJsonFence(std::string_view text) {
     return body.find("```") == std::string_view::npos ? body : text;
 }
 
-/** @brief 返回不含原文或模型字段值的统一协议错误。 */
+/*
+ * 功能：构造候选字段或逐字证据无效的固定协议错误，避免回显原文。
+ * 参数：无。返回：失败的布尔 Result，不含候选内容。
+ * 失败：分配异常可传播；副作用：仅内存构造；线程：同步。
+ */
 xuyan::domain::Result<bool> fieldsError() {
     return xuyan::domain::Result<bool>::failure({xuyan::domain::ErrorCode::validation_failed,
         "候选类型字段、额外属性或标识证据无效", false, "核对类型化提取协议，不自动采纳结果"});
 }
 
-/** @brief 从属性集合生成全字段必需、禁止额外属性的对象Schema。 */
+/*
+ * 功能：将属性映射封装为所有字段必需且禁止额外属性的 JSON Schema 对象。
+ * 参数：properties 为按值取得的属性名与子 Schema 映射，函数内移入结果。
+ * 返回：独立拥有的对象 Schema。失败：分配异常可传播。
+ * 副作用：只构造内存对象，不写文件；线程：同步，不保存输入引用。
+ */
 JsonValue closedObject(JsonValue::Object properties) {
     JsonValue::Array required;
     for (const auto& [name, property] : properties) {
@@ -120,14 +180,24 @@ JsonValue closedObject(JsonValue::Object properties) {
         {"required", std::move(required)}, {"additionalProperties", false}};
 }
 
-/** @brief 构造文本枚举Schema，避免依赖提供商对联合Schema的额外支持。 */
+/*
+ * 功能：构造字符串枚举的 JSON Schema，保持提供商请求协议稳定。
+ * 参数：values 为调用期间有效的常量字符串集合，可为空。
+ * 返回：含 type 与 enum 的独立 JSON 对象。失败：分配异常可传播。
+ * 副作用：只构造内存对象；线程：同步，不保存源指针。
+ */
 JsonValue enumSchema(std::initializer_list<const char*> values) {
     JsonValue::Array choices;
     for (auto value : values) choices.emplace_back(value);
     return JsonValue::Object{{"type", "string"}, {"enum", std::move(choices)}};
 }
 
-/** @brief 为各类候选定义不同的必需字段，未知时间/地点用空串而不是虚构值。 */
+/*
+ * 功能：根据候选类型生成各自的封闭字段 Schema。
+ * 参数：type 为协议中的 entity、event、relation 或 rule；其他值当前走 rule 分支，调用方须保证有效。
+ * 返回：要求所有字段且禁止扩展属性的独立 Schema 对象。
+ * 失败：内存分配异常可传播；副作用：仅构造协议对象；线程：同步，不保留视图。
+ */
 JsonValue fieldsSchema(std::string_view type) {
     const JsonValue text(JsonValue::Object{{"type", "string"}});
     const JsonValue texts(JsonValue::Object{{"type", "array"}, {"items", text}});
@@ -213,7 +283,12 @@ xuyan::domain::Result<std::vector<TypedExtractionCandidate>> parseTypedExtractio
     std::string_view text, std::size_t* rejected_candidates) {
     using Result = xuyan::domain::Result<std::vector<TypedExtractionCandidate>>;
     if (rejected_candidates != nullptr) *rejected_candidates = 0;
-    /** @brief 生成不含模型字段、原文或请求片段的固定协议错误。 */
+    /*
+     * 功能：把解析失败消息封装成不含模型正文的固定校验错误。
+     * 参数：message 为静态中文错误文本指针，调用期间有效，不得含原文或凭据。
+     * 返回：候选列表类型的失败 Result。失败：分配异常可传播。
+     * 副作用：仅内存构造；线程：同步，无外部捕获或持续引用。
+     */
     const auto reject = [](const char* message) { return Result::failure({
         xuyan::domain::ErrorCode::validation_failed, message, false, "保留失败步骤，不自动重试或采纳"}); };
     if (text.size() > 128 * 1024) return reject("模型输出超过类型化协议的大小上限");

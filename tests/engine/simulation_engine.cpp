@@ -6,6 +6,7 @@ namespace xuyan::engine {
 
 xuyan::domain::Result<xuyan::domain::ActorContext> buildActorContext(
     const xuyan::domain::ScenarioState& state, const std::string& input_commit_id, const std::string& actor_id) {
+    /* 只借用输入人物，序列化前按本人知识筛选；原始完整状态不能直接进入人物上下文。 */
     const auto* actor = xuyan::domain::findCharacter(state, actor_id);
     if (actor == nullptr) return xuyan::domain::Result<xuyan::domain::ActorContext>::failure(
         {xuyan::domain::ErrorCode::missing_context, "人物不在当前分支状态中", false, "刷新人物绑定"});
@@ -22,6 +23,7 @@ xuyan::domain::Result<xuyan::domain::ActorContext> buildActorContext(
 xuyan::domain::Result<xuyan::domain::ActorIntent> SessionMockProvider::propose(
     const xuyan::domain::ActorContext& context, const xuyan::domain::ScenarioState& state) const {
     xuyan::domain::ActorIntent intent; intent.actor_id = context.actor_id; intent.input_commit_id = context.input_commit_id;
+    /* 固定回合仅用于测试：返回意图，不在此改变知识、修订或数据库，也不替代生产调度器。 */
     if (state.turn == 0) {
         intent.speech = "暴雨封住渡口，明日谈判前先共同核对议和凭证。";
         intent.public_reason = "只使用公开天气与谈判信息。";

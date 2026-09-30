@@ -3,18 +3,27 @@
 
 #include <algorithm>
 #include <sstream>
+#include <limits>
 
 namespace xuyan::domain {
 namespace {
 
-/** @brief 在可变状态中按标识查找人物，未找到时返回空指针。 */
+/* 功能：在状态副本中按稳定标识读取可修改人物，不猜测名称。
+ * 参数：state为调用者拥有的可变状态；id为调用期间借用的稳定标识。
+ * 返回：首个匹配项的非拥有指针，无匹配为nullptr；容器重分配或状态销毁后失效。
+ * 失败：只读扫描，无业务错误容器。副作用：不创建或修改人物，调用者负责指针使用期。
+ */
 CharacterState* mutableCharacter(ScenarioState& state, const std::string& id) {
     const auto it = std::find_if(state.characters.begin(), state.characters.end(),
                                  [&id](const CharacterState& item) { return item.id == id; });
     return it == state.characters.end() ? nullptr : &*it;
 }
 
-/** @brief 构造不可自动重试的情景规则冲突错误。 */
+/* 功能：组装当前操作需要作者介入的规则错误。
+ * 参数：message为按值持有的中文原因，移动到结果中，不应包含私有模型响应。
+ * 返回：不可自动重试的rule_conflict及中文建议。
+ * 失败：字符串分配可抛异常。副作用：只组装值，不执行回合或自动恢复。
+ */
 Error ruleError(std::string message) {
     return Error{ErrorCode::rule_conflict, std::move(message), false, "修改行动或由作者介入"};
 }
@@ -28,6 +37,9 @@ const CharacterState* findCharacter(const ScenarioState& state, const std::strin
 }
 
 Result<ScenarioState> applyOperation(const ScenarioState& input, const ProposedOperation& operation) {
+    // 修订是有符号整数；在复制/修改前阻止上溢，不制造无法持久化的下一状态。
+    if (input.revision == std::numeric_limits<int>::max())
+        return Result<ScenarioState>::failure(ruleError("状态修订已达到可表示上限"));
     ScenarioState output = input;
     auto* actor = mutableCharacter(output, operation.actor_id);
     auto* target = mutableCharacter(output, operation.target_id);
@@ -59,6 +71,8 @@ Result<ScenarioState> applyOperation(const ScenarioState& input, const ProposedO
         if (target == nullptr) {
             return Result<ScenarioState>::failure(ruleError("秘密接收者不存在"));
         }
+        if (target->trust == std::numeric_limits<int>::max())
+            return Result<ScenarioState>::failure(ruleError("人物信任计数已达到可表示上限"));
         target->knows_seal_forgery = true;
         ++target->trust;
         break;
@@ -71,6 +85,8 @@ Result<ScenarioState> applyOperation(const ScenarioState& input, const ProposedO
         }
         output.seal_holder_id = target->id;
         break;
+    default:
+        return Result<ScenarioState>::failure(ruleError("操作类型不受当前规则支持"));
     }
     ++output.revision;
     return Result<ScenarioState>::success(std::move(output));

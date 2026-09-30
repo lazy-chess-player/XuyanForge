@@ -8,7 +8,7 @@
 
 namespace xuyan::domain {
 
-/** @brief 验证冻结的思考强度和结构化输出参数，拒绝未知值与不支持的提供商组合。 */
+
 Result<ProviderGenerationConfig> validateProviderGenerationConfig(
     ProviderGenerationConfig config, std::string_view provider_kind) {
     constexpr std::array efforts{std::string_view{"provider_default"}, std::string_view{"none"},
@@ -34,21 +34,21 @@ Result<ProviderConnection> validateProviderConnection(ProviderConnection connect
     if (connection.endpoint.size() > 2048 || connection.endpoint.find_first_of("\r\n\t ") != std::string::npos
         || (connection.endpoint.rfind("https://", 0) != 0 && connection.endpoint.rfind("http://", 0) != 0)) {
         return Result<ProviderConnection>::failure(
-            {ErrorCode::validation_failed, "端点必须是有效的 HTTP(S) URL 且不能包含空白", false, "修正端点 URL"});
+            {ErrorCode::validation_failed, "接口地址须使用网络地址格式且不能包含空白", false, "修正接口地址"});
     }
     if (connection.kind != "local" && connection.endpoint.rfind("https://", 0) != 0) {
         return Result<ProviderConnection>::failure(
-            {ErrorCode::validation_failed, "远程提供商必须使用 HTTPS", false, "改用 HTTPS 端点"});
+            {ErrorCode::validation_failed, "远程提供商必须使用加密网络地址", false, "改用加密网络接口地址"});
     }
     if (connection.default_model.size() > 256) return Result<ProviderConnection>::failure(
         {ErrorCode::validation_failed, "模型标识过长", false, "修改模型标识"});
     if (connection.data_policy != "remote_allowed" && connection.data_policy != "local_only") {
         return Result<ProviderConnection>::failure(
-            {ErrorCode::validation_failed, "数据策略无效", false, "选择 remote_allowed 或 local_only"});
+            {ErrorCode::validation_failed, "数据策略无效", false, "选择允许远程发送或仅本地处理策略"});
     }
     if (connection.data_policy == "local_only" && connection.kind != "local") {
         return Result<ProviderConnection>::failure(
-            {ErrorCode::validation_failed, "local_only 策略不能绑定远程提供商", false, "改用本地连接或调整策略"});
+            {ErrorCode::validation_failed, "仅本地处理策略不能绑定远程提供商", false, "改用本地连接或调整策略"});
     }
     if (connection.data_policy == "local_only") {
         const auto authority = connection.endpoint.substr(connection.endpoint.find("//") + 2);
@@ -58,13 +58,17 @@ Result<ProviderConnection> validateProviderConnection(ProviderConnection connect
             && (authority.size() == 5 || authority[5] == ':' || authority[5] == '/');
         const bool loopback = host == "localhost" || host == "127.0.0.1" || ipv6_loopback;
         if (!loopback) return Result<ProviderConnection>::failure(
-            {ErrorCode::validation_failed, "local_only 连接必须使用回环地址", false, "改用 localhost、127.0.0.1 或 [::1]"});
+            {ErrorCode::validation_failed, "仅本地处理连接必须使用回环地址", false, "改用 localhost、127.0.0.1 或 [::1]"});
     }
     return Result<ProviderConnection>::success(std::move(connection));
 }
 
 std::string providerConnectionFingerprint(const ProviderConnection& connection) {
     std::string material;
+    /* 功能：将一个配置字段以长度前缀写入指纹材料，避免分隔符导致字段歧义。
+     * 参数：field为调用期间借用的配置字节串，不含明文凭据。返回：无。
+     * 失败：字符串扩容可抛异常。副作用：修改局部material，回调不逃逸当前函数。
+     */
     const auto append = [&material](std::string_view field) {
         material += std::to_string(field.size());
         material.push_back(':');

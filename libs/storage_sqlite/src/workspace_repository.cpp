@@ -1,4 +1,5 @@
 #include "xuyan/storage/workspace_repository.h"
+#include "sqlite_support.h"
 #include "xuyan/domain/hash.h"
 #include "xuyan/package/json.h"
 
@@ -35,132 +36,51 @@ using xuyan::domain::CharacterBlueprint;
 using xuyan::domain::ProviderConnection;
 using xuyan::domain::EvidenceReference;
 
-class Statement {
-public:
-    Statement(sqlite3* database, const char* sql) {
-        if (sqlite3_prepare_v2(database, sql, -1, &statement_, nullptr) != SQLITE_OK) {
-            throw std::runtime_error(sqlite3_errmsg(database));
-        }
-    }
-    ~Statement() { sqlite3_finalize(statement_); }
-    Statement(const Statement&) = delete;
-    Statement& operator=(const Statement&) = delete;
-    sqlite3_stmt* get() const noexcept { return statement_; }
+using detail::Statement;
+using detail::Transaction;
+using detail::ReadTransaction;
+using detail::bindText;
+using detail::columnText;
+using detail::randomId;
+using detail::utcNow;
+using detail::storageError;
+using detail::writeMutexFor;
+using detail::stepRow;
 
-private:
-    sqlite3_stmt* statement_{nullptr};
-};
-
-std::shared_ptr<std::mutex> writeMutexFor(sqlite3* database) {
-    static std::mutex registry_mutex;
-    static std::unordered_map<std::string, std::weak_ptr<std::mutex>> registry;
-    const auto* filename = sqlite3_db_filename(database, "main");
-    const std::string key = filename == nullptr ? std::string{"<memory>"} : std::filesystem::weakly_canonical(filename).string();
-    std::lock_guard lock(registry_mutex);
-    auto& entry = registry[key];
-    auto shared = entry.lock();
-    if (!shared) { shared = std::make_shared<std::mutex>(); entry = shared; }
-    return shared;
+/* 功能：检查数据库身份文本是否无法用于逐字匹配，避免控制分隔符被当作别名数据。
+ * 参数：text为借用的稳定标识或逐字名称；允许普通空格，纯空格名称由业务入口另行拒绝。
+ * 返回：空串、超过512字节或含低位/删除控制字符为true，否则false。
+ * 失败：只读扫描不产生业务异常。副作用：不删除、规范化或猜测身份。
+ */
+bool invalidIdentityText(const std::string& text) {
+    return text.empty() || text.size() > 512 || std::any_of(text.begin(), text.end(), [](unsigned char value) {
+        return value < 0x20 || value == 0x7f;
+    });
 }
 
-class Transaction {
-public:
-    explicit Transaction(sqlite3* database)
-        : database_(database), write_mutex_(writeMutexFor(database)), write_lock_(*write_mutex_) {
-        char* message = nullptr;
-        if (sqlite3_exec(database_, "BEGIN IMMEDIATE", nullptr, nullptr, &message) != SQLITE_OK) {
-            std::string detail = message == nullptr ? "cannot begin transaction" : message;
-            sqlite3_free(message);
-            throw std::runtime_error(detail);
-        }
-    }
-    ~Transaction() {
-        if (!committed_) {
-            sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
-        }
-    }
-    void commit() {
-        if (sqlite3_exec(database_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
-            throw std::runtime_error(sqlite3_errmsg(database_));
-        }
-        committed_ = true;
-    }
-
-private:
-    sqlite3* database_;
-    std::shared_ptr<std::mutex> write_mutex_;
-    std::unique_lock<std::mutex> write_lock_;
-    bool committed_{false};
-};
-
-/** @brief 在多条只读查询之间固定同一数据库快照，不占用写锁。 */
-class ReadTransaction {
-public:
-    /** @brief 开始延迟事务；第一次读取时确定快照。 */
-    explicit ReadTransaction(sqlite3* database) : database_(database) {
-        if (sqlite3_exec(database_, "BEGIN DEFERRED", nullptr, nullptr, nullptr) != SQLITE_OK)
-            throw std::runtime_error(sqlite3_errmsg(database_));
-    }
-    /** @brief 未提交时回滚，只释放读快照而不修改数据。 */
-    ~ReadTransaction() {
-        if (!committed_) sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
-    }
-    ReadTransaction(const ReadTransaction&) = delete;
-    ReadTransaction& operator=(const ReadTransaction&) = delete;
-    /** @brief 结束读快照，使后续查询看到最新已提交数据。 */
-    void commit() {
-        if (sqlite3_exec(database_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
-            throw std::runtime_error(sqlite3_errmsg(database_));
-        committed_ = true;
-    }
-private:
-    sqlite3* database_;
-    bool committed_{false};
-};
-
-void bindText(sqlite3_stmt* statement, int index, const std::string& value) {
-    if (sqlite3_bind_text(statement, index, value.c_str(), static_cast<int>(value.size()), SQLITE_TRANSIENT) != SQLITE_OK) {
-        throw std::runtime_error("cannot bind SQLite text value");
-    }
-}
-
-std::string columnText(sqlite3_stmt* statement, int column) {
-    const auto* value = sqlite3_column_text(statement, column);
-    return value == nullptr ? std::string{} : reinterpret_cast<const char*>(value);
-}
-
-std::string randomId(std::string_view prefix) {
-    static thread_local std::mt19937_64 generator{std::random_device{}()};
-    std::ostringstream out;
-    out << prefix << '-' << std::hex << std::setfill('0') << std::setw(16) << generator();
-    return out.str();
-}
-
-std::string utcNow() {
-    const auto now = std::chrono::system_clock::now();
-    const auto time = std::chrono::system_clock::to_time_t(now);
-    std::tm value{};
-#ifdef _WIN32
-    gmtime_s(&value, &time);
-#else
-    gmtime_r(&time, &value);
-#endif
-    std::ostringstream out;
-    out << std::put_time(&value, "%Y-%m-%dT%H:%M:%SZ");
-    return out.str();
-}
-
-Error storageError(const std::exception& exception) {
-    return Error{ErrorCode::storage_error, exception.what(), true, "检查工作区路径和磁盘空间后重试"};
-}
-
-/** @brief 判断候选是否使用仍受审核事务支持的类型化协议版本。 */
+/* 判断候选是否使用仍受审核事务支持的类型化协议版本。 */
+/*
+ * 功能：判断候选的结构/提示词版本是否为当前审核事务支持的v2或v3配对。
+ * 参数：
+ *   candidate：借用的候选值，读取其协议和提示词版本。
+ * 返回：两项版本严格配对时true，旧通用或错配时false。
+ * 副作用：只读取候选，不升级版本。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 bool isTypedCandidateProtocol(const xuyan::domain::ExtractionCandidate& candidate) {
     return (candidate.schema_version == "candidate-v2" && candidate.prompt_version == "extract-v2")
         || (candidate.schema_version == "candidate-v3" && candidate.prompt_version == "extract-v3");
 }
 
-/** @brief 序列化完整情景状态及全部人物，作为版本化快照正文。 */
+/* 序列化完整情景状态及全部人物，作为版本化快照正文。 */
+/*
+ * 功能：将调用者提供的完整情景状态序列化为带格式版本的快照JSON。
+ * 参数：
+ *   state：借用的完整状态，包括真实人物集合，不补样例。
+ * 返回：可持久化的JSON字符串，包括完整人物数组和状态，不补默认人物。
+ * 副作用：只产生派生文本，不修改输入状态。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string stateJson(const ScenarioState& state) {
     using xuyan::package::JsonValue;
     JsonValue::Array characters;
@@ -182,7 +102,16 @@ std::string stateJson(const ScenarioState& state) {
     }));
 }
 
-/** @brief 获取快照对象的必需字段，缺失时拒绝加载整个快照。 */
+/* 获取快照对象的必需字段，缺失时拒绝加载整个快照。 */
+/*
+ * 功能：从快照对象读取必需字段，避免缺字段被默认值悄悄补齐。
+ * 参数：
+ *   object：借用的JSON对象，子值引用不能超过其生命周期。
+ *   key：必需字段名的借用视图，仅在调用期间有效。
+ * 返回：借用JSON子值引用，有效期不能超过object；缺字段抛runtime_error。
+ * 副作用：只读查找。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 const xuyan::package::JsonValue& requiredStateField(const xuyan::package::JsonValue& object,
                                                     std::string_view key) {
     const auto* value = object.find(key);
@@ -190,7 +119,16 @@ const xuyan::package::JsonValue& requiredStateField(const xuyan::package::JsonVa
     return *value;
 }
 
-/** @brief 将快照整数安全缩窄为领域状态使用的 int。 */
+/* 将快照整数安全缩窄为领域状态使用的 int。 */
+/*
+ * 功能：读取必需快照整数并在缩窄前检查int范围。
+ * 参数：
+ *   object：借用的JSON对象，子值引用不能超过其生命周期。
+ *   key：必需字段名的借用视图，仅在调用期间有效。
+ * 返回：合法整数；字段缺失、非整数或越界抛runtime_error。
+ * 副作用：只读，不能把未知时间等空值改成0。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 int stateInteger(const xuyan::package::JsonValue& object, std::string_view key) {
     const auto& value = requiredStateField(object, key);
     if (!value.isInteger() || value.integer() < std::numeric_limits<int>::min()
@@ -199,21 +137,47 @@ int stateInteger(const xuyan::package::JsonValue& object, std::string_view key) 
     return static_cast<int>(value.integer());
 }
 
-/** @brief 读取快照布尔字段并拒绝数字、文本等歧义值。 */
+/* 读取快照布尔字段并拒绝数字、文本等歧义值。 */
+/*
+ * 功能：读取必需快照布尔值，拒绝数字或文本代替布尔。
+ * 参数：
+ *   object：借用的JSON对象，子值引用不能超过其生命周期。
+ *   key：必需字段名的借用视图，仅在调用期间有效。
+ * 返回：布尔值；缺字段或类型不符抛runtime_error。
+ * 副作用：只读。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 bool stateBoolean(const xuyan::package::JsonValue& object, std::string_view key) {
     const auto& value = requiredStateField(object, key);
     if (!value.isBool()) throw std::runtime_error("快照布尔字段格式无效");
     return value.boolean();
 }
 
-/** @brief 读取快照字符串字段并拒绝非文本值。 */
+/* 读取快照字符串字段并拒绝非文本值。 */
+/*
+ * 功能：读取必需快照文本并保留原UTF-8内容。
+ * 参数：
+ *   object：借用的JSON对象，子值引用不能超过其生命周期。
+ *   key：必需字段名的借用视图，仅在调用期间有效。
+ * 返回：文本副本；缺字段或非字符串抛runtime_error。
+ * 副作用：只读。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string stateString(const xuyan::package::JsonValue& object, std::string_view key) {
     const auto& value = requiredStateField(object, key);
     if (!value.isString()) throw std::runtime_error("快照文本字段格式无效");
     return value.string();
 }
 
-/** @brief 从版本化 JSON 读取完整状态，拒绝缺失角色、重复 ID 或过期格式。 */
+/* 从版本化 JSON 读取完整状态，拒绝缺失角色、重复 ID 或过期格式。 */
+/*
+ * 功能：校验版本化快照JSON，恢复完整人物和状态并检查标识及持有人引用。
+ * 参数：
+ *   encoded：版本化快照JSON文本，作为数据解析。
+ * 返回：独立拥有数据的状态值；损坏JSON、非支持版本、缺字段、重复人物或无效持有人抛异常。
+ * 副作用：仅解析输入，不创建资料或恢复旧测试字面量。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 ScenarioState parseStateJson(const std::string& encoded) {
     auto parsed = xuyan::package::parseJson(encoded, 8, 100000);
     if (!parsed.ok() || !parsed.value->isObject()) throw std::runtime_error("快照格式无效或不受支持");
@@ -249,13 +213,22 @@ ScenarioState parseStateJson(const std::string& encoded) {
     return state;
 }
 
-/** @brief 读取并校验完整提交快照，拒绝旧格式或摘要不一致的数据。 */
+/* 读取并校验完整提交快照，拒绝旧格式或摘要不一致的数据。 */
+/*
+ * 功能：按提交ID读取完整快照并重新计算内容摘要。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   commit_id：不可变提交稳定标识。
+ * 返回：已验证的提交视图；缺失、损坏或哈希不一致抛异常。
+ * 副作用：只读数据库。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 CommitView readCommit(sqlite3* database, const std::string& commit_id) {
     Statement query(database,
         "SELECT s.branch_id,s.commit_id,s.parent_commit_id,s.state_hash,s.state_json "
         "FROM state_snapshot s WHERE s.commit_id=?");
     bindText(query.get(), 1, commit_id);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) {
+    if (!stepRow(query.get())) {
         throw std::runtime_error("找不到提交：" + commit_id);
     }
     CommitView view;
@@ -269,7 +242,16 @@ CommitView readCommit(sqlite3* database, const std::string& commit_id) {
     return view;
 }
 
-/** @brief 在调用方事务中写入已校验的完整快照。 */
+/* 在调用方事务中写入已校验的完整快照。 */
+/*
+ * 功能：在调用方事务中写入完整不可变提交快照，写前再次核对序列化摘要。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   view：借用的完整提交视图，摘要须与状态一致。
+ * 返回：无；摘要不一致或SQLite写入失败抛异常。
+ * 副作用：插入快照；事务由调用方管理，不自行提交。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void insertSnapshot(sqlite3* database, const CommitView& view) {
     const auto encoded = stateJson(view.state);
     if (xuyan::domain::stateHash(parseStateJson(encoded)) != view.state_hash)
@@ -289,15 +271,35 @@ void insertSnapshot(sqlite3* database, const CommitView& view) {
     }
 }
 
+/*
+ * 功能：读取命令的摘要和既有结果提交，供外层幂等重放核对。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   command_id：写命令稳定标识，用于幂等日志定位。
+ * 返回：可选二元组：请求摘要、结果提交ID；无记录为空。
+ * 副作用：只读，游标错误与正常空结果分开。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::optional<std::pair<std::string, std::string>> commandResult(sqlite3* database, const std::string& command_id) {
     Statement query(database, "SELECT payload_hash,result_commit_id FROM command_log WHERE command_id=?");
     bindText(query.get(), 1, command_id);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) {
+    if (!stepRow(query.get())) {
         return std::nullopt;
     }
     return std::make_pair(columnText(query.get(), 0), columnText(query.get(), 1));
 }
 
+/*
+ * 功能：在调用方事务中追加分支操作的命令审计记录。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   command_id：写命令稳定标识，用于幂等日志定位。
+ *   payload_hash：请求正文摘要，供命令重放比对。
+ *   commit_id：不可变提交稳定标识。
+ * 返回：无；违反唯一约束或数据库失败抛异常。
+ * 副作用：写入命令日志，不自行提交。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void recordCommand(sqlite3* database, const std::string& command_id, const std::string& payload_hash,
                    const std::string& commit_id) {
     Statement insert(database,
@@ -311,6 +313,14 @@ void recordCommand(sqlite3* database, const std::string& command_id, const std::
     }
 }
 
+/*
+ * 功能：用历史存储协议的单位分隔字节连接字符串列表。
+ * 参数：
+ *   values：借用的字符串集合，元素的分隔符合法性由业务层校验。
+ * 返回：连接结果；空列表为空串；输入元素须经过不含分隔字节的业务校验。
+ * 副作用：只生成文本，不改变元素。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string joinValues(const std::vector<std::string>& values) {
     std::string result;
     for (const auto& value : values) {
@@ -320,6 +330,14 @@ std::string joinValues(const std::vector<std::string>& values) {
     return result;
 }
 
+/*
+ * 功能：按单位分隔字节还原历史存储协议的字符串列表。
+ * 参数：
+ *   value：输入文本视图，仅在调用期间借用。
+ * 返回：字符串列表副本；空串返回空列表。
+ * 副作用：只解析输入，不持有string_view引用。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::vector<std::string> splitValues(std::string_view value) {
     std::vector<std::string> values;
     std::size_t begin = 0;
@@ -332,6 +350,16 @@ std::vector<std::string> splitValues(std::string_view value) {
     return values;
 }
 
+/*
+ * 功能：按原实体命令协议组织字段和预期修订，供请求摘要/幂等核对。
+ * 参数：
+ *   entity：借用的实体字段和修订值。
+ *   expected_revision：外层已读取的预期实体修订。
+ *   operation：内部操作类型视图，参与命令身份正文。
+ * 返回：按稳定字段顺序组织的请求正文，后续由调用方摘要化。
+ * 副作用：只读实体；不将正文当成SQL。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string entityPayload(const WorldEntity& entity, int expected_revision, std::string_view operation) {
     std::ostringstream out;
     out << operation << '|' << expected_revision << '|' << entity.id << '|' << entity.world_id << '|'
@@ -341,6 +369,16 @@ std::string entityPayload(const WorldEntity& entity, int expected_revision, std:
     return out.str();
 }
 
+/*
+ * 功能：读取实体指定历史修订，或连接当前头修订读取最新版。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   entity_id：实体稳定标识。
+ *   revision：历史修订号，默认-1表示当前头。
+ * 返回：完整实体值；标识/修订不存在或读取失败抛异常。
+ * 副作用：只读，不把历史修订倒退写回当前头。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 WorldEntity readEntityRevision(sqlite3* database, const std::string& entity_id, int revision = -1) {
     const char* sql = revision < 0
         ? "SELECT e.id,e.world_id,r.kind,r.name,r.aliases,r.tags,r.description,r.attributes_json,"
@@ -352,7 +390,7 @@ WorldEntity readEntityRevision(sqlite3* database, const std::string& entity_id, 
     Statement query(database, sql);
     bindText(query.get(), 1, entity_id);
     if (revision >= 0) sqlite3_bind_int(query.get(), 2, revision);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到世界条目：" + entity_id);
+    if (!stepRow(query.get())) throw std::runtime_error("找不到世界条目：" + entity_id);
     WorldEntity entity;
     entity.id = columnText(query.get(), 0);
     entity.world_id = columnText(query.get(), 1);
@@ -368,6 +406,15 @@ WorldEntity readEntityRevision(sqlite3* database, const std::string& entity_id, 
     return entity;
 }
 
+/*
+ * 功能：追加实体的不可变修订正文。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   entity：借用的实体字段和修订值。
+ * 返回：无；重复修订或数据库失败抛异常。
+ * 副作用：在调用方事务内插入历史版本，不移动实体头。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void insertEntityRevision(sqlite3* database, const WorldEntity& entity) {
     Statement insert(database,
         "INSERT INTO entity_revision(entity_id,revision,kind,name,aliases,tags,description,attributes_json,"
@@ -386,6 +433,15 @@ void insertEntityRevision(sqlite3* database, const WorldEntity& entity) {
     if (sqlite3_step(insert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
 }
 
+/*
+ * 功能：将实体头和软删除标记指向已写入的新修订，要求恰好更新一项。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   entity：借用的实体字段和修订值。
+ * 返回：无；不存在实体或并发更新计数不符时抛异常。
+ * 副作用：更新头元数据，须和修订正文写入同事务。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void updateEntityHead(sqlite3* database, const WorldEntity& entity) {
     Statement update(database, "UPDATE world_entity SET head_revision=?,deleted=? WHERE id=?");
     sqlite3_bind_int(update.get(), 1, entity.revision); sqlite3_bind_int(update.get(), 2, entity.deleted ? 1 : 0);
@@ -394,14 +450,34 @@ void updateEntityHead(sqlite3* database, const WorldEntity& entity) {
         throw std::runtime_error("无法更新条目头修订");
 }
 
+/*
+ * 功能：读取实体命令的请求摘要、实体ID和修订，供重放恢复原结果。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   command_id：写命令稳定标识，用于幂等日志定位。
+ * 返回：可选三元组；无命令记录为空。
+ * 副作用：只读命令日志。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::optional<std::tuple<std::string, std::string, int>> entityCommandResult(sqlite3* database,
                                                                              const std::string& command_id) {
     Statement query(database, "SELECT payload_hash,entity_id,revision FROM entity_command_log WHERE command_id=?");
     bindText(query.get(), 1, command_id);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) return std::nullopt;
+    if (!stepRow(query.get())) return std::nullopt;
     return std::make_tuple(columnText(query.get(), 0), columnText(query.get(), 1), sqlite3_column_int(query.get(), 2));
 }
 
+/*
+ * 功能：记录实体命令与已提交实体修订之间的对应。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   command_id：写命令稳定标识，用于幂等日志定位。
+ *   payload：外层计算的请求摘要。
+ *   entity：借用的实体字段和修订值。
+ * 返回：无；命令唯一约束或SQLite失败抛异常。
+ * 副作用：在当前写事务内追加审计记录。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void recordEntityCommand(sqlite3* database, const std::string& command_id, const std::string& payload,
                          const WorldEntity& entity) {
     Statement insert(database,
@@ -414,12 +490,21 @@ void recordEntityCommand(sqlite3* database, const std::string& command_id, const
     if (sqlite3_step(insert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
 }
 
+/*
+ * 功能：按来源ID读取资产引用、编码、章节头和按序章节元数据。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   source_id：小说来源标识；关系合并改写函数中表示源实体标识，非来源文件。
+ * 返回：来源对象及章节索引；找不到来源或读取失败抛异常。
+ * 副作用：只读数据库，不读取整书正文。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 SourceDocument readSource(sqlite3* database, const std::string& source_id) {
     Statement query(database,
         "SELECT id,world_id,name,sha256,original_asset_ref,normalized_asset_ref,edition "
         "FROM source_document WHERE id=?");
     bindText(query.get(), 1, source_id);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到来源文档：" + source_id);
+    if (!stepRow(query.get())) throw std::runtime_error("找不到来源文档：" + source_id);
     SourceDocument document;
     document.id = columnText(query.get(), 0);
     document.world_id = columnText(query.get(), 1);
@@ -431,18 +516,18 @@ SourceDocument readSource(sqlite3* database, const std::string& source_id) {
     {
         Statement encoding(database, "SELECT encoding FROM source_encoding WHERE source_id=?");
         bindText(encoding.get(), 1, source_id);
-        if (sqlite3_step(encoding.get()) == SQLITE_ROW) document.detected_encoding = columnText(encoding.get(), 0);
+        if (stepRow(encoding.get())) document.detected_encoding = columnText(encoding.get(), 0);
     }
     {
         Statement head(database, "SELECT revision FROM source_chapter_head WHERE source_id=?");
         bindText(head.get(), 1, source_id);
-        if (sqlite3_step(head.get()) == SQLITE_ROW) document.chapter_revision = sqlite3_column_int(head.get(), 0);
+        if (stepRow(head.get())) document.chapter_revision = sqlite3_column_int(head.get(), 0);
     }
     Statement chapters(database,
         "SELECT id,title,ordinal,start_byte,end_byte,start_codepoint,end_codepoint "
         "FROM source_chapter WHERE document_id=? ORDER BY ordinal");
     bindText(chapters.get(), 1, source_id);
-    while (sqlite3_step(chapters.get()) == SQLITE_ROW) {
+    while (stepRow(chapters.get())) {
         document.chapters.push_back(SourceChapter{
             columnText(chapters.get(), 0), columnText(chapters.get(), 1), sqlite3_column_int(chapters.get(), 2),
             static_cast<std::size_t>(sqlite3_column_int64(chapters.get(), 3)),
@@ -454,6 +539,16 @@ SourceDocument readSource(sqlite3* database, const std::string& source_id) {
     return document;
 }
 
+/*
+ * 功能：读取人物卡指定版本，负版本值读取当前头版本。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   id：被查询记录的稳定标识。
+ *   version：人物卡历史版本，默认-1表示当前头。
+ * 返回：完整人物卡版本副本；记录缺失或读取失败抛异常。
+ * 副作用：只读，不覆盖作者的当前版本。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 CharacterBlueprint readBlueprint(sqlite3* database, const std::string& id, int version = -1) {
     const char* sql = version < 0
         ? "SELECT b.id,v.version,v.name,v.summary,v.core_values,v.traits,v.long_term_goal,v.short_term_goal,"
@@ -467,7 +562,7 @@ CharacterBlueprint readBlueprint(sqlite3* database, const std::string& id, int v
     Statement query(database, sql);
     bindText(query.get(), 1, id);
     if (version >= 0) sqlite3_bind_int(query.get(), 2, version);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到人物卡或指定版本：" + id);
+    if (!stepRow(query.get())) throw std::runtime_error("找不到人物卡或指定版本：" + id);
     CharacterBlueprint result;
     result.id = columnText(query.get(), 0);
     result.version = sqlite3_column_int(query.get(), 1);
@@ -487,6 +582,16 @@ CharacterBlueprint readBlueprint(sqlite3* database, const std::string& id, int v
     return result;
 }
 
+/*
+ * 功能：按人物卡命令协议组织可编辑字段及预期版本。
+ * 参数：
+ *   blueprint：借用的人物卡版本字段。
+ *   expected：预期版本/修订，供命令身份核对。
+ *   operation：内部操作类型视图，参与命令身份正文。
+ * 返回：用于幂等摘要的稳定顺序文本。
+ * 副作用：只读输入卡片，不写明文凭据。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string blueprintPayload(const CharacterBlueprint& blueprint, int expected, std::string_view operation) {
     std::ostringstream out;
     out << operation << '|' << expected << '|' << blueprint.id << '|' << blueprint.name << '|'
@@ -497,6 +602,15 @@ std::string blueprintPayload(const CharacterBlueprint& blueprint, int expected, 
     return out.str();
 }
 
+/*
+ * 功能：追加人物卡历史版本正文。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   blueprint：借用的人物卡版本字段。
+ * 返回：无；重复版本或存储失败抛异常。
+ * 副作用：写当前事务，不自行发布或更新头。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void insertBlueprintVersion(sqlite3* database, const CharacterBlueprint& blueprint) {
     Statement insert(database,
         "INSERT INTO character_blueprint_version(blueprint_id,version,name,summary,core_values,traits,long_term_goal,"
@@ -521,12 +635,21 @@ void insertBlueprintVersion(sqlite3* database, const CharacterBlueprint& bluepri
     if (sqlite3_step(insert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
 }
 
+/*
+ * 功能：按连接ID读取持久化模型配置，密钥内容保持在凭据设施外部。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   id：被查询记录的稳定标识。
+ * 返回：连接值对象；缺失或读取失败抛异常。
+ * 副作用：只读配置，不探测端点、不发送小说。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 ProviderConnection readProvider(sqlite3* database, const std::string& id) {
     Statement query(database,
         "SELECT id,name,kind,endpoint,default_model,credential_ref,data_policy,enabled,deleted,revision "
         "FROM provider_connection WHERE id=?");
     bindText(query.get(), 1, id);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到模型连接：" + id);
+    if (!stepRow(query.get())) throw std::runtime_error("找不到模型连接：" + id);
     ProviderConnection value;
     value.id = columnText(query.get(), 0); value.name = columnText(query.get(), 1);
     value.kind = columnText(query.get(), 2); value.endpoint = columnText(query.get(), 3);
@@ -536,6 +659,16 @@ ProviderConnection readProvider(sqlite3* database, const std::string& id) {
     return value;
 }
 
+/*
+ * 功能：组织模型连接配置命令的幂等正文，不包含明文密钥。
+ * 参数：
+ *   value：借用的模型连接配置，不含明文密钥。
+ *   expected：预期版本/修订，供命令身份核对。
+ *   operation：内部操作类型视图，参与命令身份正文。
+ * 返回：含配置字段及预期修订的稳定文本。
+ * 副作用：只读配置。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string providerPayload(const ProviderConnection& value, int expected, std::string_view operation) {
     std::ostringstream out;
     out << operation << '|' << expected << '|' << value.id << '|' << value.name << '|' << value.kind << '|'
@@ -544,6 +677,14 @@ std::string providerPayload(const ProviderConnection& value, int expected, std::
     return out.str();
 }
 
+/*
+ * 功能：将已定位结果行的固定列转换为原文证据对象。
+ * 参数：
+ *   query：已步进到当前行的有效SQLite语句；固定列顺序由调用方查询保证。
+ * 返回：拥有字段副本的证据值；来源偏移按持久化列解释。
+ * 副作用：读取当前行，不推进游标、不读取原文。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 EvidenceReference readEvidence(sqlite3_stmt* query) {
     EvidenceReference value;
     value.id = columnText(query, 0); value.entity_id = columnText(query, 1);
@@ -555,11 +696,20 @@ EvidenceReference readEvidence(sqlite3_stmt* query) {
     return value;
 }
 
-/** @brief 读取计数、冻结配置和索引停止标志，不搬入步骤输出；调用者负责读快照或写事务。 */
+/* 读取计数、冻结配置和索引停止标志，不搬入步骤输出；调用者负责读快照或写事务。 */
+/*
+ * 功能：在当前读范围获取任务计数及停止标志，避免读历史输出正文。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   job_id：解析任务稳定标识。
+ * 返回：任务轻量检查点；任务缺失或查询失败抛异常。
+ * 副作用：只读；多查询一致性由调用方快照或事务保证。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::ExtractionJobState readExtractionJobState(sqlite3* database, const std::string& job_id) {
     Statement query(database, "SELECT id,source_id,status,schema_version,prompt_version,provider_connection_id,model_id,total_steps,completed_steps,cancel_requested,revision FROM extraction_job WHERE id=?");
     bindText(query.get(), 1, job_id);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到提取任务：" + job_id);
+    if (!stepRow(query.get())) throw std::runtime_error("找不到提取任务：" + job_id);
     xuyan::domain::ExtractionJobState job;
     job.id = columnText(query.get(), 0); job.source_id = columnText(query.get(), 1); job.status = columnText(query.get(), 2);
     job.schema_version = columnText(query.get(), 3); job.prompt_version = columnText(query.get(), 4);
@@ -569,13 +719,13 @@ xuyan::domain::ExtractionJobState readExtractionJobState(sqlite3* database, cons
     {
         Statement snapshot(database, "SELECT fingerprint FROM extraction_job_provider_snapshot WHERE job_id=?");
         bindText(snapshot.get(), 1, job_id);
-        if (sqlite3_step(snapshot.get()) == SQLITE_ROW)
+        if (stepRow(snapshot.get()))
             job.provider_connection_fingerprint = columnText(snapshot.get(), 0);
     }
     {
         Statement budget(database, "SELECT estimated_input_tokens,output_token_limit,max_requests,consumed_requests,sample_steps,price_known,estimated_cost_microunits,currency FROM extraction_budget WHERE job_id=?");
         bindText(budget.get(), 1, job_id);
-        if (sqlite3_step(budget.get()) == SQLITE_ROW) {
+        if (stepRow(budget.get())) {
             job.budget.estimated_input_tokens = static_cast<std::size_t>(sqlite3_column_int64(budget.get(), 0));
             job.budget.output_token_limit_per_request = sqlite3_column_int(budget.get(), 1);
             job.budget.max_requests = sqlite3_column_int(budget.get(), 2);
@@ -591,7 +741,7 @@ xuyan::domain::ExtractionJobState readExtractionJobState(sqlite3* database, cons
         "EXISTS(SELECT 1 FROM extraction_step WHERE job_id=? AND status='running'),"
         "EXISTS(SELECT 1 FROM extraction_step WHERE job_id=? AND status IN ('running','failed','unknown'))");
     for (int parameter = 1; parameter <= 3; ++parameter) bindText(flags.get(), parameter, job_id);
-    if (sqlite3_step(flags.get()) != SQLITE_ROW) throw std::runtime_error("无法读取任务停止标志");
+    if (!stepRow(flags.get())) throw std::runtime_error("无法读取任务停止标志");
     job.has_ready_step = sqlite3_column_int(flags.get(), 0) != 0;
     job.has_running_step = sqlite3_column_int(flags.get(), 1) != 0;
     job.requires_attention = sqlite3_column_int(flags.get(), 2) != 0 || job.status == "needs_attention";
@@ -599,19 +749,27 @@ xuyan::domain::ExtractionJobState readExtractionJobState(sqlite3* database, cons
         // 旧任务迁移时已回填原文参数；当前快照缺失必须拒绝，不能静默改变发送语义。
         Statement input(database, "SELECT mode,density,algorithm_version FROM extraction_job_input_snapshot WHERE job_id=?");
         bindText(input.get(), 1, job_id);
-        if (sqlite3_step(input.get()) != SQLITE_ROW) throw std::runtime_error("解析任务输入快照缺失");
+        if (!stepRow(input.get())) throw std::runtime_error("解析任务输入快照缺失");
         job.input = {columnText(input.get(), 0), columnText(input.get(), 1), columnText(input.get(), 2)};
     }
     {
         Statement generation(database, "SELECT reasoning_effort,output_format FROM extraction_job_generation_snapshot WHERE job_id=?");
         bindText(generation.get(), 1, job_id);
-        if (sqlite3_step(generation.get()) != SQLITE_ROW) throw std::runtime_error("解析任务生成配置快照缺失");
+        if (!stepRow(generation.get())) throw std::runtime_error("解析任务生成配置快照缺失");
         job.generation = {columnText(generation.get(), 0), columnText(generation.get(), 1)};
     }
     return job;
 }
 
-/** @brief 从步骤查询的八个定位字段读取元数据，默认不含输出正文及错误详情。 */
+/* 从步骤查询的八个定位字段读取元数据，默认不含输出正文及错误详情。 */
+/*
+ * 功能：将当前步骤行转换为不含输出正文的轻量定位元数据。
+ * 参数：
+ *   row：已步进到当前行的有效语句，按步骤元数据固定列顺序读取。
+ * 返回：步骤值，包含范围、序号、尝试和冻结配置字段。
+ * 副作用：只读取当前行，不推进游标。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::ExtractionStep readExtractionStepMetadata(sqlite3_stmt* row) {
     xuyan::domain::ExtractionStep step;
     step.id = columnText(row, 0); step.job_id = columnText(row, 1); step.ordinal = sqlite3_column_int(row, 2);
@@ -621,15 +779,34 @@ xuyan::domain::ExtractionStep readExtractionStepMetadata(sqlite3_stmt* row) {
     return step;
 }
 
-/** @brief 读取单个步骤元数据，用于原子领取重放和定点候选校验。 */
+/* 读取单个步骤元数据，用于原子领取重放和定点候选校验。 */
+/*
+ * 功能：读取任务内指定步骤的元数据。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   job_id：解析任务稳定标识。
+ *   ordinal：任务内步骤从 1 开始的序号。
+ * 返回：指定步骤值；没有该步骤或查询失败抛异常。
+ * 副作用：只读。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::ExtractionStep readExtractionStep(sqlite3* database, const std::string& job_id, int ordinal) {
     Statement query(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt FROM extraction_step WHERE job_id=? AND ordinal=?");
     bindText(query.get(), 1, job_id); sqlite3_bind_int(query.get(), 2, ordinal);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到提取步骤");
+    if (!stepRow(query.get())) throw std::runtime_error("找不到提取步骤");
     return readExtractionStepMetadata(query.get());
 }
 
-/** @brief 通过状态索引只读取最早的一片待执行定位信息，空队列返回空值。 */
+/* 通过状态索引只读取最早的一片待执行定位信息，空队列返回空值。 */
+/*
+ * 功能：用有序限量查询取得最早的待执行步骤。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   job_id：解析任务稳定标识。
+ * 返回：可选轻量步骤；正常无待执行步骤为空。
+ * 副作用：只读，不领取步骤或增加尝试次数。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::optional<xuyan::domain::ExtractionStep> readNextExtractionStep(sqlite3* database, const std::string& job_id) {
     Statement query(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt FROM extraction_step WHERE job_id=? AND status='ready' ORDER BY ordinal LIMIT 1");
     bindText(query.get(), 1, job_id);
@@ -639,23 +816,42 @@ std::optional<xuyan::domain::ExtractionStep> readNextExtractionStep(sqlite3* dat
     return readExtractionStepMetadata(query.get());
 }
 
-/** @brief 命令重放时仅读取原领取步骤的完整结果，保留旧接口语义而不加载其他步骤。 */
+/* 命令重放时仅读取原领取步骤的完整结果，保留旧接口语义而不加载其他步骤。 */
+/*
+ * 功能：读取领取命令重放涉及的步骤，避免重新认领或重复发送。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   job_id：解析任务稳定标识。
+ *   ordinal：任务内步骤从 1 开始的序号。
+ * 返回：既有步骤轻量状态；无法找到对应步骤时抛异常。
+ * 副作用：只读取本步骤保存的输出与错误信息，不遍历其他步骤或修改记录。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::ExtractionStep readClaimReplayStep(sqlite3* database, const std::string& job_id, int ordinal) {
     Statement query(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt,output_json,error_message FROM extraction_step WHERE job_id=? AND ordinal=?");
     bindText(query.get(), 1, job_id); sqlite3_bind_int(query.get(), 2, ordinal);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("领取重放步骤缺失");
+    if (!stepRow(query.get())) throw std::runtime_error("领取重放步骤缺失");
     auto step = readExtractionStepMetadata(query.get());
     step.output_json = columnText(query.get(), 8); step.error_message = columnText(query.get(), 9);
     return step;
 }
 
-/** @brief 只供完整结果或编辑查询读取全部步骤，调度循环使用检查点接口。 */
+/* 只供完整结果或编辑查询读取全部步骤，调度循环使用检查点接口。 */
+/*
+ * 功能：读取任务及按序的全部步骤，供明确需要完整快照的旧接口使用。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   job_id：解析任务稳定标识。
+ * 返回：完整任务值；缺失或读取失败抛异常。
+ * 副作用：只读；调度批次应优先使用轻量检查点避免反复全量加载。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::ExtractionJob readExtractionJob(sqlite3* database, const std::string& job_id) {
     xuyan::domain::ExtractionJob job;
     static_cast<xuyan::domain::ExtractionJobState&>(job) = readExtractionJobState(database, job_id);
     Statement steps(database, "SELECT id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt,output_json,error_message FROM extraction_step WHERE job_id=? ORDER BY ordinal");
     bindText(steps.get(), 1, job_id);
-    while (sqlite3_step(steps.get()) == SQLITE_ROW) {
+    while (stepRow(steps.get())) {
         auto step = readExtractionStepMetadata(steps.get());
         step.output_json = columnText(steps.get(), 8);
         step.error_message = columnText(steps.get(), 9); job.steps.push_back(std::move(step));
@@ -663,7 +859,16 @@ xuyan::domain::ExtractionJob readExtractionJob(sqlite3* database, const std::str
     return job;
 }
 
-/** @brief 在当前事务内选择完整或检查点结果，保持同一份写入及幂等实现。 */
+/* 在当前事务内选择完整或检查点结果，保持同一份写入及幂等实现。 */
+/*
+ * 功能：按模板结果类型选择完整任务或轻量检查点读取路径。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   job_id：解析任务稳定标识。
+ * 返回：JobResult值；支持完整ExtractionJob或轻量ExtractionJobState。
+ * 副作用：只读；不会因返回类型改变写事务语义。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 template<class JobResult>
 JobResult readExtractionResult(sqlite3* database, const std::string& job_id) {
     if constexpr (std::is_same_v<JobResult, xuyan::domain::ExtractionJobState>)
@@ -671,6 +876,14 @@ JobResult readExtractionResult(sqlite3* database, const std::string& job_id) {
     else return readExtractionJob(database, job_id);
 }
 
+/*
+ * 功能：把候选结果行转为独立拥有字段及证据元数据的值。
+ * 参数：
+ *   query：已步进到当前行的有效SQLite语句；固定列顺序由调用方查询保证。
+ * 返回：候选值，保留原协议/提示词版本及来源性质。
+ * 副作用：只读当前行，不推进游标、不自动接受。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::ExtractionCandidate readCandidate(sqlite3_stmt* query) {
     xuyan::domain::ExtractionCandidate value;
     value.id = columnText(query, 0); value.job_id = columnText(query, 1); value.step_ordinal = sqlite3_column_int(query, 2);
@@ -683,31 +896,49 @@ xuyan::domain::ExtractionCandidate readCandidate(sqlite3_stmt* query) {
     return value;
 }
 
+/*
+ * 功能：读取指定已发布世界版本及其固定成员。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   version_id：不可变世界版本标识。
+ * 返回：不可变版本值；缺失或查询失败抛异常。
+ * 副作用：只读，不追加或修改发布成员。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::WorldVersion readWorldVersion(sqlite3* database, const std::string& version_id) {
     Statement query(database, "SELECT id,world_id,parent_id,status,content_hash,published_at FROM world_version WHERE id=?");
     bindText(query.get(), 1, version_id);
-    if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到世界版本：" + version_id);
+    if (!stepRow(query.get())) throw std::runtime_error("找不到世界版本：" + version_id);
     xuyan::domain::WorldVersion version;
     version.id = columnText(query.get(), 0); version.world_id = columnText(query.get(), 1);
     version.parent_id = columnText(query.get(), 2); version.status = columnText(query.get(), 3);
     version.content_hash = columnText(query.get(), 4); version.published_at = columnText(query.get(), 5);
     Statement members(database, "SELECT m.entity_id,m.entity_revision,COALESCE(s.scope_revision,0) FROM world_version_member m LEFT JOIN world_version_member_scope s ON s.version_id=m.version_id AND s.entity_id=m.entity_id WHERE m.version_id=? ORDER BY m.entity_id");
     bindText(members.get(), 1, version_id);
-    while (sqlite3_step(members.get()) == SQLITE_ROW)
+    while (stepRow(members.get()))
         version.members.push_back({columnText(members.get(), 0), sqlite3_column_int(members.get(), 1), sqlite3_column_int(members.get(), 2)});
     return version;
 }
 
+/*
+ * 功能：读取事件正文与时间、因果和真实性语义。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   event_id：时间线事件标识。
+ * 返回：完整时间线事件；缺失或查询失败抛异常。
+ * 副作用：只读；未知故事时间保留空值。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::TimelineEvent readTimelineEvent(sqlite3* database, const std::string& event_id) {
     Statement query(database, "SELECT id,world_id,name,has_story_time,story_time,narrative_order,relative_time,truth_status,revision FROM timeline_event WHERE id=?");
-    bindText(query.get(), 1, event_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到时间事件");
+    bindText(query.get(), 1, event_id); if (!stepRow(query.get())) throw std::runtime_error("找不到时间事件");
     xuyan::domain::TimelineEvent event; event.id = columnText(query.get(), 0); event.world_id = columnText(query.get(), 1);
     event.name = columnText(query.get(), 2); if (sqlite3_column_int(query.get(), 3)) event.story_time = sqlite3_column_int64(query.get(), 4);
     event.narrative_order = sqlite3_column_int(query.get(), 5); event.relative_time = columnText(query.get(), 6);
     event.truth_status = columnText(query.get(), 7); event.revision = sqlite3_column_int(query.get(), 8);
     Statement edges(database, "SELECT edge_kind,target_event_id FROM timeline_event_edge WHERE event_id=? ORDER BY edge_kind,target_event_id");
     bindText(edges.get(), 1, event_id);
-    while (sqlite3_step(edges.get()) == SQLITE_ROW) {
+    while (stepRow(edges.get())) {
         const auto kind = columnText(edges.get(), 0); const auto target = columnText(edges.get(), 1);
         if (kind == "prerequisite") event.prerequisites.push_back(target);
         else if (kind == "cause") event.causes.push_back(target); else event.results.push_back(target);
@@ -715,7 +946,19 @@ xuyan::domain::TimelineEvent readTimelineEvent(sqlite3* database, const std::str
     return event;
 }
 
-/** @brief 在审核写事务中校验明确选择的实体及当前修订，不把名字相同当作选择依据。 */
+/* 在审核写事务中校验明确选择的实体及当前修订，不把名字相同当作选择依据。 */
+/*
+ * 功能：核对作者明确选择的实体是否满足世界、状态、类别、逐字身份和修订边界。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   world_id：当前世界稳定标识，用于隔离端点。
+ *   mention：原文逐字名称或完整别名，作为精确身份条件。
+ *   entity_id：实体稳定标识。
+ *   expected_revision：外层已读取的预期实体修订。
+ * 返回：通过为成功true；规则/修订问题返回Result错误。
+ * 副作用：只读，不在多个同名项中自动选择，不改实体。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 Result<bool> validateChosenEndpoint(sqlite3* database, const std::string& world_id, const std::string& mention,
                                     const std::string& entity_id, int expected_revision) {
     if (entity_id.empty() || entity_id.size() > 512 || expected_revision < 1)
@@ -738,7 +981,14 @@ Result<bool> validateChosenEndpoint(sqlite3* database, const std::string& world_
     return Result<bool>::success(true);
 }
 
-/** @brief 创建图语义扩展及旧记录回填；调用方必须在持有迁移锁的事务中执行。 */
+/* 创建图语义扩展及旧记录回填；调用方必须在持有迁移锁的事务中执行。 */
+/*
+ * 功能：返回关系/地点专用语义结构的既定迁移SQL。
+ * 参数：无。
+ * 返回：固定结构迁移文本，不含世界或人物资料。
+ * 副作用：只构造SQL字符串，调用者在迁移事务内执行。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string graphSemanticsUpgradeSql() {
     return "CREATE TABLE IF NOT EXISTS relation_semantics("
         "relation_id TEXT PRIMARY KEY,bidirectional INTEGER NOT NULL CHECK(bidirectional IN(0,1)),"
@@ -755,7 +1005,14 @@ std::string graphSemanticsUpgradeSql() {
         "CREATE INDEX IF NOT EXISTS idx_candidate_acceptance_entity ON candidate_acceptance(entity_id);";
 }
 
-/** @brief 增加实体合并的关系引用检查点与不可变改写日志，不推断或回填历史合并的图操作。 */
+/* 增加实体合并的关系引用检查点与不可变改写日志，不推断或回填历史合并的图操作。 */
+/*
+ * 功能：返回合并关系改写日志和图检查点的迁移SQL。
+ * 参数：无。
+ * 返回：固定结构迁移文本；不猜测补写旧合并关系。
+ * 副作用：只返回文本，执行由迁移事务负责。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 std::string entityRelationRewriteUpgradeSql() {
     return "CREATE TABLE IF NOT EXISTS entity_merge_graph_checkpoint("
         "merge_id TEXT PRIMARY KEY,algorithm_version TEXT NOT NULL,relation_count INTEGER NOT NULL CHECK(relation_count>=0),"
@@ -771,7 +1028,17 @@ std::string entityRelationRewriteUpgradeSql() {
         "CREATE INDEX IF NOT EXISTS idx_directed_relation_to_entity ON directed_relation(to_entity_id);";
 }
 
-/** @brief 在合并事务内有界检查受影响关系，拒绝自环、跨世界、损坏语义及不能安全递增的修订。 */
+/* 在合并事务内有界检查受影响关系，拒绝自环、跨世界、损坏语义及不能安全递增的修订。 */
+/*
+ * 功能：在合并写入前核对涉及源/目标的关系修订及可安全递增性。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   source：借用的合并源实体，按其当前修订检查关系。
+ *   target：借用的合并目标实体，由作者明确选择。
+ * 返回：成功值为受影响关系数；非法数据或修订问题返回错误。
+ * 副作用：只读，校验与后续改写须在同一写事务。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 Result<int> preflightEntityRelationRewrite(sqlite3* database, const WorldEntity& source, const WorldEntity& target) {
     // 地图/时间线本体的合并需要另行解决专用字段冲突；不能沿用只合并别名的通用路径。
     Statement unsupported(database, "SELECT EXISTS(SELECT 1 FROM location_placement WHERE location_id=? OR parent_location_id=?)"
@@ -780,7 +1047,7 @@ Result<int> preflightEntityRelationRewrite(sqlite3* database, const WorldEntity&
         " OR EXISTS(SELECT 1 FROM timeline_event_edge WHERE event_id=? OR target_event_id=?)"
         " OR EXISTS(SELECT 1 FROM directed_relation WHERE id=?)");
     for (int index = 1; index <= 8; ++index) bindText(unsupported.get(), index, source.id);
-    if (sqlite3_step(unsupported.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database));
+    if (!stepRow(unsupported.get())) throw std::runtime_error(sqlite3_errmsg(database));
     if (sqlite3_column_int(unsupported.get(), 0)) return Result<int>::failure({ErrorCode::rule_conflict,
         "源条目含地图、时间线或关系本体，须先处理专用记录冲突，不能仅合并别名", false, "保留资料并校对专用记录"});
     Statement check(database, "SELECT COUNT(*),COALESCE(MAX(r.world_id<>?),0),"
@@ -791,7 +1058,7 @@ Result<int> preflightEntityRelationRewrite(sqlite3* database, const WorldEntity&
     bindText(check.get(), 4, target.id); bindText(check.get(), 5, source.id);
     sqlite3_bind_int(check.get(), 6, std::numeric_limits<int>::max() - 1);
     bindText(check.get(), 7, source.id); bindText(check.get(), 8, source.id);
-    if (sqlite3_step(check.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database));
+    if (!stepRow(check.get())) throw std::runtime_error(sqlite3_errmsg(database));
     if (sqlite3_column_int(check.get(), 1) || sqlite3_column_int(check.get(), 4))
         return Result<int>::failure({ErrorCode::rule_conflict, "关系存在跨世界引用或缺失语义，不能合并", false, "先修复关系资料"});
     if (sqlite3_column_int(check.get(), 2)) return Result<int>::failure({ErrorCode::rule_conflict,
@@ -802,7 +1069,19 @@ Result<int> preflightEntityRelationRewrite(sqlite3* database, const WorldEntity&
     return Result<int>::success(static_cast<int>(count));
 }
 
-/** @brief 在既有合并事务内先记录全部旧/新端点，再集合改写，避免把全量小说关系加载到内存。 */
+/* 在既有合并事务内先记录全部旧/新端点，再集合改写，避免把全量小说关系加载到内存。 */
+/*
+ * 功能：按预检数量记录关系旧端点并集合改写源到目标引用，关系身份及语义不变。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   merge_id：待改写或恢复的合并日志标识。
+ *   source_id：小说来源标识；关系合并改写函数中表示源实体标识，非来源文件。
+ *   target_id：作者明确选择的目标实体标识。
+ *   expected_count：同一事务预检得到的关系数量，实际写入须一致。
+ * 返回：无；实际数量或日志条件不符合时抛异常。
+ * 副作用：写改写日志和关系修订，外层事务失败整体回滚。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void applyEntityRelationRewrite(sqlite3* database, const std::string& merge_id,
                                 const std::string& source_id, const std::string& target_id, int expected_count) {
     Statement checkpoint(database, "INSERT INTO entity_merge_graph_checkpoint(merge_id,algorithm_version,relation_count) VALUES(?,'entity-relations-v1',?)");
@@ -825,7 +1104,16 @@ void applyEntityRelationRewrite(sqlite3* database, const std::string& merge_id,
     // 不修改关系ID、专用语义、权限或原文锚点，也不将两条不同关系静默合并。
 }
 
-/** @brief 验证拆分所需的关系日志完整性和当前修订，拒绝覆盖合并之后的编辑或另一次合并。 */
+/* 验证拆分所需的关系日志完整性和当前修订，拒绝覆盖合并之后的编辑或另一次合并。 */
+/*
+ * 功能：检查合并后关系是否仍与日志一致，防止拆分覆盖后续作者编辑。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   merge_id：待改写或恢复的合并日志标识。
+ * 返回：成功值为可恢复关系数；修订或端点已经变化时返回错误。
+ * 副作用：只读，恢复必须紧接在同一写事务内进行。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 Result<int> preflightEntityRelationRestore(sqlite3* database, const std::string& merge_id) {
     Statement checkpoint(database, "SELECT algorithm_version,relation_count FROM entity_merge_graph_checkpoint WHERE merge_id=?");
     bindText(checkpoint.get(), 1, merge_id);
@@ -853,7 +1141,7 @@ Result<int> preflightEntityRelationRestore(sqlite3* database, const std::string&
         " FROM entity_relation_rewrite j JOIN entity_merge m ON m.id=j.merge_id JOIN world_entity e ON e.id=m.source_id"
         " LEFT JOIN directed_relation r ON r.id=j.relation_id LEFT JOIN relation_semantics s ON s.relation_id=r.id WHERE j.merge_id=?");
     sqlite3_bind_int(check.get(), 1, std::numeric_limits<int>::max()); bindText(check.get(), 2, merge_id);
-    if (sqlite3_step(check.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database));
+    if (!stepRow(check.get())) throw std::runtime_error(sqlite3_errmsg(database));
     if (sqlite3_column_int64(check.get(), 0) != expected_count || sqlite3_column_int(check.get(), 2))
         return Result<int>::failure({ErrorCode::rule_conflict, "合并关系日志不完整，不能自动拆分", false, "保留资料并检查改写历史"});
     if (sqlite3_column_int(check.get(), 1)) return Result<int>::failure({ErrorCode::revision_conflict,
@@ -861,7 +1149,17 @@ Result<int> preflightEntityRelationRestore(sqlite3* database, const std::string&
     return Result<int>::success(static_cast<int>(expected_count));
 }
 
-/** @brief 只恢复日志内的旧端点并追加关系修订，保留合并后新增关系及不可变改写历史。 */
+/* 只恢复日志内的旧端点并追加关系修订，保留合并后新增关系及不可变改写历史。 */
+/*
+ * 功能：仅恢复指定合并日志内的旧端点，并继续递增关系修订。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   merge_id：待改写或恢复的合并日志标识。
+ *   expected_count：同一事务预检得到的关系数量，实际写入须一致。
+ * 返回：无；实际恢复数不符或存储失败抛异常。
+ * 副作用：写关系及修订，不倒退已发布快照或其他关系。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void restoreEntityRelationRewrite(sqlite3* database, const std::string& merge_id, int expected_count) {
     Statement update(database, "UPDATE directed_relation SET from_entity_id=(SELECT j.previous_from FROM entity_relation_rewrite j WHERE j.merge_id=? AND j.relation_id=directed_relation.id),"
         "to_entity_id=(SELECT j.previous_to FROM entity_relation_rewrite j WHERE j.merge_id=? AND j.relation_id=directed_relation.id),revision=revision+1"
@@ -871,7 +1169,17 @@ void restoreEntityRelationRewrite(sqlite3* database, const std::string& merge_id
         throw std::runtime_error("关系端点拆分数量不一致");
 }
 
-/** @brief 在既有写事务中保存方向、强度已知位及真实性；候选首次投影禁止覆盖同标识语义。 */
+/* 在既有写事务中保存方向、强度已知位及真实性；候选首次投影禁止覆盖同标识语义。 */
+/*
+ * 功能：在通用关系记录旁保存证据性质与真实性字段。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   relation：有向关系及其证据/真实性字段。
+ *   insert_only：默认false允许更新已有语义；true仅插入并保留既有记录。
+ * 返回：无；存储失败抛异常。
+ * 副作用：写当前事务中的专用语义表；不自动提升模型推断为事实。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void writeRelationSemantics(sqlite3* database, const xuyan::domain::DirectedRelation& relation, bool insert_only = false) {
     const std::string sql = "INSERT INTO relation_semantics(relation_id,bidirectional,has_strength,truth_status) VALUES(?,?,?,?)"
         + std::string(insert_only ? "" : " ON CONFLICT(relation_id) DO UPDATE SET bidirectional=excluded.bidirectional,has_strength=excluded.has_strength,truth_status=excluded.truth_status");
@@ -881,7 +1189,17 @@ void writeRelationSemantics(sqlite3* database, const xuyan::domain::DirectedRela
     if (sqlite3_step(statement.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
 }
 
-/** @brief 在既有写事务中保存地点真实性；候选首次投影禁止覆盖同标识语义。 */
+/* 在既有写事务中保存地点真实性；候选首次投影禁止覆盖同标识语义。 */
+/*
+ * 功能：在地点记录旁保存证据性质与真实性字段。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   location：地点放置及其证据/真实性字段。
+ *   insert_only：默认false允许更新已有语义；true仅插入并保留既有记录。
+ * 返回：无；存储失败抛异常。
+ * 副作用：写当前事务中的专用语义表；未知语义遵守对象字段。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 void writeLocationSemantics(sqlite3* database, const xuyan::domain::LocationPlacement& location, bool insert_only = false) {
     const std::string sql = "INSERT INTO location_semantics(location_id,truth_status) VALUES(?,?)"
         + std::string(insert_only ? "" : " ON CONFLICT(location_id) DO UPDATE SET truth_status=excluded.truth_status");
@@ -890,10 +1208,19 @@ void writeLocationSemantics(sqlite3* database, const xuyan::domain::LocationPlac
     if (sqlite3_step(statement.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
 }
 
-/** @brief 读取关系及其明确语义；当前格式缺少扩展记录时拒绝，不能把未知数值默认为零。 */
+/* 读取关系及其明确语义；当前格式缺少扩展记录时拒绝，不能把未知数值默认为零。 */
+/*
+ * 功能：读取有向关系、修订、时间和专用真实性语义。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   relation_id：有向关系稳定标识。
+ * 返回：完整关系值；不存在或读取失败抛异常。
+ * 副作用：只读，未知强度/时间与已知零值分开。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::DirectedRelation readDirectedRelation(sqlite3* database, const std::string& relation_id) {
     Statement query(database, "SELECT r.id,r.world_id,r.from_entity_id,r.to_entity_id,r.dimension,r.strength,r.has_valid_from,r.valid_from,r.has_valid_to,r.valid_to,r.visibility,r.evidence_status,r.revision,s.bidirectional,s.has_strength,s.truth_status FROM directed_relation r JOIN relation_semantics s ON s.relation_id=r.id WHERE r.id=?");
-    bindText(query.get(), 1, relation_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到定向关系");
+    bindText(query.get(), 1, relation_id); if (!stepRow(query.get())) throw std::runtime_error("找不到定向关系");
     xuyan::domain::DirectedRelation relation; relation.id = columnText(query.get(), 0); relation.world_id = columnText(query.get(), 1);
     relation.from_entity_id = columnText(query.get(), 2); relation.to_entity_id = columnText(query.get(), 3);
     relation.dimension = columnText(query.get(), 4);
@@ -905,14 +1232,23 @@ xuyan::domain::DirectedRelation readDirectedRelation(sqlite3* database, const st
     relation.bidirectional = sqlite3_column_int(query.get(), 13) != 0; relation.truth_status = columnText(query.get(), 15);
     Statement grants(database, "SELECT actor_id FROM directed_relation_grant WHERE relation_id=? ORDER BY actor_id");
     bindText(grants.get(), 1, relation_id);
-    while (sqlite3_step(grants.get()) == SQLITE_ROW) relation.actor_grants.push_back(columnText(grants.get(), 0));
+    while (stepRow(grants.get())) relation.actor_grants.push_back(columnText(grants.get(), 0));
     return relation;
 }
 
-/** @brief 读取地点及真实性；未知坐标仍为空，缺少当前语义记录时拒绝读取。 */
+/* 读取地点及真实性；未知坐标仍为空，缺少当前语义记录时拒绝读取。 */
+/*
+ * 功能：读取地点层级、可选图像坐标及专用真实性语义。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   location_id：地点实体稳定标识。
+ * 返回：地点放置值；不存在或读取失败抛异常。
+ * 副作用：只读，不补默认地图坐标。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::LocationPlacement readLocationPlacement(sqlite3* database, const std::string& location_id) {
     Statement query(database, "SELECT p.location_id,p.parent_location_id,p.has_image_point,p.image_x,p.image_y,p.background_asset_ref,p.evidence_status,p.revision,s.truth_status FROM location_placement p JOIN location_semantics s ON s.location_id=p.location_id WHERE p.location_id=?");
-    bindText(query.get(), 1, location_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到地点标注");
+    bindText(query.get(), 1, location_id); if (!stepRow(query.get())) throw std::runtime_error("找不到地点标注");
     xuyan::domain::LocationPlacement value; value.location_id = columnText(query.get(), 0); value.parent_location_id = columnText(query.get(), 1);
     if (sqlite3_column_int(query.get(), 2)) { value.image_x = sqlite3_column_int(query.get(), 3); value.image_y = sqlite3_column_int(query.get(), 4); }
     value.background_asset_ref = columnText(query.get(), 5); value.evidence_status = columnText(query.get(), 6); value.revision = sqlite3_column_int(query.get(), 7);
@@ -920,54 +1256,99 @@ xuyan::domain::LocationPlacement readLocationPlacement(sqlite3* database, const 
     return value;
 }
 
+/*
+ * 功能：读取地点之间的路线及方向、可选旅行分钟数。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   route_id：地点路线稳定标识。
+ * 返回：路线值；不存在或读取失败抛异常。
+ * 副作用：只读，不将未知耗时当成0。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::TravelRoute readTravelRoute(sqlite3* database, const std::string& route_id) {
     Statement query(database, "SELECT id,from_location_id,to_location_id,has_travel_minutes,travel_minutes,bidirectional,evidence_status,revision FROM travel_route WHERE id=?");
-    bindText(query.get(), 1, route_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到地点路线");
+    bindText(query.get(), 1, route_id); if (!stepRow(query.get())) throw std::runtime_error("找不到地点路线");
     xuyan::domain::TravelRoute value; value.id = columnText(query.get(), 0); value.from_location_id = columnText(query.get(), 1);
     value.to_location_id = columnText(query.get(), 2); if (sqlite3_column_int(query.get(), 3)) value.travel_minutes = sqlite3_column_int(query.get(), 4);
     value.bidirectional = sqlite3_column_int(query.get(), 5) != 0; value.evidence_status = columnText(query.get(), 6); value.revision = sqlite3_column_int(query.get(), 7);
     return value;
 }
 
+/*
+ * 功能：读取故事时间快照及未能确定的实体范围。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   snapshot_id：历史快照稳定标识。
+ * 返回：固定历史快照值；缺失或读取失败抛异常。
+ * 副作用：只读，不改原世界版本。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::HistoricalSnapshot readHistoricalSnapshot(sqlite3* database, const std::string& snapshot_id) {
     Statement query(database, "SELECT id,world_version_id,story_time,content_hash FROM historical_snapshot WHERE id=?");
-    bindText(query.get(), 1, snapshot_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到历史快照");
+    bindText(query.get(), 1, snapshot_id); if (!stepRow(query.get())) throw std::runtime_error("找不到历史快照");
     xuyan::domain::HistoricalSnapshot snapshot; snapshot.id = columnText(query.get(), 0); snapshot.world_version_id = columnText(query.get(), 1);
     snapshot.story_time = sqlite3_column_int64(query.get(), 2); snapshot.content_hash = columnText(query.get(), 3);
     Statement members(database, "SELECT m.entity_id,m.entity_revision,COALESCE(s.scope_revision,0) FROM historical_snapshot_member m LEFT JOIN world_version_member_scope s ON s.version_id=? AND s.entity_id=m.entity_id WHERE m.snapshot_id=? ORDER BY m.entity_id");
     bindText(members.get(), 1, snapshot.world_version_id); bindText(members.get(), 2, snapshot_id);
-    while (sqlite3_step(members.get()) == SQLITE_ROW) snapshot.included_members.push_back({columnText(members.get(), 0), sqlite3_column_int(members.get(), 1), sqlite3_column_int(members.get(), 2)});
+    while (stepRow(members.get())) snapshot.included_members.push_back({columnText(members.get(), 0), sqlite3_column_int(members.get(), 1), sqlite3_column_int(members.get(), 2)});
     Statement unresolved(database, "SELECT entity_id FROM historical_snapshot_unresolved WHERE snapshot_id=? ORDER BY entity_id"); bindText(unresolved.get(), 1, snapshot_id);
-    while (sqlite3_step(unresolved.get()) == SQLITE_ROW) snapshot.unresolved_entity_ids.push_back(columnText(unresolved.get(), 0));
+    while (stepRow(unresolved.get())) snapshot.unresolved_entity_ids.push_back(columnText(unresolved.get(), 0));
     return snapshot;
 }
 
+/*
+ * 功能：读取绑定卡片/世界版本的人物实例和记忆。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   instance_id：人物实例稳定标识。
+ * 返回：完整人物实例值；缺失或读取失败抛异常。
+ * 副作用：只读，不生成默认人物。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::CharacterInstance readCharacterInstance(sqlite3* database, const std::string& instance_id) {
     Statement query(database, "SELECT id,blueprint_id,blueprint_version,world_version_id,snapshot_id,name,adaptation_json,knowledge_policy,memory_json,status,revision FROM character_instance WHERE id=?");
-    bindText(query.get(), 1, instance_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到人物实例");
+    bindText(query.get(), 1, instance_id); if (!stepRow(query.get())) throw std::runtime_error("找不到人物实例");
     xuyan::domain::CharacterInstance value; value.id = columnText(query.get(), 0); value.blueprint_id = columnText(query.get(), 1);
     value.blueprint_version = sqlite3_column_int(query.get(), 2); value.world_version_id = columnText(query.get(), 3);
     value.snapshot_id = columnText(query.get(), 4); value.name = columnText(query.get(), 5); value.adaptation_json = columnText(query.get(), 6);
     value.knowledge_policy = columnText(query.get(), 7); value.memory_json = columnText(query.get(), 8);
     value.status = columnText(query.get(), 9); value.revision = sqlite3_column_int(query.get(), 10);
     Statement conflicts(database, "SELECT message FROM character_instance_conflict WHERE instance_id=? ORDER BY message"); bindText(conflicts.get(), 1, instance_id);
-    while (sqlite3_step(conflicts.get()) == SQLITE_ROW) value.conflicts.push_back(columnText(conflicts.get(), 0));
+    while (stepRow(conflicts.get())) value.conflicts.push_back(columnText(conflicts.get(), 0));
     return value;
 }
 
+/*
+ * 功能：读取分支的固定世界、历史快照和人物绑定集合。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   branch_id：推演分支稳定标识。
+ * 返回：分支根绑定值；缺失或读取失败抛异常。
+ * 副作用：只读。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::BranchRootBinding readBranchRootBinding(sqlite3* database, const std::string& branch_id) {
     Statement query(database, "SELECT branch_id,world_version_id,snapshot_id,history_mode,root_hash FROM branch_root_binding WHERE branch_id=?");
-    bindText(query.get(), 1, branch_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到分支根绑定");
+    bindText(query.get(), 1, branch_id); if (!stepRow(query.get())) throw std::runtime_error("找不到分支根绑定");
     xuyan::domain::BranchRootBinding value; value.branch_id = columnText(query.get(), 0); value.world_version_id = columnText(query.get(), 1);
     value.snapshot_id = columnText(query.get(), 2); value.history_mode = columnText(query.get(), 3); value.root_hash = columnText(query.get(), 4);
     Statement instances(database, "SELECT instance_id FROM branch_character_instance WHERE branch_id=? ORDER BY instance_id"); bindText(instances.get(), 1, branch_id);
-    while (sqlite3_step(instances.get()) == SQLITE_ROW) value.character_instance_ids.push_back(columnText(instances.get(), 0));
+    while (stepRow(instances.get())) value.character_instance_ids.push_back(columnText(instances.get(), 0));
     return value;
 }
 
+/*
+ * 功能：读取一个已预留或已提交回合的意图、状态和叙事字段。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   turn_id：推演回合稳定标识。
+ * 返回：推演回合值；缺失或读取失败抛异常。
+ * 副作用：只读，不运行网络或推进会话。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::SimulationTurn readSimulationTurn(sqlite3* database, const std::string& turn_id) {
     Statement query(database, "SELECT id,session_id,ordinal,input_commit_id,committed_commit_id,actor_id,status,speech,operation,target_id,holder_consented,ends_scene,public_reason,draft_narration,final_narration,error_message,revision FROM simulation_turn WHERE id=?");
-    bindText(query.get(), 1, turn_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到推演回合");
+    bindText(query.get(), 1, turn_id); if (!stepRow(query.get())) throw std::runtime_error("找不到推演回合");
     xuyan::domain::SimulationTurn turn; turn.id = columnText(query.get(), 0); turn.session_id = columnText(query.get(), 1);
     turn.ordinal = sqlite3_column_int(query.get(), 2); turn.input_commit_id = columnText(query.get(), 3);
     turn.committed_commit_id = columnText(query.get(), 4); turn.actor_id = columnText(query.get(), 5); turn.status = columnText(query.get(), 6);
@@ -977,21 +1358,30 @@ xuyan::domain::SimulationTurn readSimulationTurn(sqlite3* database, const std::s
     turn.intent.public_reason = columnText(query.get(), 12); turn.draft_narration = columnText(query.get(), 13);
     turn.final_narration = columnText(query.get(), 14); turn.error_message = columnText(query.get(), 15); turn.revision = sqlite3_column_int(query.get(), 16);
     Statement call(database, "SELECT id,turn_id,provider_connection_id,model_id,request_hash,status,input_tokens,output_tokens,failure_kind FROM simulation_provider_call WHERE turn_id=?"); bindText(call.get(), 1, turn_id);
-    if (sqlite3_step(call.get()) == SQLITE_ROW) { turn.call.id = columnText(call.get(), 0); turn.call.turn_id = columnText(call.get(), 1); turn.call.provider_connection_id = columnText(call.get(), 2); turn.call.model_id = columnText(call.get(), 3); turn.call.request_hash = columnText(call.get(), 4); turn.call.status = columnText(call.get(), 5); turn.call.input_tokens = sqlite3_column_int(call.get(), 6); turn.call.output_tokens = sqlite3_column_int(call.get(), 7); turn.call.failure_kind = columnText(call.get(), 8); }
+    if (stepRow(call.get())) { turn.call.id = columnText(call.get(), 0); turn.call.turn_id = columnText(call.get(), 1); turn.call.provider_connection_id = columnText(call.get(), 2); turn.call.model_id = columnText(call.get(), 3); turn.call.request_hash = columnText(call.get(), 4); turn.call.status = columnText(call.get(), 5); turn.call.input_tokens = sqlite3_column_int(call.get(), 6); turn.call.output_tokens = sqlite3_column_int(call.get(), 7); turn.call.failure_kind = columnText(call.get(), 8); }
     return turn;
 }
 
+/*
+ * 功能：读取会话配置、角色集合和回合记录。
+ * 参数：
+ *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
+ *   session_id：推演会话稳定标识。
+ * 返回：完整持久化会话值；缺失或读取失败抛异常。
+ * 副作用：只读，不因恢复读取而重发未知模型调用。
+ * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ */
 xuyan::domain::SimulationSession readSimulationSession(sqlite3* database, const std::string& session_id) {
     Statement query(database, "SELECT id,branch_id,status,max_turns,continuous,no_progress_limit,max_calls,used_calls,reserved_calls,unknown_calls,pause_requested,cancel_requested,revision FROM simulation_session WHERE id=?");
-    bindText(query.get(), 1, session_id); if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到推演会话");
+    bindText(query.get(), 1, session_id); if (!stepRow(query.get())) throw std::runtime_error("找不到推演会话");
     xuyan::domain::SimulationSession session; session.id = columnText(query.get(), 0); session.branch_id = columnText(query.get(), 1);
     session.status = columnText(query.get(), 2); session.max_turns = sqlite3_column_int(query.get(), 3); session.continuous = sqlite3_column_int(query.get(), 4) != 0;
     session.no_progress_limit = sqlite3_column_int(query.get(), 5); session.max_calls = sqlite3_column_int(query.get(), 6);
     session.used_calls = sqlite3_column_int(query.get(), 7); session.reserved_calls = sqlite3_column_int(query.get(), 8); session.unknown_calls = sqlite3_column_int(query.get(), 9);
     session.pause_requested = sqlite3_column_int(query.get(), 10) != 0; session.cancel_requested = sqlite3_column_int(query.get(), 11) != 0; session.revision = sqlite3_column_int(query.get(), 12);
     Statement actors(database, "SELECT actor_id,provider_connection_id,model_id FROM simulation_actor_binding WHERE session_id=? ORDER BY ordinal"); bindText(actors.get(), 1, session_id);
-    while (sqlite3_step(actors.get()) == SQLITE_ROW) session.actors.push_back({columnText(actors.get(), 0), columnText(actors.get(), 1), columnText(actors.get(), 2)});
-    Statement turns(database, "SELECT id FROM simulation_turn WHERE session_id=? ORDER BY ordinal"); bindText(turns.get(), 1, session_id); std::vector<std::string> turn_ids; while (sqlite3_step(turns.get()) == SQLITE_ROW) turn_ids.push_back(columnText(turns.get(), 0));
+    while (stepRow(actors.get())) session.actors.push_back({columnText(actors.get(), 0), columnText(actors.get(), 1), columnText(actors.get(), 2)});
+    Statement turns(database, "SELECT id FROM simulation_turn WHERE session_id=? ORDER BY ordinal"); bindText(turns.get(), 1, session_id); std::vector<std::string> turn_ids; while (stepRow(turns.get())) turn_ids.push_back(columnText(turns.get(), 0));
     for (const auto& id : turn_ids) session.turns.push_back(readSimulationTurn(database, id));
     return session;
 }
@@ -1004,7 +1394,8 @@ WorkspaceRepository::WorkspaceRepository(const std::filesystem::path& database_p
     }
     const auto utf8 = database_path.u8string();
     if (sqlite3_open(reinterpret_cast<const char*>(utf8.c_str()), &database_) != SQLITE_OK) {
-        const auto message = database_ == nullptr ? "cannot open SQLite workspace" : sqlite3_errmsg(database_);
+        // SQLite 的错误缓冲区随连接关闭失效；先复制消息再释放句柄。
+        const std::string message = database_ == nullptr ? "无法打开工作区数据库" : sqlite3_errmsg(database_);
         if (database_ != nullptr) sqlite3_close(database_);
         database_ = nullptr;
         throw std::runtime_error(message);
@@ -1026,12 +1417,30 @@ WorkspaceRepository::~WorkspaceRepository() {
     if (database_ != nullptr) sqlite3_close(database_);
 }
 
-/** @brief 原子升级工作区结构；新图语义仅为旧记录保留已有意义，不重写候选或猜测未知资料。 */
+Result<bool> WorkspaceRepository::validateCoreSchema() {
+    try {
+        // 只核对跨入口必需的表名，避免为一次切换加载整本来源或大量世界条目。
+        Statement required(database_,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ("
+            "'branch','state_snapshot','world_entity','entity_revision','source_document','source_chapter',"
+            "'world_template','provider_connection','evidence_reference','extraction_job','extraction_step',"
+            "'extraction_candidate','character_blueprint','character_blueprint_version','world_version',"
+            "'simulation_session')");
+        if (!stepRow(required.get()) || sqlite3_column_int(required.get(), 0) != 16)
+            return Result<bool>::failure({ErrorCode::storage_error,
+                "工作区缺少核心资料表，无法安全打开", false, "保留原文件并使用匹配的软件版本或有效备份"});
+        return Result<bool>::success(true);
+    } catch (const std::exception& exception) {
+        return Result<bool>::failure(storageError(exception));
+    }
+}
+
+/* 原子升级工作区结构；新图语义仅为旧记录保留已有意义，不重写候选或猜测未知资料。 */
 void WorkspaceRepository::migrate() {
     int existing_version = 0;
     {
         Statement version(database_, "PRAGMA user_version");
-        if (sqlite3_step(version.get()) != SQLITE_ROW) throw std::runtime_error("无法读取工作区版本");
+        if (!stepRow(version.get())) throw std::runtime_error("无法读取工作区版本");
         existing_version = sqlite3_column_int(version.get(), 0);
     }
     if (existing_version > 30)
@@ -1040,7 +1449,7 @@ void WorkspaceRepository::migrate() {
     std::vector<std::string> snapshot_columns;
     {
         Statement columns(database_, "PRAGMA table_info(state_snapshot)");
-        while (sqlite3_step(columns.get()) == SQLITE_ROW) snapshot_columns.push_back(columnText(columns.get(), 1));
+        while (stepRow(columns.get())) snapshot_columns.push_back(columnText(columns.get(), 1));
     }
     const std::vector<std::string> current_columns{
         "branch_id", "commit_id", "parent_commit_id", "state_hash", "state_json", "created_at"};
@@ -1080,6 +1489,7 @@ void WorkspaceRepository::migrate() {
         }
         return;
     }
+    bool reset_empty_snapshot = false;
     if (!snapshot_columns.empty() && snapshot_columns != current_columns) {
         const std::vector<std::string> old_prefix{
             "branch_id", "commit_id", "parent_commit_id", "state_hash", "state_json", "revision",
@@ -1090,22 +1500,16 @@ void WorkspaceRepository::migrate() {
         if (!known_empty_schema)
             throw std::runtime_error("工作区快照结构不受支持；原数据库未修改，请使用匹配的软件版本");
         Statement existing(database_, "SELECT 1 FROM state_snapshot LIMIT 1");
-        if (sqlite3_step(existing.get()) == SQLITE_ROW)
+        if (stepRow(existing.get()))
             throw std::runtime_error("工作区包含不受支持的旧快照；原数据库未修改，请先备份并使用新工作区");
         Statement branches(database_, "SELECT name FROM sqlite_master WHERE type='table' AND name='branch'");
-        if (sqlite3_step(branches.get()) == SQLITE_ROW) {
+        if (stepRow(branches.get())) {
             Statement existing_branch(database_, "SELECT 1 FROM branch LIMIT 1");
-            if (sqlite3_step(existing_branch.get()) == SQLITE_ROW)
+            if (stepRow(existing_branch.get()))
                 throw std::runtime_error("工作区包含旧分支记录；原数据库未修改，请先备份并使用新工作区");
         }
-        char* error = nullptr;
-        constexpr auto reset_empty_snapshot = "BEGIN IMMEDIATE; DROP TABLE state_snapshot; COMMIT;";
-        if (sqlite3_exec(database_, reset_empty_snapshot, nullptr, nullptr, &error) != SQLITE_OK) {
-            const std::string detail = error == nullptr ? "无法升级空快照表" : error;
-            sqlite3_free(error);
-            sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
-            throw std::runtime_error(detail);
-        }
+        // 只标记预检通过；删除旧表必须和后续建表处于同一事务，以便失败时完整回滚。
+        reset_empty_snapshot = true;
     }
     // MSVC 限制单个字面量长度；相邻原始字符串在编译期拼接，仍一次执行同一份迁移 SQL。
     constexpr auto sql = R"SQL(
@@ -1443,7 +1847,14 @@ CREATE TABLE IF NOT EXISTS simulation_director_intervention(
   FOREIGN KEY(session_id) REFERENCES simulation_session(id)
 );
 )SQL";
-    const auto complete_sql = std::string{sql} + graphSemanticsUpgradeSql() + entityRelationRewriteUpgradeSql() + "PRAGMA user_version=30; COMMIT;";
+    std::string complete_sql = std::string{sql} + graphSemanticsUpgradeSql() + entityRelationRewriteUpgradeSql() + "PRAGMA user_version=30; COMMIT;";
+    if (reset_empty_snapshot) {
+        constexpr auto transaction_start = "BEGIN IMMEDIATE;";
+        const auto offset = complete_sql.find(transaction_start);
+        if (offset == std::string::npos)
+            throw std::runtime_error("工作区升级事务结构无效；原数据库未修改");
+        complete_sql.insert(offset + sizeof("BEGIN IMMEDIATE;") - 1, " DROP TABLE state_snapshot;");
+    }
     char* message = nullptr;
     if (sqlite3_exec(database_, complete_sql.c_str(), nullptr, nullptr, &message) != SQLITE_OK) {
         const std::string detail = message == nullptr ? "migration failed" : message;
@@ -1463,7 +1874,7 @@ Result<CommitView> WorkspaceRepository::createRootBranch(
     try {
         Transaction transaction(database_);
         Statement existing(database_, "SELECT value FROM metadata WHERE key='active_branch_id'");
-        if (sqlite3_step(existing.get()) == SQLITE_ROW) {
+        if (stepRow(existing.get())) {
             return Result<CommitView>::failure(
                 {ErrorCode::rule_conflict, "工作区已有活动分支", false, "打开现有分支或创建新工作区"});
         }
@@ -1500,7 +1911,7 @@ Result<CommitView> WorkspaceRepository::createRootBranch(
 Result<std::string> WorkspaceRepository::activeBranchId() {
     try {
         Statement query(database_, "SELECT value FROM metadata WHERE key='active_branch_id'");
-        if (sqlite3_step(query.get()) != SQLITE_ROW) {
+        if (!stepRow(query.get())) {
             return Result<std::string>::failure(
                 Error{ErrorCode::missing_context, "工作区尚无活动分支", false, "创建分支后再继续"});
         }
@@ -1514,7 +1925,7 @@ Result<CommitView> WorkspaceRepository::loadHead(const std::string& branch_id) {
     try {
         Statement query(database_, "SELECT head_commit_id FROM branch WHERE id=?");
         bindText(query.get(), 1, branch_id);
-        if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到分支：" + branch_id);
+        if (!stepRow(query.get())) throw std::runtime_error("找不到分支：" + branch_id);
         return Result<CommitView>::success(readCommit(database_, columnText(query.get(), 0)));
     } catch (const std::exception& exception) {
         return Result<CommitView>::failure(storageError(exception));
@@ -1533,7 +1944,7 @@ Result<std::vector<BranchInfo>> WorkspaceRepository::listBranches() {
     try {
         Statement query(database_, "SELECT id,name,COALESCE(parent_id,''),fork_commit_id,head_commit_id FROM branch ORDER BY created_at");
         std::vector<BranchInfo> branches;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) {
+        while (stepRow(query.get())) {
             branches.push_back({columnText(query.get(), 0), columnText(query.get(), 1), columnText(query.get(), 2),
                                 columnText(query.get(), 3), columnText(query.get(), 4)});
         }
@@ -1570,7 +1981,7 @@ Result<CommitView> WorkspaceRepository::commitStep(const std::string& command_id
         }
         Statement head(database_, "SELECT head_commit_id FROM branch WHERE id=?");
         bindText(head.get(), 1, expected.branch_id);
-        if (sqlite3_step(head.get()) != SQLITE_ROW || columnText(head.get(), 0) != expected.commit_id) {
+        if (!stepRow(head.get()) || columnText(head.get(), 0) != expected.commit_id) {
             return Result<CommitView>::failure(
                 Error{ErrorCode::revision_conflict, "分支头已经改变", true, "刷新分支后重新校验行动"});
         }
@@ -1741,7 +2152,7 @@ Result<WorldEntity> WorkspaceRepository::saveEntity(const std::string& command_i
         }
         Statement head(database_, "SELECT head_revision FROM world_entity WHERE id=?");
         bindText(head.get(), 1, entity.id);
-        if (sqlite3_step(head.get()) != SQLITE_ROW) {
+        if (!stepRow(head.get())) {
             return Result<WorldEntity>::failure(
                 Error{ErrorCode::missing_context, "要保存的条目不存在", false, "刷新条目列表"});
         }
@@ -1796,7 +2207,7 @@ Result<EntityPage> WorkspaceRepository::searchEntities(const std::string& query,
         bindText(count.get(), 1, query);
         for (int index = 2; index <= 5; ++index) bindText(count.get(), index, pattern);
         if (filter_kind) bindText(count.get(), 6, kind);
-        if (sqlite3_step(count.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+        if (!stepRow(count.get())) throw std::runtime_error(sqlite3_errmsg(database_));
         EntityPage page;
         page.offset = offset;
         page.total = sqlite3_column_int(count.get(), 0);
@@ -1810,7 +2221,7 @@ Result<EntityPage> WorkspaceRepository::searchEntities(const std::string& query,
         if (filter_kind) bindText(list.get(), parameter++, kind);
         sqlite3_bind_int(list.get(), parameter++, limit);
         sqlite3_bind_int(list.get(), parameter, offset);
-        while (sqlite3_step(list.get()) == SQLITE_ROW) {
+        while (stepRow(list.get())) {
             WorldEntity entity;
             entity.id = columnText(list.get(), 0);
             entity.world_id = columnText(list.get(), 1);
@@ -1840,7 +2251,7 @@ Result<WorldEntity> WorkspaceRepository::deleteEntity(const std::string& command
     return saveEntity(command_id, std::move(*entity.value), expected_revision);
 }
 
-/** @brief 显式合并同世界同类型条目，原子迁移证据和关系端点，并保留可拆分的改写历史。 */
+/* 显式合并同世界同类型条目，原子迁移证据和关系端点，并保留可拆分的改写历史。 */
 Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
     const std::string& command_id, const std::string& source_id, int source_expected_revision,
     const std::string& target_id, int target_expected_revision) {
@@ -1857,13 +2268,13 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
         {
             Statement replay(database_, "SELECT payload_hash,merge_id FROM entity_merge_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload && columnText(replay.get(), 0) != legacy_payload) return Result<MergeResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他合并", false, "生成新的命令标识"});
                 const auto existing_merge = columnText(replay.get(), 1);
                 Statement info(database_, "SELECT source_id,target_id,active FROM entity_merge WHERE id=?");
                 bindText(info.get(), 1, existing_merge);
-                if (sqlite3_step(info.get()) != SQLITE_ROW) throw std::runtime_error("合并命令结果缺失");
+                if (!stepRow(info.get())) throw std::runtime_error("合并命令结果缺失");
                 MergeResult result{existing_merge, readEntityRevision(database_, columnText(info.get(), 0)),
                                    readEntityRevision(database_, columnText(info.get(), 1)), sqlite3_column_int(info.get(), 2) != 0};
                 transaction.commit(); return Result<MergeResult>::success(std::move(result));
@@ -1897,7 +2308,7 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
         std::vector<std::string> evidence_ids;
         Statement evidence(database_, "SELECT id FROM evidence_reference WHERE entity_id=?");
         bindText(evidence.get(), 1, source_id);
-        while (sqlite3_step(evidence.get()) == SQLITE_ROW) evidence_ids.push_back(columnText(evidence.get(), 0));
+        while (stepRow(evidence.get())) evidence_ids.push_back(columnText(evidence.get(), 0));
         for (const auto& evidence_id : evidence_ids) {
             Statement rewrite(database_, "INSERT INTO evidence_entity_rewrite(merge_id,evidence_id,from_entity_id,to_entity_id) VALUES(?,?,?,?)");
             bindText(rewrite.get(), 1, merge_id); bindText(rewrite.get(), 2, evidence_id);
@@ -1924,7 +2335,7 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::mergeEntities(
     } catch (const std::exception& exception) { return Result<MergeResult>::failure(storageError(exception)); }
 }
 
-/** @brief 按显式合并历史恢复条目、证据及日志内关系端点，拒绝覆盖之后的图编辑。 */
+/* 按显式合并历史恢复条目、证据及日志内关系端点，拒绝覆盖之后的图编辑。 */
 Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
     const std::string& command_id, const std::string& merge_id,
     int source_expected_revision, int target_expected_revision) {
@@ -1939,12 +2350,12 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
         {
             Statement replay(database_, "SELECT payload_hash FROM entity_merge_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload && columnText(replay.get(), 0) != legacy_payload) return Result<MergeResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他拆分", false, "生成新的命令标识"});
                 Statement replay_info(database_, "SELECT source_id,target_id,active FROM entity_merge WHERE id=?");
                 bindText(replay_info.get(), 1, merge_id);
-                if (sqlite3_step(replay_info.get()) != SQLITE_ROW) throw std::runtime_error("拆分命令结果缺失");
+                if (!stepRow(replay_info.get())) throw std::runtime_error("拆分命令结果缺失");
                 MergeResult result{merge_id, readEntityRevision(database_, columnText(replay_info.get(), 0)),
                                    readEntityRevision(database_, columnText(replay_info.get(), 1)), sqlite3_column_int(replay_info.get(), 2) != 0};
                 transaction.commit(); return Result<MergeResult>::success(std::move(result));
@@ -1952,7 +2363,7 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
         }
         Statement info(database_, "SELECT source_id,target_id,source_previous_revision,target_previous_revision,active,source_merged_revision,target_merged_revision FROM entity_merge WHERE id=?");
         bindText(info.get(), 1, merge_id);
-        if (sqlite3_step(info.get()) != SQLITE_ROW) return Result<MergeResult>::failure(
+        if (!stepRow(info.get())) return Result<MergeResult>::failure(
             {ErrorCode::missing_context, "找不到合并记录", false, "刷新合并历史"});
         const auto source_id = columnText(info.get(), 0); const auto target_id = columnText(info.get(), 1);
         const auto source_previous = sqlite3_column_int(info.get(), 2); const auto target_previous = sqlite3_column_int(info.get(), 3);
@@ -1981,7 +2392,7 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
         Statement rewrites(database_, "SELECT evidence_id,from_entity_id,to_entity_id FROM evidence_entity_rewrite WHERE merge_id=?");
         bindText(rewrites.get(), 1, merge_id);
         std::vector<std::tuple<std::string,std::string,std::string>> mappings;
-        while (sqlite3_step(rewrites.get()) == SQLITE_ROW)
+        while (stepRow(rewrites.get()))
             mappings.emplace_back(columnText(rewrites.get(), 0), columnText(rewrites.get(), 1), columnText(rewrites.get(), 2));
         for (const auto& [evidence_id, from_id, to_id] : mappings) {
             Statement update(database_, "UPDATE evidence_reference SET entity_id=? WHERE id=? AND entity_id=?");
@@ -2003,8 +2414,10 @@ Result<xuyan::domain::EntityMergeResult> WorkspaceRepository::splitEntityMerge(
 }
 
 Result<WorldTemplate> WorkspaceRepository::createWorldTemplate(const std::string& id, const std::string& name) {
-    if (id.empty() || name.empty() || name.size() > 120) return Result<WorldTemplate>::failure(
-        {ErrorCode::validation_failed, "世界名称或 ID 无效", false, "填写 1-120 字符的名称"});
+    // 界面承诺的是字符数量，不能用UTF-8字节长度把合法中文名称提前截断。
+    const auto name_codepoints = xuyan::domain::utf8CodepointCount(name);
+    if (id.empty() || name_codepoints == 0 || name_codepoints > 120) return Result<WorldTemplate>::failure(
+        {ErrorCode::validation_failed, "世界名称或稳定标识无效", false, "填写1—120个字符的有效名称"});
     try {
         Transaction transaction(database_);
         Statement insert(database_, "INSERT INTO world_template(id,name,created_at) VALUES(?,?,?)");
@@ -2019,7 +2432,7 @@ Result<std::vector<WorldTemplate>> WorkspaceRepository::listWorldTemplates() {
     try {
         Statement query(database_, "SELECT id,name,source_id FROM world_template ORDER BY created_at,id");
         std::vector<WorldTemplate> worlds;
-        while (sqlite3_step(query.get()) == SQLITE_ROW)
+        while (stepRow(query.get()))
             worlds.push_back({columnText(query.get(), 0), columnText(query.get(), 1), columnText(query.get(), 2)});
         return Result<std::vector<WorldTemplate>>::success(std::move(worlds));
     } catch (const std::exception& exception) { return Result<std::vector<WorldTemplate>>::failure(storageError(exception)); }
@@ -2031,7 +2444,7 @@ Result<WorldTemplate> WorkspaceRepository::attachWorldSource(const std::string& 
         Transaction transaction(database_);
         Statement source(database_, "SELECT 1 FROM source_document WHERE id=? AND world_id=?");
         bindText(source.get(), 1, source_id); bindText(source.get(), 2, world_id);
-        if (sqlite3_step(source.get()) != SQLITE_ROW) return Result<WorldTemplate>::failure(
+        if (!stepRow(source.get())) return Result<WorldTemplate>::failure(
             {ErrorCode::validation_failed, "来源不属于该世界", false, "重新选择导入来源"});
         Statement update(database_, "UPDATE world_template SET source_id=? WHERE id=?");
         bindText(update.get(), 1, source_id); bindText(update.get(), 2, world_id);
@@ -2039,7 +2452,7 @@ Result<WorldTemplate> WorkspaceRepository::attachWorldSource(const std::string& 
             throw std::runtime_error("找不到目标世界模板");
         Statement query(database_, "SELECT name FROM world_template WHERE id=?");
         bindText(query.get(), 1, world_id);
-        if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到目标世界模板");
+        if (!stepRow(query.get())) throw std::runtime_error("找不到目标世界模板");
         auto result = WorldTemplate{world_id, columnText(query.get(), 0), source_id};
         transaction.commit();
         return Result<WorldTemplate>::success(std::move(result));
@@ -2054,7 +2467,7 @@ Result<SourceDocument> WorkspaceRepository::saveSource(const std::string& comman
         {
             Statement replay(database_, "SELECT payload_hash,source_id FROM source_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) {
                     return Result<SourceDocument>::failure(
                         Error{ErrorCode::command_conflict, "相同 command_id 携带了不同来源文件", false, "生成新的命令ID"});
@@ -2067,7 +2480,7 @@ Result<SourceDocument> WorkspaceRepository::saveSource(const std::string& comman
         {
             Statement existing(database_, "SELECT id FROM source_document WHERE id=?");
             bindText(existing.get(), 1, document.id);
-            if (sqlite3_step(existing.get()) == SQLITE_ROW) {
+            if (stepRow(existing.get())) {
                 Statement record(database_,
                     "INSERT INTO source_command_log(command_id,payload_hash,source_id,created_at) VALUES(?,?,?,?)");
                 bindText(record.get(), 1, command_id);
@@ -2134,7 +2547,7 @@ Result<std::vector<SourceDocument>> WorkspaceRepository::listSources() {
     try {
         Statement query(database_, "SELECT id FROM source_document ORDER BY created_at,id");
         std::vector<SourceDocument> documents;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) {
+        while (stepRow(query.get())) {
             documents.push_back(readSource(database_, columnText(query.get(), 0)));
         }
         return Result<std::vector<SourceDocument>>::success(std::move(documents));
@@ -2150,7 +2563,7 @@ Result<std::vector<SourceDocument>> WorkspaceRepository::listSourcesForWorld(con
         Statement query(database_, "SELECT id FROM source_document WHERE world_id=? ORDER BY created_at,id");
         bindText(query.get(), 1, world_id);
         std::vector<SourceDocument> documents;
-        while (sqlite3_step(query.get()) == SQLITE_ROW)
+        while (stepRow(query.get()))
             documents.push_back(readSource(database_, columnText(query.get(), 0)));
         return Result<std::vector<SourceDocument>>::success(std::move(documents));
     } catch (const std::exception& exception) {
@@ -2180,7 +2593,7 @@ Result<SourceDocument> WorkspaceRepository::replaceSourceChapters(
         {
             Statement replay(database_, "SELECT payload_hash,source_id FROM source_chapter_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<SourceDocument>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他章节布局", false, "生成新的命令标识"});
                 auto result = readSource(database_, columnText(replay.get(), 1)); transaction.commit();
@@ -2189,7 +2602,7 @@ Result<SourceDocument> WorkspaceRepository::replaceSourceChapters(
         }
         Statement head(database_, "SELECT revision FROM source_chapter_head WHERE source_id=?");
         bindText(head.get(), 1, source_id);
-        if (sqlite3_step(head.get()) != SQLITE_ROW) return Result<SourceDocument>::failure(
+        if (!stepRow(head.get())) return Result<SourceDocument>::failure(
             {ErrorCode::missing_context, "找不到来源章节修订", false, "刷新来源列表"});
         if (sqlite3_column_int(head.get(), 0) != expected_revision) return Result<SourceDocument>::failure(
             {ErrorCode::revision_conflict, "章节布局已被其他编辑修改", false, "刷新章节后重试"});
@@ -2231,7 +2644,7 @@ Result<CharacterBlueprint> WorkspaceRepository::createBlueprint(const std::strin
             Statement replay(database_,
                 "SELECT payload_hash,blueprint_id,version FROM blueprint_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) {
                     return Result<CharacterBlueprint>::failure(
                         Error{ErrorCode::command_conflict, "相同 command_id 携带了不同人物卡", false, "生成新的命令ID"});
@@ -2278,7 +2691,7 @@ Result<CharacterBlueprint> WorkspaceRepository::saveBlueprint(const std::string&
             Statement replay(database_,
                 "SELECT payload_hash,blueprint_id,version FROM blueprint_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) {
                     return Result<CharacterBlueprint>::failure(
                         Error{ErrorCode::command_conflict, "相同 command_id 携带了不同人物卡修订", false, "生成新的命令ID"});
@@ -2290,7 +2703,7 @@ Result<CharacterBlueprint> WorkspaceRepository::saveBlueprint(const std::string&
         }
         Statement head(database_, "SELECT head_version FROM character_blueprint WHERE id=?");
         bindText(head.get(), 1, blueprint.id);
-        if (sqlite3_step(head.get()) != SQLITE_ROW) {
+        if (!stepRow(head.get())) {
             return Result<CharacterBlueprint>::failure(
                 Error{ErrorCode::missing_context, "人物卡不存在", false, "刷新人物卡列表"});
         }
@@ -2339,7 +2752,7 @@ Result<std::vector<CharacterBlueprint>> WorkspaceRepository::listBlueprints() {
     try {
         Statement query(database_, "SELECT id FROM character_blueprint WHERE deleted=0 ORDER BY created_at,id");
         std::vector<CharacterBlueprint> result;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) result.push_back(readBlueprint(database_, columnText(query.get(), 0)));
+        while (stepRow(query.get())) result.push_back(readBlueprint(database_, columnText(query.get(), 0)));
         return Result<std::vector<CharacterBlueprint>>::success(std::move(result));
     } catch (const std::exception& exception) {
         return Result<std::vector<CharacterBlueprint>>::failure(storageError(exception));
@@ -2363,7 +2776,7 @@ Result<int> WorkspaceRepository::importEntities(const std::string& command_id, c
         {
             Statement replay(database_, "SELECT package_hash,imported_count FROM package_import_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != package_hash) {
                     return Result<int>::failure(
                         Error{ErrorCode::command_conflict, "相同 command_id 指向不同导入包", false, "生成新的命令ID"});
@@ -2376,7 +2789,7 @@ Result<int> WorkspaceRepository::importEntities(const std::string& command_id, c
         for (const auto& entity : entities) {
             Statement exists(database_, "SELECT 1 FROM world_entity WHERE id=?");
             bindText(exists.get(), 1, entity.id);
-            if (sqlite3_step(exists.get()) == SQLITE_ROW) {
+            if (stepRow(exists.get())) {
                 return Result<int>::failure(
                     Error{ErrorCode::revision_conflict, "目标工作区已存在实体：" + entity.id, false,
                           "导入到空工作区或先解决 ID 冲突"});
@@ -2430,7 +2843,7 @@ Result<int> WorkspaceRepository::importBlueprintVersions(const std::string& comm
         {
             Statement replay(database_, "SELECT package_hash,imported_count FROM package_import_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != package_hash) return Result<int>::failure(
                     Error{ErrorCode::command_conflict, "相同 command_id 指向不同人物包", false, "生成新的命令ID"});
                 const auto count = sqlite3_column_int(replay.get(), 1);
@@ -2440,7 +2853,7 @@ Result<int> WorkspaceRepository::importBlueprintVersions(const std::string& comm
         }
         Statement exists(database_, "SELECT 1 FROM character_blueprint WHERE id=?");
         bindText(exists.get(), 1, blueprint_id);
-        if (sqlite3_step(exists.get()) == SQLITE_ROW) return Result<int>::failure(
+        if (stepRow(exists.get())) return Result<int>::failure(
             Error{ErrorCode::revision_conflict, "目标工作区已存在人物卡：" + blueprint_id, false,
                   "导入到空工作区或先解决人物卡冲突"});
         const auto& head = versions.back();
@@ -2474,7 +2887,7 @@ Result<ProviderConnection> WorkspaceRepository::saveProviderConnection(
         {
             Statement replay(database_, "SELECT payload_hash,connection_id FROM provider_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<ProviderConnection>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于不同的连接内容", false, "生成新的命令标识后重试"});
                 auto result = readProvider(database_, columnText(replay.get(), 1)); transaction.commit();
@@ -2484,7 +2897,7 @@ Result<ProviderConnection> WorkspaceRepository::saveProviderConnection(
         if (expected_revision == 0) {
             Statement existing(database_, "SELECT revision FROM provider_connection WHERE id=?");
             bindText(existing.get(), 1, connection.id);
-            if (sqlite3_step(existing.get()) == SQLITE_ROW) return Result<ProviderConnection>::failure(
+            if (stepRow(existing.get())) return Result<ProviderConnection>::failure(
                 {ErrorCode::revision_conflict, "模型连接已存在", false, "刷新连接列表后重试"});
             connection.revision = 1;
             Statement insert(database_, "INSERT INTO provider_connection(id,name,kind,endpoint,default_model,credential_ref,data_policy,enabled,deleted,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)");
@@ -2528,7 +2941,7 @@ Result<std::vector<ProviderConnection>> WorkspaceRepository::listProviderConnect
     try {
         Statement query(database_, "SELECT id FROM provider_connection WHERE deleted=0 ORDER BY name COLLATE NOCASE,id");
         std::vector<ProviderConnection> result;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) result.push_back(readProvider(database_, columnText(query.get(), 0)));
+        while (stepRow(query.get())) result.push_back(readProvider(database_, columnText(query.get(), 0)));
         return Result<std::vector<ProviderConnection>>::success(std::move(result));
     } catch (const std::exception& exception) { return Result<std::vector<ProviderConnection>>::failure(storageError(exception)); }
 }
@@ -2556,12 +2969,12 @@ Result<EvidenceReference> WorkspaceRepository::createEvidence(
         {
             Statement replay(database_, "SELECT payload_hash,evidence_id FROM evidence_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<EvidenceReference>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于不同证据", false, "生成新的命令标识"});
                 Statement query(database_, "SELECT id,entity_id,field_path,source_id,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,revision FROM evidence_reference WHERE id=?");
                 bindText(query.get(), 1, columnText(replay.get(), 1));
-                if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("证据命令结果缺失");
+                if (!stepRow(query.get())) throw std::runtime_error("证据命令结果缺失");
                 auto result = readEvidence(query.get()); transaction.commit();
                 return Result<EvidenceReference>::success(std::move(result));
             }
@@ -2590,7 +3003,7 @@ Result<std::vector<EvidenceReference>> WorkspaceRepository::listEvidenceForSourc
         Statement query(database_, "SELECT id,entity_id,field_path,source_id,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,revision FROM evidence_reference WHERE source_id=? ORDER BY start_codepoint,id");
         bindText(query.get(), 1, source_id);
         std::vector<EvidenceReference> result;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) result.push_back(readEvidence(query.get()));
+        while (stepRow(query.get())) result.push_back(readEvidence(query.get()));
         return Result<std::vector<EvidenceReference>>::success(std::move(result));
     } catch (const std::exception& exception) { return Result<std::vector<EvidenceReference>>::failure(storageError(exception)); }
 }
@@ -2616,7 +3029,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
         {
             Statement replay(database_, "SELECT payload_hash,job_id FROM extraction_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionJob>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他提取任务", false, "生成新的命令标识"});
                 auto result = readExtractionJob(database_, columnText(replay.get(), 1)); transaction.commit();
@@ -2636,7 +3049,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
         std::ostringstream entity_index_builder;
         {
             Statement entities(database_, "SELECT id,head_revision,deleted FROM world_entity ORDER BY id");
-            while (sqlite3_step(entities.get()) == SQLITE_ROW)
+            while (stepRow(entities.get()))
                 entity_index_builder << columnText(entities.get(), 0) << ':' << sqlite3_column_int(entities.get(), 1)
                                      << ':' << sqlite3_column_int(entities.get(), 2) << '|';
         }
@@ -2706,7 +3119,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
                 bindText(cached.get(), 1, step.chunk_hash); bindText(cached.get(), 2, job.schema_version);
                 bindText(cached.get(), 3, job.prompt_version); bindText(cached.get(), 4, entity_index_hash);
                 bindText(cached.get(), 5, generation_parameters_hash);
-                if (sqlite3_step(cached.get()) == SQLITE_ROW) {
+                if (stepRow(cached.get())) {
                     cached_job_id = columnText(cached.get(), 0); cached_ordinal = sqlite3_column_int(cached.get(), 1);
                     cached_start = static_cast<std::size_t>(sqlite3_column_int64(cached.get(), 2));
                     cached_end = static_cast<std::size_t>(sqlite3_column_int64(cached.get(), 3));
@@ -2715,7 +3128,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::createExtractionJob(
             if (!cached_job_id.empty()) {
                 Statement candidates(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE job_id=? AND step_ordinal=? ORDER BY id");
                 bindText(candidates.get(), 1, cached_job_id); sqlite3_bind_int(candidates.get(), 2, cached_ordinal);
-                while (sqlite3_step(candidates.get()) == SQLITE_ROW) cached_candidates.push_back(readCandidate(candidates.get()));
+                while (stepRow(candidates.get())) cached_candidates.push_back(readCandidate(candidates.get()));
             }
             step.status = cached_job_id.empty() ? "ready" : "completed"; step.attempt = 0;
             Statement add(database_, "INSERT INTO extraction_step(id,job_id,ordinal,start_codepoint,end_codepoint,chunk_hash,status,attempt,output_json,error_message,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
@@ -2819,7 +3232,7 @@ Result<std::vector<xuyan::domain::ExtractionJob>> WorkspaceRepository::listExtra
     try {
         Statement query(database_, "SELECT id FROM extraction_job ORDER BY updated_at DESC,id");
         std::vector<std::string> ids;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0));
+        while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0));
         std::vector<xuyan::domain::ExtractionJob> jobs;
         for (const auto& id : ids) jobs.push_back(readExtractionJob(database_, id));
         return Result<std::vector<xuyan::domain::ExtractionJob>>::success(std::move(jobs));
@@ -2835,7 +3248,7 @@ Result<std::vector<xuyan::domain::ExtractionJob>> WorkspaceRepository::listExtra
             "JOIN source_document s ON s.id=j.source_id WHERE s.world_id=? ORDER BY j.updated_at DESC,j.id");
         bindText(query.get(), 1, world_id);
         std::vector<std::string> ids;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0));
+        while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0));
         std::vector<xuyan::domain::ExtractionJob> jobs;
         jobs.reserve(ids.size());
         for (const auto& id : ids) jobs.push_back(readExtractionJob(database_, id));
@@ -2853,7 +3266,7 @@ Result<xuyan::domain::ExtractionStep> WorkspaceRepository::claimExtractionStep(
         {
             Statement replay(database_, "SELECT payload_hash,step_ordinal FROM extraction_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionStep>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他步骤领取", false, "生成新的命令标识"});
                 const auto ordinal = sqlite3_column_int(replay.get(), 1);
@@ -2900,7 +3313,7 @@ Result<xuyan::domain::ExtractionJobState> WorkspaceRepository::finishExtractionS
     return finishExtractionStepImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, ordinal, expected_attempt, terminal_status, output_json, error_message);
 }
 
-/** @brief 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
+/* 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
 template<class JobResult>
 Result<JobResult> WorkspaceRepository::finishExtractionStepImpl(
     const std::string& command_id, const std::string& job_id, int ordinal, int expected_attempt,
@@ -2915,7 +3328,7 @@ Result<JobResult> WorkspaceRepository::finishExtractionStepImpl(
         {
             Statement replay(database_, "SELECT payload_hash FROM extraction_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<JobResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他步骤结果", false, "生成新的命令标识"});
                 auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit();
@@ -2930,7 +3343,7 @@ Result<JobResult> WorkspaceRepository::finishExtractionStepImpl(
             {ErrorCode::revision_conflict, "步骤不再处于对应运行尝试", false, "刷新任务后重试"});
         Statement counts(database_, "SELECT COUNT(*),SUM(status='completed'),SUM(status='failed'),SUM(status='unknown'),SUM(status='running') FROM extraction_step WHERE job_id=?");
         bindText(counts.get(), 1, job_id);
-        if (sqlite3_step(counts.get()) != SQLITE_ROW) throw std::runtime_error("无法汇总任务步骤");
+        if (!stepRow(counts.get())) throw std::runtime_error("无法汇总任务步骤");
         const auto total = sqlite3_column_int(counts.get(), 0); const auto completed = sqlite3_column_int(counts.get(), 1);
         const auto failed = sqlite3_column_int(counts.get(), 2); const auto unknown = sqlite3_column_int(counts.get(), 3);
         const auto running = sqlite3_column_int(counts.get(), 4);
@@ -2959,7 +3372,7 @@ Result<xuyan::domain::ExtractionJobState> WorkspaceRepository::cancelExtractionJ
     return cancelExtractionJobImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, expected_revision);
 }
 
-/** @brief 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
+/* 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
 template<class JobResult>
 Result<JobResult> WorkspaceRepository::cancelExtractionJobImpl(
     const std::string& command_id, const std::string& job_id, int expected_revision) {
@@ -2968,7 +3381,7 @@ Result<JobResult> WorkspaceRepository::cancelExtractionJobImpl(
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash FROM extraction_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload) return Result<JobResult>::failure(
                 {ErrorCode::command_conflict, "命令标识已用于其他取消", false, "生成新的命令标识"});
             auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit(); return Result<JobResult>::success(std::move(result));
@@ -2999,7 +3412,7 @@ Result<xuyan::domain::ExtractionJob> WorkspaceRepository::retryExtractionStep(
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash FROM extraction_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::ExtractionJob>::failure(
                 {ErrorCode::command_conflict, "命令标识已用于其他重试", false, "生成新的命令标识"});
             auto result = readExtractionJob(database_, job_id); transaction.commit(); return Result<xuyan::domain::ExtractionJob>::success(std::move(result));
@@ -3024,7 +3437,7 @@ Result<int> WorkspaceRepository::recoverInterruptedExtractionSteps() {
         Transaction transaction(database_);
         Statement jobs_query(database_, "SELECT DISTINCT job_id FROM extraction_step WHERE status='running'");
         std::vector<std::string> jobs;
-        while (sqlite3_step(jobs_query.get()) == SQLITE_ROW) jobs.push_back(columnText(jobs_query.get(), 0));
+        while (stepRow(jobs_query.get())) jobs.push_back(columnText(jobs_query.get(), 0));
         Statement steps(database_, "UPDATE extraction_step SET status='unknown',error_message='进程中断，请确认外部请求是否已计费后再重试',updated_at=? WHERE status='running'");
         bindText(steps.get(), 1, utcNow());
         if (sqlite3_step(steps.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
@@ -3050,7 +3463,7 @@ Result<xuyan::domain::ExtractionJobState> WorkspaceRepository::commitExtractionC
     return commitExtractionCandidatesImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, step_ordinal, expected_attempt, output_json, std::move(candidates));
 }
 
-/** @brief 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
+/* 共用原子写入及命令重放事务，按显式结果类型选择返回完整任务或检查点。 */
 template<class JobResult>
 Result<JobResult> WorkspaceRepository::commitExtractionCandidatesImpl(
     const std::string& command_id, const std::string& job_id, int step_ordinal, int expected_attempt,
@@ -3070,7 +3483,7 @@ Result<JobResult> WorkspaceRepository::commitExtractionCandidatesImpl(
         {
             Statement replay(database_, "SELECT payload_hash FROM extraction_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<JobResult>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他候选提交", false, "生成新的命令标识"});
                 auto result = readExtractionResult<JobResult>(database_, job_id); transaction.commit();
@@ -3079,7 +3492,7 @@ Result<JobResult> WorkspaceRepository::commitExtractionCandidatesImpl(
         }
         Statement state(database_, "SELECT j.source_id,s.status,s.attempt,j.cancel_requested FROM extraction_step s JOIN extraction_job j ON j.id=s.job_id WHERE s.job_id=? AND s.ordinal=?");
         bindText(state.get(), 1, job_id); sqlite3_bind_int(state.get(), 2, step_ordinal);
-        if (sqlite3_step(state.get()) != SQLITE_ROW || columnText(state.get(), 1) != "running"
+        if (!stepRow(state.get()) || columnText(state.get(), 1) != "running"
             || sqlite3_column_int(state.get(), 2) != expected_attempt) return Result<JobResult>::failure(
                 {ErrorCode::revision_conflict, "候选步骤尝试已变化", false, "刷新任务后重试"});
         const auto source_id = columnText(state.get(), 0);
@@ -3114,7 +3527,7 @@ Result<JobResult> WorkspaceRepository::commitExtractionCandidatesImpl(
         // 有效的在途回报仍保存；任务状态与取消/失败检查点在同一事务中结算。
         Statement counts(database_, "SELECT COUNT(*),SUM(status='completed'),SUM(status='failed'),SUM(status='unknown'),SUM(status='running') FROM extraction_step WHERE job_id=?");
         bindText(counts.get(), 1, job_id);
-        if (sqlite3_step(counts.get()) != SQLITE_ROW) throw std::runtime_error("无法汇总候选任务进度");
+        if (!stepRow(counts.get())) throw std::runtime_error("无法汇总候选任务进度");
         const auto total = sqlite3_column_int(counts.get(), 0); const auto completed = sqlite3_column_int(counts.get(), 1);
         const auto failed = sqlite3_column_int(counts.get(), 2);
         const auto unknown = sqlite3_column_int(counts.get(), 3);
@@ -3143,7 +3556,7 @@ Result<std::vector<xuyan::domain::ExtractionCandidate>> WorkspaceRepository::lis
         Statement query(database_, sql);
         if (!review_status.empty()) bindText(query.get(), 1, review_status);
         std::vector<xuyan::domain::ExtractionCandidate> result;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) result.push_back(readCandidate(query.get()));
+        while (stepRow(query.get())) result.push_back(readCandidate(query.get()));
         return Result<std::vector<xuyan::domain::ExtractionCandidate>>::success(std::move(result));
     } catch (const std::exception& exception) { return Result<std::vector<xuyan::domain::ExtractionCandidate>>::failure(storageError(exception)); }
 }
@@ -3165,6 +3578,12 @@ Result<xuyan::domain::ExtractionCandidatePage> WorkspaceRepository::listExtracti
                             " WHERE s.world_id=?";
         if (!source_id.empty()) scope += " AND c.source_id=?";
         if (!review_status.empty()) scope += " AND c.review_status=?";
+        /* 功能：向总数或页面语句绑定完全相同的世界、来源及审核筛选。
+         * 参数：statement为借用的预编译语句，筛选占位符须按scope顺序从1开始。
+         * 返回：下一可用绑定下标，供分页上限/偏移继续绑定。
+         * 失败：文本绑定失败抛异常，由当前仓储入口转换并回滚读快照。
+         * 副作用：只改变本语句绑定；捕获引用不逃出函数，同线程执行。
+         */
         const auto bind_scope = [&](sqlite3_stmt* statement) {
             int index = 1;
             bindText(statement, index++, world_id);
@@ -3177,7 +3596,7 @@ Result<xuyan::domain::ExtractionCandidatePage> WorkspaceRepository::listExtracti
         {
             Statement count(database_, count_sql.c_str());
             bind_scope(count.get());
-            if (sqlite3_step(count.get()) != SQLITE_ROW)
+            if (!stepRow(count.get()))
                 throw std::runtime_error(sqlite3_errmsg(database_));
             page.total = static_cast<std::uint64_t>(sqlite3_column_int64(count.get(), 0));
         }
@@ -3208,18 +3627,12 @@ Result<xuyan::domain::ExtractionCandidatePage> WorkspaceRepository::listExtracti
     }
 }
 
-/** @brief 精确匹配当前世界已确认的名称或完整别名，同一读快照返回总数和有界轻量结果。 */
+/* 精确匹配当前世界已确认的名称或完整别名，同一读快照返回总数和有界轻量结果。 */
 Result<xuyan::domain::RelationEndpointMatchPage> WorkspaceRepository::matchRelationEndpoints(
     const std::string& world_id, const std::string& mention, int limit, std::int64_t offset) {
     using Page = xuyan::domain::RelationEndpointMatchPage;
     // 别名采用单元分隔符存储，必须拒绝控制字符，不能让查询拆出另一条标识。
-    /** @brief 检查匹配输入的大小及控制字符，防止别名分隔符被解释为数据。 */
-    const auto invalid_text = [](const std::string& text) {
-        return text.empty() || text.size() > 512 || std::any_of(text.begin(), text.end(), [](unsigned char value) {
-            return value < 0x20 || value == 0x7f;
-        });
-    };
-    if (invalid_text(world_id) || invalid_text(mention) || limit < 1 || limit > 50 || offset < 0
+    if (invalidIdentityText(world_id) || invalidIdentityText(mention) || limit < 1 || limit > 50 || offset < 0
         || std::all_of(mention.begin(), mention.end(), [](unsigned char value) { return value == ' '; }))
         return Result<Page>::failure({ErrorCode::validation_failed,
             "端点匹配的世界、标识或分页参数无效", false, "选择世界及完整标识，每页限制为1—50项"});
@@ -3240,7 +3653,11 @@ Result<xuyan::domain::RelationEndpointMatchPage> WorkspaceRepository::matchRelat
             " WHERE a.entity_id=e.id AND (c.candidate_type<>'entity' OR c.review_status<>'accepted'"
             " OR c.provenance_type NOT IN('original_fact','author_setting')))"
             " AND (r.name=? OR instr(char(31)||r.aliases||char(31),char(31)||?||char(31))>0)";
-        /** @brief 为总数和分页查询绑定同一世界及逐字标识，不拼接用户输入到SQL。 */
+        /* 功能：为端点总数与分页绑定同一世界和两处逐字身份条件。
+         * 参数：statement为本快照内借用语句，前三个占位符依次为世界/名称/别名。
+         * 返回：无。失败：绑定错误抛异常，由入口转换为存储错误。
+         * 副作用：只改变语句参数，调用期间借用world_id和mention，不拼接用户SQL。
+         */
         const auto bind_scope = [&](sqlite3_stmt* statement) {
             bindText(statement, 1, world_id); bindText(statement, 2, mention); bindText(statement, 3, mention);
         };
@@ -3249,7 +3666,7 @@ Result<xuyan::domain::RelationEndpointMatchPage> WorkspaceRepository::matchRelat
         {
             const auto sql = "SELECT COUNT(*)" + scope;
             Statement count(database_, sql.c_str()); bind_scope(count.get());
-            if (sqlite3_step(count.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+            if (!stepRow(count.get())) throw std::runtime_error(sqlite3_errmsg(database_));
             page.total = static_cast<std::uint64_t>(sqlite3_column_int64(count.get(), 0));
         }
         {
@@ -3273,17 +3690,11 @@ Result<xuyan::domain::RelationEndpointMatchPage> WorkspaceRepository::matchRelat
     } catch (const std::exception& exception) { return Result<Page>::failure(storageError(exception)); }
 }
 
-/** @brief 按待审实体候选的名称和逐字别名匹配同世界同类型已确认条目，同名结果全部保留。 */
+/* 按待审实体候选的名称和逐字别名匹配同世界同类型已确认条目，同名结果全部保留。 */
 Result<xuyan::domain::CandidateEntityMatchPage> WorkspaceRepository::matchCandidateEntities(
     const std::string& candidate_id, int expected_candidate_revision, int limit, std::int64_t offset) {
     using Page = xuyan::domain::CandidateEntityMatchPage;
-    /** @brief 拒绝空标识、控制字符和过长标识，保持数据库边界与候选契约一致。 */
-    const auto invalid_id = [](const std::string& text) {
-        return text.empty() || text.size() > 512 || std::any_of(text.begin(), text.end(), [](unsigned char value) {
-            return value < 0x20 || value == 0x7f;
-        });
-    };
-    if (invalid_id(candidate_id) || expected_candidate_revision < 1
+    if (invalidIdentityText(candidate_id) || expected_candidate_revision < 1
         || expected_candidate_revision >= std::numeric_limits<int>::max()
         || limit < 1 || limit > 50 || offset < 0)
         return Result<Page>::failure({ErrorCode::validation_failed,
@@ -3351,7 +3762,12 @@ Result<xuyan::domain::CandidateEntityMatchPage> WorkspaceRepository::matchCandid
             " WHERE c.candidate_type<>'entity' OR c.review_status<>'accepted' OR c.provenance_type NOT IN('original_fact','author_setting'))"
             " AND EXISTS(SELECT 1 FROM candidate_mention m WHERE r.name=m.value"
             " OR instr(char(31)||r.aliases||char(31),char(31)||m.value||char(31))>0)";
-        /** @brief 为总数与页面查询绑定相同的候选标识集合、世界和分类。 */
+        /* 功能：为候选身份建议的总数和页面绑定相同的CTE标识集合及世界/类别。
+         * 参数：statement为借用的预编译语句，占位符与mentions数量及scope一致。
+         * 返回：下一可用下标，继续绑定页大小及偏移。
+         * 失败：任意文本绑定失败抛异常，入口将其转换为存储错误。
+         * 副作用：只更新当前语句，借用集合及已解析kind仅在此函数内有效。
+         */
         const auto bind_scope = [&](sqlite3_stmt* statement) {
             int next = 1;
             for (const auto& mention : mentions) bindText(statement, next++, mention);
@@ -3366,7 +3782,7 @@ Result<xuyan::domain::CandidateEntityMatchPage> WorkspaceRepository::matchCandid
             const auto sql = cte + " SELECT COUNT(*)" + scope;
             Statement count(database_, sql.c_str());
             bind_scope(count.get());
-            if (sqlite3_step(count.get()) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_));
+            if (!stepRow(count.get())) throw std::runtime_error(sqlite3_errmsg(database_));
             page.total = static_cast<std::uint64_t>(sqlite3_column_int64(count.get(), 0));
         }
         {
@@ -3405,7 +3821,7 @@ Result<std::vector<xuyan::domain::ExtractionCandidate>> WorkspaceRepository::lis
         Statement query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE job_id=? ORDER BY step_ordinal,id LIMIT ?");
         bindText(query.get(), 1, job_id); sqlite3_bind_int(query.get(), 2, limit);
         std::vector<xuyan::domain::ExtractionCandidate> result;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) result.push_back(readCandidate(query.get()));
+        while (stepRow(query.get())) result.push_back(readCandidate(query.get()));
         return Result<std::vector<xuyan::domain::ExtractionCandidate>>::success(std::move(result));
     } catch (const std::exception& exception) { return Result<std::vector<xuyan::domain::ExtractionCandidate>>::failure(storageError(exception)); }
 }
@@ -3414,19 +3830,23 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::loadExtractionCa
     try {
         Statement query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE id=?");
         bindText(query.get(), 1, candidate_id);
-        if (sqlite3_step(query.get()) != SQLITE_ROW) return Result<xuyan::domain::ExtractionCandidate>::failure(
+        if (!stepRow(query.get())) return Result<xuyan::domain::ExtractionCandidate>::failure(
             {ErrorCode::missing_context, "找不到提取候选", false, "刷新校对列表"});
         return Result<xuyan::domain::ExtractionCandidate>::success(readCandidate(query.get()));
     } catch (const std::exception& exception) { return Result<xuyan::domain::ExtractionCandidate>::failure(storageError(exception)); }
 }
 
-/** @brief 将实体候选明确关联已有条目，避免跨章重复建档；所有相关写入共用一个事务。 */
+/* 将实体候选明确关联已有条目，避免跨章重复建档；所有相关写入共用一个事务。 */
 Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::acceptCandidateIntoEntity(
     const std::string& command_id, const std::string& candidate_id, int expected_candidate_revision,
     const xuyan::domain::CandidateEntitySelection& selection, const std::string& provenance_type) {
     using CandidateResult = Result<xuyan::domain::ExtractionCandidate>;
     using xuyan::package::JsonValue;
-    /** @brief 返回关联前的边界或规则错误，不包含原文、字段正文或凭据。 */
+    /* 功能：创建明确关联失败的统一结果，保留错误分类但不自动执行消歧。
+     * 参数：code为失败分类；message为借用的中文原因，不包含原文或凭据。
+     * 返回：无成功值的候选Result。失败：错误文本分配可抛异常。
+     * 副作用：只组装内存值，不推进审核修订、不执行写入。
+     */
     const auto reject = [](ErrorCode code, const std::string& message) {
         return CandidateResult::failure({code, message, false, "刷新候选并明确选择同世界同类型的已确认条目"});
     };
@@ -3488,7 +3908,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::acceptCandidateI
             return reject(ErrorCode::revision_conflict, "候选修订已变化或审核已终结，不能重新关联");
         Statement source(database_, "SELECT world_id FROM source_document WHERE id=?");
         bindText(source.get(), 1, candidate.source_id);
-        if (sqlite3_step(source.get()) != SQLITE_ROW)
+        if (!stepRow(source.get()))
             return reject(ErrorCode::missing_context, "关联候选的来源世界不存在");
         auto selected = validateChosenEndpoint(database_, columnText(source.get(), 0), candidate.name,
                                               selection.entity_id, selection.expected_revision);
@@ -3545,7 +3965,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::acceptCandidateI
     }
 }
 
-/** @brief 在单一审核事务中提交带原文证据的条目及类型投影，明确端点须在写入前再次消歧。 */
+/* 在单一审核事务中提交带原文证据的条目及类型投影，明确端点须在写入前再次消歧。 */
 Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtractionCandidate(
     const std::string& command_id, xuyan::domain::ExtractionCandidate candidate, int expected_revision,
     std::optional<WorldEntity> accepted_entity, std::optional<xuyan::domain::TimelineEvent> accepted_timeline,
@@ -3740,7 +4160,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
         Transaction transaction(database_);
         Statement current_query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE id=?");
         bindText(current_query.get(), 1, candidate.id);
-        if (sqlite3_step(current_query.get()) != SQLITE_ROW) return Result<xuyan::domain::ExtractionCandidate>::failure(
+        if (!stepRow(current_query.get())) return Result<xuyan::domain::ExtractionCandidate>::failure(
             {ErrorCode::missing_context, "找不到提取候选", false, "刷新校对列表"});
         const auto current = readCandidate(current_query.get());
         // 审核只允许改名称、字段和来源性质；证据及冻结任务身份不属于可编辑内容。
@@ -3754,14 +4174,14 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
         if (accepted_entity) {
             Statement source(database_, "SELECT world_id FROM source_document WHERE id=?");
             bindText(source.get(), 1, current.source_id);
-            if (sqlite3_step(source.get()) != SQLITE_ROW || accepted_entity->world_id != columnText(source.get(), 0)
+            if (!stepRow(source.get()) || accepted_entity->world_id != columnText(source.get(), 0)
                 || accepted_entity->id != "entity-from-" + current.id)
                 return Result<xuyan::domain::ExtractionCandidate>::failure(
                     {ErrorCode::validation_failed, "接受条目必须属于候选来源世界并使用稳定标识", false, "重新生成接受条目"});
         }
         Statement replay(database_, "SELECT payload_hash,candidate_id FROM candidate_review_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             const auto stored_payload = columnText(replay.get(), 0);
             // 历史审核只返回已有结果，不借重放补写过去没有的事件记录或实体别名。
             const bool historical_typed_replay = (((requires_timeline || typed_entity_acceptance || requires_relation) && stored_payload == legacy_payload)
@@ -3771,7 +4191,7 @@ Result<xuyan::domain::ExtractionCandidate> WorkspaceRepository::reviewExtraction
                 {ErrorCode::command_conflict, "命令标识已用于其他候选审核", false, "生成新的命令标识"});
             Statement query(database_, "SELECT id,job_id,step_ordinal,source_id,candidate_type,name,fields_json,start_codepoint,end_codepoint,quote,quote_hash,provenance_type,review_status,schema_version,prompt_version,revision FROM extraction_candidate WHERE id=?");
             bindText(query.get(), 1, columnText(replay.get(), 1));
-            if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("候选审核结果缺失");
+            if (!stepRow(query.get())) throw std::runtime_error("候选审核结果缺失");
             auto result = readCandidate(query.get()); transaction.commit();
             return Result<xuyan::domain::ExtractionCandidate>::success(std::move(result));
         }
@@ -3877,23 +4297,28 @@ Result<xuyan::domain::EntityRetrievalScope> WorkspaceRepository::saveEntityRetri
     const auto payload = payload_builder.str();
     try {
         Transaction transaction(database_);
+        /* 功能：在当前事务读取完整的检索范围及明确人物授权，用于命令重放。
+         * 参数：entity_id为调用期间借用的目标稳定标识。返回：独立范围副本。
+         * 失败：记录缺失或SQLite失败抛异常，仓储入口转换并回滚事务。
+         * 副作用：只读同线程database_；捕获this不逃出调用，连接覆盖回调有效期。
+         */
         auto read_scope = [this](const std::string& entity_id) {
             xuyan::domain::EntityRetrievalScope value; value.entity_id = entity_id;
             Statement query(database_, "SELECT has_valid_from,valid_from,has_valid_to,valid_to,visibility,revision FROM entity_retrieval_scope WHERE entity_id=?");
             bindText(query.get(), 1, entity_id);
-            if (sqlite3_step(query.get()) != SQLITE_ROW) throw std::runtime_error("找不到条目检索范围");
+            if (!stepRow(query.get())) throw std::runtime_error("找不到条目检索范围");
             if (sqlite3_column_int(query.get(), 0)) value.valid_from = sqlite3_column_int64(query.get(), 1);
             if (sqlite3_column_int(query.get(), 2)) value.valid_to = sqlite3_column_int64(query.get(), 3);
             value.visibility = columnText(query.get(), 4); value.revision = sqlite3_column_int(query.get(), 5);
             Statement grants(database_, "SELECT actor_id FROM entity_retrieval_grant WHERE entity_id=? ORDER BY actor_id");
             bindText(grants.get(), 1, entity_id);
-            while (sqlite3_step(grants.get()) == SQLITE_ROW) value.actor_grants.push_back(columnText(grants.get(), 0));
+            while (stepRow(grants.get())) value.actor_grants.push_back(columnText(grants.get(), 0));
             return value;
         };
         {
             Statement replay(database_, "SELECT payload_hash,entity_id FROM entity_retrieval_command_log WHERE command_id=?");
             bindText(replay.get(), 1, command_id);
-            if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+            if (stepRow(replay.get())) {
                 if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::EntityRetrievalScope>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他检索范围", false, "生成新的命令标识"});
                 auto result = read_scope(columnText(replay.get(), 1)); transaction.commit();
@@ -3901,12 +4326,12 @@ Result<xuyan::domain::EntityRetrievalScope> WorkspaceRepository::saveEntityRetri
             }
         }
         Statement entity(database_, "SELECT 1 FROM world_entity WHERE id=? AND deleted=0"); bindText(entity.get(), 1, scope.entity_id);
-        if (sqlite3_step(entity.get()) != SQLITE_ROW) return Result<xuyan::domain::EntityRetrievalScope>::failure(
+        if (!stepRow(entity.get())) return Result<xuyan::domain::EntityRetrievalScope>::failure(
             {ErrorCode::missing_context, "检索范围对应的世界条目不存在", false, "刷新世界资料"});
         int current_revision = 0;
         {
             Statement current(database_, "SELECT revision FROM entity_retrieval_scope WHERE entity_id=?"); bindText(current.get(), 1, scope.entity_id);
-            if (sqlite3_step(current.get()) == SQLITE_ROW) current_revision = sqlite3_column_int(current.get(), 0);
+            if (stepRow(current.get())) current_revision = sqlite3_column_int(current.get(), 0);
         }
         if (current_revision != expected_revision) return Result<xuyan::domain::EntityRetrievalScope>::failure(
             {ErrorCode::revision_conflict, "检索范围修订已变化", false, "刷新后重试"});
@@ -3964,7 +4389,11 @@ Result<std::vector<xuyan::domain::RetrievalHit>> WorkspaceRepository::retrieveEn
         sqlite3_bind_int64(query.get(), 5, request.story_time.value_or(0));
         sqlite3_bind_int(query.get(), 6, request.author_view ? 1 : 0); bindText(query.get(), 7, request.actor_id);
         std::vector<std::string> ids;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0));
+        while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0));
+        /* 功能：仅将ASCII大写转换为小写，用于当前词法检索，不改变中文UTF-8字节。
+         * 参数：value按值拥有的待匹配正文。返回：转换后的副本。
+         * 失败：值分配可抛异常。副作用：仅改本地副本，不规范化持久化名称。
+         */
         auto fold = [](std::string value) {
             std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
                 return character >= 'A' && character <= 'Z' ? static_cast<char>(character + ('a' - 'A')) : static_cast<char>(character);
@@ -3978,6 +4407,10 @@ Result<std::vector<xuyan::domain::RetrievalHit>> WorkspaceRepository::retrieveEn
             if (!loaded.ok()) throw std::runtime_error(loaded.error->message);
             const auto& entity_value = *loaded.value;
             int score = needle.empty() ? 1 : 0;
+            /* 功能：判断一个资料字段是否包含当前词法查询，中文逐字、ASCII忽略大小写。
+             * 参数：value为调用期间借用的字段。返回：命中为true，否则false。
+             * 失败：转换副本分配可抛异常。副作用：只读，局部捕获不逃逸检索调用。
+             */
             auto contains = [&](const std::string& value) { return fold(value).find(needle) != std::string::npos; };
             if (!needle.empty()) {
                 if (contains(entity_value.name)) score += 100;
@@ -4006,7 +4439,7 @@ Result<xuyan::domain::WorldVersion> WorkspaceRepository::publishWorldVersion(
         if (!parent_id.empty()) {
             Statement parent(database_, "SELECT 1 FROM world_version WHERE id=? AND world_id=?");
             bindText(parent.get(), 1, parent_id); bindText(parent.get(), 2, world_id);
-            if (sqlite3_step(parent.get()) != SQLITE_ROW) return Result<xuyan::domain::WorldVersion>::failure(
+            if (!stepRow(parent.get())) return Result<xuyan::domain::WorldVersion>::failure(
                 {ErrorCode::missing_context, "父世界版本不存在或属于其他世界", false, "刷新版本列表"});
         }
         xuyan::domain::WorldVersion version;
@@ -4015,7 +4448,7 @@ Result<xuyan::domain::WorldVersion> WorkspaceRepository::publishWorldVersion(
         Statement members(database_, "SELECT e.id,e.head_revision,COALESCE(s.revision,0) FROM world_entity e LEFT JOIN entity_retrieval_scope s ON s.entity_id=e.id WHERE e.world_id=? AND e.deleted=0 ORDER BY e.id");
         bindText(members.get(), 1, world_id);
         std::ostringstream content;
-        while (sqlite3_step(members.get()) == SQLITE_ROW) {
+        while (stepRow(members.get())) {
             xuyan::domain::WorldVersionMember member{columnText(members.get(), 0), sqlite3_column_int(members.get(), 1), sqlite3_column_int(members.get(), 2)};
             version.members.push_back(member); content << member.entity_id << ':' << member.entity_revision << ':' << member.retrieval_scope_revision << '|';
         }
@@ -4026,7 +4459,7 @@ Result<xuyan::domain::WorldVersion> WorkspaceRepository::publishWorldVersion(
         const auto payload = world_id + '|' + parent_id + '|' + version.content_hash;
         Statement replay(database_, "SELECT payload_hash,version_id FROM world_publish_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::WorldVersion>::failure(
                 {ErrorCode::command_conflict, "命令标识已用于其他世界版本", false, "生成新的命令标识"});
             auto result = readWorldVersion(database_, columnText(replay.get(), 1)); transaction.commit();
@@ -4055,7 +4488,7 @@ Result<xuyan::domain::WorldVersion> WorkspaceRepository::publishWorldVersion(
 Result<std::vector<xuyan::domain::WorldVersion>> WorkspaceRepository::listWorldVersions(const std::string& world_id) {
     try {
         Statement query(database_, "SELECT id FROM world_version WHERE world_id=? ORDER BY published_at,id"); bindText(query.get(), 1, world_id);
-        std::vector<std::string> ids; while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0));
+        std::vector<std::string> ids; while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0));
         std::vector<xuyan::domain::WorldVersion> result; result.reserve(ids.size());
         for (const auto& id : ids) result.push_back(readWorldVersion(database_, id));
         return Result<std::vector<xuyan::domain::WorldVersion>>::success(std::move(result));
@@ -4088,7 +4521,7 @@ Result<xuyan::domain::HistoricalSnapshot> WorkspaceRepository::createHistoricalS
             Statement scope(database_, "SELECT has_valid_from,valid_from,has_valid_to,valid_to FROM entity_retrieval_scope_history WHERE entity_id=? AND revision=?");
             bindText(scope.get(), 1, member.entity_id);
             sqlite3_bind_int(scope.get(), 2, member.retrieval_scope_revision);
-            if (sqlite3_step(scope.get()) == SQLITE_ROW) {
+            if (stepRow(scope.get())) {
                 if (sqlite3_column_int(scope.get(), 0) && sqlite3_column_int64(scope.get(), 1) > story_time) active = false;
                 if (sqlite3_column_int(scope.get(), 2) && sqlite3_column_int64(scope.get(), 3) < story_time) active = false;
             }
@@ -4108,12 +4541,12 @@ Result<xuyan::domain::HistoricalSnapshot> WorkspaceRepository::createHistoricalS
         const auto payload = world_version_id + '|' + std::to_string(story_time) + '|' + snapshot.content_hash;
         Statement replay(database_, "SELECT payload_hash,snapshot_id FROM historical_snapshot_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::HistoricalSnapshot>::failure(
                 {ErrorCode::command_conflict, "命令标识已用于其他历史快照", false, "生成新的命令标识"});
             const auto id = columnText(replay.get(), 1);
             Statement existing(database_, "SELECT content_hash FROM historical_snapshot WHERE id=?"); bindText(existing.get(), 1, id);
-            if (sqlite3_step(existing.get()) != SQLITE_ROW) throw std::runtime_error("历史快照重放结果缺失");
+            if (!stepRow(existing.get())) throw std::runtime_error("历史快照重放结果缺失");
             snapshot.id = id; snapshot.content_hash = columnText(existing.get(), 0); transaction.commit();
             return Result<xuyan::domain::HistoricalSnapshot>::success(std::move(snapshot));
         }
@@ -4152,13 +4585,13 @@ Result<xuyan::domain::TimelineEvent> WorkspaceRepository::saveTimelineEvent(
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,record_type,record_id FROM world_graph_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "timeline")
                 return Result<xuyan::domain::TimelineEvent>::failure({ErrorCode::command_conflict, "命令标识已用于其他世界视图记录", false, "生成新的命令标识"});
             auto result = readTimelineEvent(database_, columnText(replay.get(), 2)); transaction.commit();
             return Result<xuyan::domain::TimelineEvent>::success(std::move(result));
         }
-        int revision = 0; { Statement current(database_, "SELECT revision FROM timeline_event WHERE id=?"); bindText(current.get(), 1, event.id); if (sqlite3_step(current.get()) == SQLITE_ROW) revision = sqlite3_column_int(current.get(), 0); }
+        int revision = 0; { Statement current(database_, "SELECT revision FROM timeline_event WHERE id=?"); bindText(current.get(), 1, event.id); if (stepRow(current.get())) revision = sqlite3_column_int(current.get(), 0); }
         if (revision != expected_revision) return Result<xuyan::domain::TimelineEvent>::failure({ErrorCode::revision_conflict, "时间事件修订已变化", false, "刷新后重试"});
         event.revision = expected_revision + 1;
         Statement upsert(database_, "INSERT INTO timeline_event(id,world_id,name,has_story_time,story_time,narrative_order,relative_time,truth_status,revision) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET world_id=excluded.world_id,name=excluded.name,has_story_time=excluded.has_story_time,story_time=excluded.story_time,narrative_order=excluded.narrative_order,relative_time=excluded.relative_time,truth_status=excluded.truth_status,revision=excluded.revision");
@@ -4169,6 +4602,11 @@ Result<xuyan::domain::TimelineEvent> WorkspaceRepository::saveTimelineEvent(
         if (sqlite3_step(upsert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
         Statement clear(database_, "DELETE FROM timeline_event_edge WHERE event_id=?"); bindText(clear.get(), 1, event.id);
         if (sqlite3_step(clear.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        /* 功能：在当前事件写事务插入一种显式引用边，不由章节相邻推断因果。
+         * 参数：ids为借用的目标事件标识列表；kind为调用期间有效的零终止内部边类别。
+         * 返回：无。失败：预编译、绑定或执行失败抛异常，整个事件写事务回滚。
+         * 副作用：写timeline_event_edge；借用event和database_不跨线程或网络等待。
+         */
         auto insert_edges = [&](const std::vector<std::string>& ids, const char* kind) {
             for (const auto& id : ids) { Statement add(database_, "INSERT INTO timeline_event_edge(event_id,edge_kind,target_event_id) VALUES(?,?,?)");
                 bindText(add.get(), 1, event.id); bindText(add.get(), 2, kind); bindText(add.get(), 3, id);
@@ -4189,13 +4627,13 @@ Result<std::vector<xuyan::domain::TimelineEvent>> WorkspaceRepository::listTimel
         const char* sql_narrative = "SELECT id FROM timeline_event WHERE world_id=? AND (?=0 OR has_story_time=0 OR story_time<=?) ORDER BY narrative_order,id";
         Statement query(database_, narrative_order ? sql_narrative : sql_story); bindText(query.get(), 1, world_id);
         sqlite3_bind_int(query.get(), 2, maximum_story_time.has_value() ? 1 : 0); sqlite3_bind_int64(query.get(), 3, maximum_story_time.value_or(0));
-        std::vector<std::string> ids; while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0));
+        std::vector<std::string> ids; while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0));
         std::vector<xuyan::domain::TimelineEvent> result; for (const auto& id : ids) result.push_back(readTimelineEvent(database_, id));
         return Result<std::vector<xuyan::domain::TimelineEvent>>::success(std::move(result));
     } catch (const std::exception& exception) { return Result<std::vector<xuyan::domain::TimelineEvent>>::failure(storageError(exception)); }
 }
 
-/** @brief 按修订原子保存关系本体及方向/未知强度/真实性语义，历史命令只读重放。 */
+/* 按修订原子保存关系本体及方向/未知强度/真实性语义，历史命令只读重放。 */
 Result<xuyan::domain::DirectedRelation> WorkspaceRepository::saveDirectedRelation(
     const std::string& command_id, xuyan::domain::DirectedRelation relation, int expected_revision) {
     auto valid = xuyan::domain::validateDirectedRelation(std::move(relation)); if (!valid.ok()) return valid; relation = std::move(*valid.value);
@@ -4217,15 +4655,15 @@ Result<xuyan::domain::DirectedRelation> WorkspaceRepository::saveDirectedRelatio
     try {
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,record_type,record_id FROM world_graph_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             const bool legacy_replay = columnText(replay.get(), 0) == legacy_payload && !relation.bidirectional && relation.strength
                 && relation.truth_status == (relation.evidence_status == "evidence" ? "fact" : "hypothesis");
             if ((columnText(replay.get(), 0) != payload && !legacy_replay) || columnText(replay.get(), 1) != "relation") return Result<xuyan::domain::DirectedRelation>::failure({ErrorCode::command_conflict, "命令标识已用于其他世界视图记录", false, "生成新的命令标识"});
             auto result = readDirectedRelation(database_, columnText(replay.get(), 2)); transaction.commit(); return Result<xuyan::domain::DirectedRelation>::success(std::move(result));
         }
         Statement endpoints(database_, "SELECT COUNT(*) FROM world_entity WHERE id IN (?,?) AND world_id=? AND deleted=0"); bindText(endpoints.get(), 1, relation.from_entity_id); bindText(endpoints.get(), 2, relation.to_entity_id); bindText(endpoints.get(), 3, relation.world_id);
-        if (sqlite3_step(endpoints.get()) != SQLITE_ROW || sqlite3_column_int(endpoints.get(), 0) != 2) return Result<xuyan::domain::DirectedRelation>::failure({ErrorCode::missing_context, "关系端点不存在于当前世界", false, "刷新世界条目"});
-        int revision = 0; { Statement current(database_, "SELECT revision FROM directed_relation WHERE id=?"); bindText(current.get(), 1, relation.id); if (sqlite3_step(current.get()) == SQLITE_ROW) revision = sqlite3_column_int(current.get(), 0); }
+        if (!stepRow(endpoints.get()) || sqlite3_column_int(endpoints.get(), 0) != 2) return Result<xuyan::domain::DirectedRelation>::failure({ErrorCode::missing_context, "关系端点不存在于当前世界", false, "刷新世界条目"});
+        int revision = 0; { Statement current(database_, "SELECT revision FROM directed_relation WHERE id=?"); bindText(current.get(), 1, relation.id); if (stepRow(current.get())) revision = sqlite3_column_int(current.get(), 0); }
         if (revision != expected_revision) return Result<xuyan::domain::DirectedRelation>::failure({ErrorCode::revision_conflict, "关系修订已变化", false, "刷新后重试"});
         relation.revision = expected_revision + 1;
         Statement upsert(database_, "INSERT INTO directed_relation(id,world_id,from_entity_id,to_entity_id,dimension,strength,has_valid_from,valid_from,has_valid_to,valid_to,visibility,evidence_status,revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET world_id=excluded.world_id,from_entity_id=excluded.from_entity_id,to_entity_id=excluded.to_entity_id,dimension=excluded.dimension,strength=excluded.strength,has_valid_from=excluded.has_valid_from,valid_from=excluded.valid_from,has_valid_to=excluded.has_valid_to,valid_to=excluded.valid_to,visibility=excluded.visibility,evidence_status=excluded.evidence_status,revision=excluded.revision");
@@ -4247,13 +4685,13 @@ Result<std::vector<xuyan::domain::DirectedRelation>> WorkspaceRepository::listDi
         Statement query(database_, "SELECT r.id FROM directed_relation r WHERE r.world_id=? AND (?='' OR r.from_entity_id=? OR r.to_entity_id=?) AND (?=0 OR r.has_valid_from=0 OR r.valid_from<=?) AND (?=0 OR r.has_valid_to=0 OR r.valid_to>=?) AND (?=1 OR r.visibility='public' OR (r.visibility='restricted' AND EXISTS(SELECT 1 FROM directed_relation_grant g WHERE g.relation_id=r.id AND g.actor_id=?))) ORDER BY r.from_entity_id,r.to_entity_id,r.dimension,r.id");
         bindText(query.get(), 1, world_id); bindText(query.get(), 2, entity_id); bindText(query.get(), 3, entity_id); bindText(query.get(), 4, entity_id);
         sqlite3_bind_int(query.get(), 5, story_time.has_value() ? 1 : 0); sqlite3_bind_int64(query.get(), 6, story_time.value_or(0)); sqlite3_bind_int(query.get(), 7, story_time.has_value() ? 1 : 0); sqlite3_bind_int64(query.get(), 8, story_time.value_or(0)); sqlite3_bind_int(query.get(), 9, author_view ? 1 : 0); bindText(query.get(), 10, actor_id);
-        std::vector<std::string> ids; while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0));
+        std::vector<std::string> ids; while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0));
         std::vector<xuyan::domain::DirectedRelation> result; for (const auto& id : ids) result.push_back(readDirectedRelation(database_, id));
         return Result<std::vector<xuyan::domain::DirectedRelation>>::success(std::move(result));
     } catch (const std::exception& exception) { return Result<std::vector<xuyan::domain::DirectedRelation>>::failure(storageError(exception)); }
 }
 
-/** @brief 按修订保存地点本体及真实性；未知坐标与旧命令只读重放语义均保留。 */
+/* 按修订保存地点本体及真实性；未知坐标与旧命令只读重放语义均保留。 */
 Result<xuyan::domain::LocationPlacement> WorkspaceRepository::saveLocationPlacement(
     const std::string& command_id, xuyan::domain::LocationPlacement placement, int expected_revision) {
     auto valid = xuyan::domain::validateLocationPlacement(std::move(placement)); if (!valid.ok()) return valid; placement = std::move(*valid.value);
@@ -4267,7 +4705,7 @@ Result<xuyan::domain::LocationPlacement> WorkspaceRepository::saveLocationPlacem
         {"truth", placement.truth_status}, {"expected_revision", expected_revision}}));
     try {
         Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,record_type,record_id FROM world_graph_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             const bool legacy_replay = columnText(replay.get(), 0) == legacy_payload
                 && placement.truth_status == (placement.evidence_status == "evidence" ? "fact" : "hypothesis");
             if ((columnText(replay.get(), 0) != payload && !legacy_replay) || columnText(replay.get(), 1) != "location")
@@ -4277,9 +4715,9 @@ Result<xuyan::domain::LocationPlacement> WorkspaceRepository::saveLocationPlacem
             return Result<xuyan::domain::LocationPlacement>::success(std::move(result));
         }
         Statement entity(database_, "SELECT r.kind FROM world_entity e JOIN entity_revision r ON r.entity_id=e.id AND r.revision=e.head_revision WHERE e.id=? AND e.deleted=0"); bindText(entity.get(), 1, placement.location_id);
-        if (sqlite3_step(entity.get()) != SQLITE_ROW || columnText(entity.get(), 0) != "location") return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::missing_context, "地图标注必须引用有效地点条目", false, "选择地点条目"});
-        if (!placement.parent_location_id.empty()) { Statement parent(database_, "SELECT 1 FROM location_placement WHERE location_id=?"); bindText(parent.get(), 1, placement.parent_location_id); if (sqlite3_step(parent.get()) != SQLITE_ROW) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::missing_context, "父地点尚未加入地图", false, "先保存父地点"}); std::string cursor = placement.parent_location_id; for (int depth = 0; depth < 128 && !cursor.empty(); ++depth) { if (cursor == placement.location_id) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::rule_conflict, "地点层级不能形成环", false, "选择其他父地点"}); Statement ancestor(database_, "SELECT parent_location_id FROM location_placement WHERE location_id=?"); bindText(ancestor.get(), 1, cursor); cursor = sqlite3_step(ancestor.get()) == SQLITE_ROW ? columnText(ancestor.get(), 0) : std::string{}; } }
-        int revision = 0; { Statement current(database_, "SELECT revision FROM location_placement WHERE location_id=?"); bindText(current.get(), 1, placement.location_id); if (sqlite3_step(current.get()) == SQLITE_ROW) revision = sqlite3_column_int(current.get(), 0); } if (revision != expected_revision) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::revision_conflict, "地点标注修订已变化", false, "刷新后重试"}); placement.revision = expected_revision + 1;
+        if (!stepRow(entity.get()) || columnText(entity.get(), 0) != "location") return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::missing_context, "地图标注必须引用有效地点条目", false, "选择地点条目"});
+        if (!placement.parent_location_id.empty()) { Statement parent(database_, "SELECT 1 FROM location_placement WHERE location_id=?"); bindText(parent.get(), 1, placement.parent_location_id); if (!stepRow(parent.get())) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::missing_context, "父地点尚未加入地图", false, "先保存父地点"}); std::string cursor = placement.parent_location_id; for (int depth = 0; depth < 128 && !cursor.empty(); ++depth) { if (cursor == placement.location_id) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::rule_conflict, "地点层级不能形成环", false, "选择其他父地点"}); Statement ancestor(database_, "SELECT parent_location_id FROM location_placement WHERE location_id=?"); bindText(ancestor.get(), 1, cursor); cursor = stepRow(ancestor.get()) ? columnText(ancestor.get(), 0) : std::string{}; } }
+        int revision = 0; { Statement current(database_, "SELECT revision FROM location_placement WHERE location_id=?"); bindText(current.get(), 1, placement.location_id); if (stepRow(current.get())) revision = sqlite3_column_int(current.get(), 0); } if (revision != expected_revision) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::revision_conflict, "地点标注修订已变化", false, "刷新后重试"}); placement.revision = expected_revision + 1;
         Statement upsert(database_, "INSERT INTO location_placement(location_id,parent_location_id,has_image_point,image_x,image_y,background_asset_ref,evidence_status,revision) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(location_id) DO UPDATE SET parent_location_id=excluded.parent_location_id,has_image_point=excluded.has_image_point,image_x=excluded.image_x,image_y=excluded.image_y,background_asset_ref=excluded.background_asset_ref,evidence_status=excluded.evidence_status,revision=excluded.revision"); bindText(upsert.get(), 1, placement.location_id); bindText(upsert.get(), 2, placement.parent_location_id); sqlite3_bind_int(upsert.get(), 3, placement.image_x.has_value() ? 1 : 0); sqlite3_bind_int(upsert.get(), 4, placement.image_x.value_or(0)); sqlite3_bind_int(upsert.get(), 5, placement.image_y.value_or(0)); bindText(upsert.get(), 6, placement.background_asset_ref); bindText(upsert.get(), 7, placement.evidence_status); sqlite3_bind_int(upsert.get(), 8, placement.revision); if (sqlite3_step(upsert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
         writeLocationSemantics(database_, placement);
         Statement log(database_, "INSERT INTO world_graph_command_log(command_id,payload_hash,record_type,record_id,revision,created_at) VALUES(?,?,?,?,?,?)"); bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, "location"); bindText(log.get(), 4, placement.location_id); sqlite3_bind_int(log.get(), 5, placement.revision); bindText(log.get(), 6, utcNow()); if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_)); transaction.commit(); return Result<xuyan::domain::LocationPlacement>::success(std::move(placement));
@@ -4291,9 +4729,9 @@ Result<xuyan::domain::TravelRoute> WorkspaceRepository::saveTravelRoute(
     auto valid = xuyan::domain::validateTravelRoute(std::move(route)); if (!valid.ok()) return valid; route = std::move(*valid.value);
     const auto payload = route.id + '|' + route.from_location_id + '|' + route.to_location_id + '|' + (route.travel_minutes ? std::to_string(*route.travel_minutes) : "null") + '|' + (route.bidirectional ? "1" : "0") + '|' + route.evidence_status;
     try {
-        Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,record_type,record_id FROM world_graph_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id); if (sqlite3_step(replay.get()) == SQLITE_ROW) { if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "route") return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::command_conflict, "命令标识已用于其他世界视图记录", false, "生成新的命令标识"}); auto result = readTravelRoute(database_, columnText(replay.get(), 2)); transaction.commit(); return Result<xuyan::domain::TravelRoute>::success(std::move(result)); }
-        Statement endpoints(database_, "SELECT COUNT(*) FROM location_placement WHERE location_id IN (?,?)"); bindText(endpoints.get(), 1, route.from_location_id); bindText(endpoints.get(), 2, route.to_location_id); if (sqlite3_step(endpoints.get()) != SQLITE_ROW || sqlite3_column_int(endpoints.get(), 0) != 2) return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::missing_context, "路线端点尚未加入地图", false, "先保存地点标注"});
-        int revision = 0; { Statement current(database_, "SELECT revision FROM travel_route WHERE id=?"); bindText(current.get(), 1, route.id); if (sqlite3_step(current.get()) == SQLITE_ROW) revision = sqlite3_column_int(current.get(), 0); } if (revision != expected_revision) return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::revision_conflict, "路线修订已变化", false, "刷新后重试"}); route.revision = expected_revision + 1;
+        Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,record_type,record_id FROM world_graph_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id); if (stepRow(replay.get())) { if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "route") return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::command_conflict, "命令标识已用于其他世界视图记录", false, "生成新的命令标识"}); auto result = readTravelRoute(database_, columnText(replay.get(), 2)); transaction.commit(); return Result<xuyan::domain::TravelRoute>::success(std::move(result)); }
+        Statement endpoints(database_, "SELECT COUNT(*) FROM location_placement WHERE location_id IN (?,?)"); bindText(endpoints.get(), 1, route.from_location_id); bindText(endpoints.get(), 2, route.to_location_id); if (!stepRow(endpoints.get()) || sqlite3_column_int(endpoints.get(), 0) != 2) return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::missing_context, "路线端点尚未加入地图", false, "先保存地点标注"});
+        int revision = 0; { Statement current(database_, "SELECT revision FROM travel_route WHERE id=?"); bindText(current.get(), 1, route.id); if (stepRow(current.get())) revision = sqlite3_column_int(current.get(), 0); } if (revision != expected_revision) return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::revision_conflict, "路线修订已变化", false, "刷新后重试"}); route.revision = expected_revision + 1;
         Statement upsert(database_, "INSERT INTO travel_route(id,from_location_id,to_location_id,has_travel_minutes,travel_minutes,bidirectional,evidence_status,revision) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET from_location_id=excluded.from_location_id,to_location_id=excluded.to_location_id,has_travel_minutes=excluded.has_travel_minutes,travel_minutes=excluded.travel_minutes,bidirectional=excluded.bidirectional,evidence_status=excluded.evidence_status,revision=excluded.revision"); bindText(upsert.get(), 1, route.id); bindText(upsert.get(), 2, route.from_location_id); bindText(upsert.get(), 3, route.to_location_id); sqlite3_bind_int(upsert.get(), 4, route.travel_minutes.has_value() ? 1 : 0); sqlite3_bind_int(upsert.get(), 5, route.travel_minutes.value_or(0)); sqlite3_bind_int(upsert.get(), 6, route.bidirectional ? 1 : 0); bindText(upsert.get(), 7, route.evidence_status); sqlite3_bind_int(upsert.get(), 8, route.revision); if (sqlite3_step(upsert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
         Statement log(database_, "INSERT INTO world_graph_command_log(command_id,payload_hash,record_type,record_id,revision,created_at) VALUES(?,?,?,?,?,?)"); bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, "route"); bindText(log.get(), 4, route.id); sqlite3_bind_int(log.get(), 5, route.revision); bindText(log.get(), 6, utcNow()); if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_)); transaction.commit(); return Result<xuyan::domain::TravelRoute>::success(std::move(route));
     } catch (const std::exception& exception) { return Result<xuyan::domain::TravelRoute>::failure(storageError(exception)); }
@@ -4301,8 +4739,8 @@ Result<xuyan::domain::TravelRoute> WorkspaceRepository::saveTravelRoute(
 
 Result<xuyan::domain::MapView> WorkspaceRepository::loadMapView(const std::string& world_id) {
     try {
-        xuyan::domain::MapView view; Statement locations(database_, "SELECT p.location_id FROM location_placement p JOIN world_entity e ON e.id=p.location_id WHERE e.world_id=? AND e.deleted=0 ORDER BY p.location_id"); bindText(locations.get(), 1, world_id); std::vector<std::string> ids; while (sqlite3_step(locations.get()) == SQLITE_ROW) ids.push_back(columnText(locations.get(), 0)); for (const auto& id : ids) view.locations.push_back(readLocationPlacement(database_, id));
-        Statement routes(database_, "SELECT r.id FROM travel_route r JOIN world_entity a ON a.id=r.from_location_id JOIN world_entity b ON b.id=r.to_location_id WHERE a.world_id=? AND b.world_id=? ORDER BY r.id"); bindText(routes.get(), 1, world_id); bindText(routes.get(), 2, world_id); std::vector<std::string> route_ids; while (sqlite3_step(routes.get()) == SQLITE_ROW) route_ids.push_back(columnText(routes.get(), 0)); for (const auto& id : route_ids) view.routes.push_back(readTravelRoute(database_, id));
+        xuyan::domain::MapView view; Statement locations(database_, "SELECT p.location_id FROM location_placement p JOIN world_entity e ON e.id=p.location_id WHERE e.world_id=? AND e.deleted=0 ORDER BY p.location_id"); bindText(locations.get(), 1, world_id); std::vector<std::string> ids; while (stepRow(locations.get())) ids.push_back(columnText(locations.get(), 0)); for (const auto& id : ids) view.locations.push_back(readLocationPlacement(database_, id));
+        Statement routes(database_, "SELECT r.id FROM travel_route r JOIN world_entity a ON a.id=r.from_location_id JOIN world_entity b ON b.id=r.to_location_id WHERE a.world_id=? AND b.world_id=? ORDER BY r.id"); bindText(routes.get(), 1, world_id); bindText(routes.get(), 2, world_id); std::vector<std::string> route_ids; while (stepRow(routes.get())) route_ids.push_back(columnText(routes.get(), 0)); for (const auto& id : route_ids) view.routes.push_back(readTravelRoute(database_, id));
         return Result<xuyan::domain::MapView>::success(std::move(view));
     } catch (const std::exception& exception) { return Result<xuyan::domain::MapView>::failure(storageError(exception)); }
 }
@@ -4316,9 +4754,9 @@ Result<xuyan::domain::CharacterInstance> WorkspaceRepository::createCharacterIns
     const auto payload = builder.str();
     try {
         Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,instance_id FROM character_instance_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) { if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::command_conflict, "命令标识已用于其他人物实例", false, "生成新的命令标识"}); auto result = readCharacterInstance(database_, columnText(replay.get(), 1)); transaction.commit(); return Result<xuyan::domain::CharacterInstance>::success(std::move(result)); }
+        if (stepRow(replay.get())) { if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::command_conflict, "命令标识已用于其他人物实例", false, "生成新的命令标识"}); auto result = readCharacterInstance(database_, columnText(replay.get(), 1)); transaction.commit(); return Result<xuyan::domain::CharacterInstance>::success(std::move(result)); }
         Statement blueprint(database_, "SELECT name FROM character_blueprint_version WHERE blueprint_id=? AND version=?"); bindText(blueprint.get(), 1, instance.blueprint_id); sqlite3_bind_int(blueprint.get(), 2, instance.blueprint_version);
-        if (sqlite3_step(blueprint.get()) != SQLITE_ROW) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::missing_context, "人物卡版本不存在", false, "刷新人物卡"});
+        if (!stepRow(blueprint.get())) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::missing_context, "人物卡版本不存在", false, "刷新人物卡"});
         instance.name = columnText(blueprint.get(), 0);
         const auto snapshot = readHistoricalSnapshot(database_, instance.snapshot_id);
         if (snapshot.world_version_id != instance.world_version_id) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::validation_failed, "人物实例的快照不属于所选世界版本", false, "重新选择入场点"});
@@ -4335,7 +4773,7 @@ Result<xuyan::domain::CharacterInstance> WorkspaceRepository::loadCharacterInsta
 }
 
 Result<std::vector<xuyan::domain::CharacterInstance>> WorkspaceRepository::listCharacterInstances(const std::string& world_version_id) {
-    try { Statement query(database_, "SELECT id FROM character_instance WHERE world_version_id=? ORDER BY name,id"); bindText(query.get(), 1, world_version_id); std::vector<std::string> ids; while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0)); std::vector<xuyan::domain::CharacterInstance> result; for (const auto& id : ids) result.push_back(readCharacterInstance(database_, id)); return Result<std::vector<xuyan::domain::CharacterInstance>>::success(std::move(result)); }
+    try { Statement query(database_, "SELECT id FROM character_instance WHERE world_version_id=? ORDER BY name,id"); bindText(query.get(), 1, world_version_id); std::vector<std::string> ids; while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0)); std::vector<xuyan::domain::CharacterInstance> result; for (const auto& id : ids) result.push_back(readCharacterInstance(database_, id)); return Result<std::vector<xuyan::domain::CharacterInstance>>::success(std::move(result)); }
     catch (const std::exception& exception) { return Result<std::vector<xuyan::domain::CharacterInstance>>::failure(storageError(exception)); }
 }
 
@@ -4343,7 +4781,7 @@ Result<xuyan::domain::CharacterInstance> WorkspaceRepository::saveCharacterInsta
     const std::string& command_id, const std::string& instance_id, int expected_revision, const std::string& memory_json) {
     const auto payload = "memory|" + instance_id + '|' + std::to_string(expected_revision) + '|' + memory_json;
     try {
-        Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,instance_id FROM character_instance_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id); if (sqlite3_step(replay.get()) == SQLITE_ROW) { if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::command_conflict, "命令标识已用于其他人物实例操作", false, "生成新的命令标识"}); auto result = readCharacterInstance(database_, columnText(replay.get(), 1)); transaction.commit(); return Result<xuyan::domain::CharacterInstance>::success(std::move(result)); }
+        Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,instance_id FROM character_instance_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id); if (stepRow(replay.get())) { if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::command_conflict, "命令标识已用于其他人物实例操作", false, "生成新的命令标识"}); auto result = readCharacterInstance(database_, columnText(replay.get(), 1)); transaction.commit(); return Result<xuyan::domain::CharacterInstance>::success(std::move(result)); }
         auto current = readCharacterInstance(database_, instance_id); if (current.revision != expected_revision) return Result<xuyan::domain::CharacterInstance>::failure({ErrorCode::revision_conflict, "人物实例记忆修订已变化", false, "刷新后重试"});
         Statement update(database_, "UPDATE character_instance SET memory_json=?,revision=revision+1 WHERE id=? AND revision=?"); bindText(update.get(), 1, memory_json); bindText(update.get(), 2, instance_id); sqlite3_bind_int(update.get(), 3, expected_revision); if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database_) != 1) throw std::runtime_error("人物实例记忆并发更新失败"); current.memory_json = memory_json; current.revision = expected_revision + 1;
         Statement log(database_, "INSERT INTO character_instance_command_log(command_id,payload_hash,instance_id,revision,created_at) VALUES(?,?,?,?,?)"); bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, instance_id); sqlite3_bind_int(log.get(), 4, current.revision); bindText(log.get(), 5, utcNow()); if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_)); transaction.commit(); return Result<xuyan::domain::CharacterInstance>::success(std::move(current));
@@ -4356,10 +4794,10 @@ Result<xuyan::domain::BranchRootBinding> WorkspaceRepository::bindBranchRoot(
     std::string payload = binding.branch_id + '|' + binding.world_version_id + '|' + binding.snapshot_id + '|' + binding.history_mode + '|' + binding.root_hash;
     for (const auto& id : binding.character_instance_ids) payload += '|' + id;
     try {
-        Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,branch_id FROM branch_binding_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id); if (sqlite3_step(replay.get()) == SQLITE_ROW) { if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::command_conflict, "命令标识已用于其他分支根", false, "生成新的命令标识"}); auto result = readBranchRootBinding(database_, columnText(replay.get(), 1)); transaction.commit(); return Result<xuyan::domain::BranchRootBinding>::success(std::move(result)); }
-        Statement branch(database_, "SELECT 1 FROM branch WHERE id=?"); bindText(branch.get(), 1, binding.branch_id); if (sqlite3_step(branch.get()) != SQLITE_ROW) return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::missing_context, "分支不存在", false, "刷新分支列表"});
+        Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,branch_id FROM branch_binding_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id); if (stepRow(replay.get())) { if (columnText(replay.get(), 0) != payload) return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::command_conflict, "命令标识已用于其他分支根", false, "生成新的命令标识"}); auto result = readBranchRootBinding(database_, columnText(replay.get(), 1)); transaction.commit(); return Result<xuyan::domain::BranchRootBinding>::success(std::move(result)); }
+        Statement branch(database_, "SELECT 1 FROM branch WHERE id=?"); bindText(branch.get(), 1, binding.branch_id); if (!stepRow(branch.get())) return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::missing_context, "分支不存在", false, "刷新分支列表"});
         const auto snapshot = readHistoricalSnapshot(database_, binding.snapshot_id); if (snapshot.world_version_id != binding.world_version_id) return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::validation_failed, "分支根快照不属于所选世界版本", false, "重新选择快照"});
-        Statement existing(database_, "SELECT 1 FROM branch_root_binding WHERE branch_id=?"); bindText(existing.get(), 1, binding.branch_id); if (sqlite3_step(existing.get()) == SQLITE_ROW) return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::revision_conflict, "分支根已固定，不能原地改绑", false, "创建新分支"});
+        Statement existing(database_, "SELECT 1 FROM branch_root_binding WHERE branch_id=?"); bindText(existing.get(), 1, binding.branch_id); if (stepRow(existing.get())) return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::revision_conflict, "分支根已固定，不能原地改绑", false, "创建新分支"});
         std::vector<xuyan::domain::CharacterInstance> instances;
         for (const auto& id : binding.character_instance_ids) { const auto instance = readCharacterInstance(database_, id); if (instance.world_version_id != binding.world_version_id || instance.snapshot_id != binding.snapshot_id || instance.status != "ready") return Result<xuyan::domain::BranchRootBinding>::failure({ErrorCode::validation_failed, "人物实例未就绪或不属于同一版本/快照", false, "解决入场冲突后重试"}); instances.push_back(instance); }
         std::ostringstream root; root << binding.branch_id << '|' << binding.world_version_id << '|' << binding.snapshot_id << '|' << binding.history_mode;
@@ -4393,7 +4831,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::createSimulationSe
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,result_type,result_id FROM simulation_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "session")
                 return Result<xuyan::domain::SimulationSession>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他推演操作", false, "生成新的命令标识"});
@@ -4403,7 +4841,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::createSimulationSe
         }
         Statement branch(database_, "SELECT 1 FROM branch WHERE id=?");
         bindText(branch.get(), 1, session.branch_id);
-        if (sqlite3_step(branch.get()) != SQLITE_ROW)
+        if (!stepRow(branch.get()))
             return Result<xuyan::domain::SimulationSession>::failure(
                 {ErrorCode::missing_context, "推演分支不存在", false, "刷新分支后重试"});
         session.status = "ready";
@@ -4446,7 +4884,7 @@ Result<std::vector<xuyan::domain::SimulationSession>> WorkspaceRepository::listS
     try {
         Statement query(database_, "SELECT id FROM simulation_session ORDER BY created_at DESC,id");
         std::vector<std::string> ids;
-        while (sqlite3_step(query.get()) == SQLITE_ROW) ids.push_back(columnText(query.get(), 0));
+        while (stepRow(query.get())) ids.push_back(columnText(query.get(), 0));
         std::vector<xuyan::domain::SimulationSession> result;
         result.reserve(ids.size());
         for (const auto& id : ids) result.push_back(readSimulationSession(database_, id));
@@ -4464,7 +4902,7 @@ Result<xuyan::domain::SimulationTurn> WorkspaceRepository::reserveSimulationTurn
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,result_type,result_id FROM simulation_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "turn")
                 return Result<xuyan::domain::SimulationTurn>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他推演操作", false, "生成新的命令标识"});
@@ -4496,7 +4934,7 @@ Result<xuyan::domain::SimulationTurn> WorkspaceRepository::reserveSimulationTurn
                 {ErrorCode::missing_context, "人物未绑定到该推演会话", false, "刷新人物模型绑定"});
         Statement head(database_, "SELECT head_commit_id FROM branch WHERE id=?");
         bindText(head.get(), 1, session.branch_id);
-        if (sqlite3_step(head.get()) != SQLITE_ROW)
+        if (!stepRow(head.get()))
             return Result<xuyan::domain::SimulationTurn>::failure(
                 {ErrorCode::missing_context, "推演分支不存在", false, "刷新分支"});
         const auto input_commit_id = columnText(head.get(), 0);
@@ -4546,7 +4984,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::commitSimulationTu
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,result_type,result_id FROM simulation_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "session")
                 return Result<xuyan::domain::SimulationSession>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他推演操作", false, "生成新的命令标识"});
@@ -4593,7 +5031,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::commitSimulationTu
         }
         Statement head(database_, "SELECT head_commit_id FROM branch WHERE id=?");
         bindText(head.get(), 1, session.branch_id);
-        if (sqlite3_step(head.get()) != SQLITE_ROW || columnText(head.get(), 0) != turn.input_commit_id)
+        if (!stepRow(head.get()) || columnText(head.get(), 0) != turn.input_commit_id)
             return Result<xuyan::domain::SimulationSession>::failure(
                 {ErrorCode::revision_conflict, "分支头已变化，不能提交过期意图", true, "基于新分支头重新推演"});
         const auto previous = readCommit(database_, turn.input_commit_id);
@@ -4623,7 +5061,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::commitSimulationTu
         int no_progress_count = 0;
         Statement progress(database_, "SELECT operation FROM simulation_turn WHERE session_id=? AND status IN ('narration_pending','completed') ORDER BY ordinal DESC LIMIT ?");
         bindText(progress.get(), 1, session.id); sqlite3_bind_int(progress.get(), 2, session.no_progress_limit);
-        while (sqlite3_step(progress.get()) == SQLITE_ROW && columnText(progress.get(), 0) == "speak") ++no_progress_count;
+        while (stepRow(progress.get()) && columnText(progress.get(), 0) == "speak") ++no_progress_count;
         std::string next_status;
         if (next.state.completed || intent.ends_scene || turn.ordinal >= session.max_turns) next_status = "completed";
         else if (session.pause_requested) next_status = "paused";
@@ -4654,7 +5092,7 @@ Result<xuyan::domain::SimulationTurn> WorkspaceRepository::finishSimulationNarra
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,result_type,result_id FROM simulation_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "turn")
                 return Result<xuyan::domain::SimulationTurn>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他推演操作", false, "生成新的命令标识"});
@@ -4687,7 +5125,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::controlSimulationS
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,result_type,result_id FROM simulation_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "session")
                 return Result<xuyan::domain::SimulationSession>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他推演操作", false, "生成新的命令标识"});
@@ -4750,7 +5188,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::commitDirectorInte
         Transaction transaction(database_);
         Statement replay(database_, "SELECT payload_hash,result_type,result_id FROM simulation_command_log WHERE command_id=?");
         bindText(replay.get(), 1, command_id);
-        if (sqlite3_step(replay.get()) == SQLITE_ROW) {
+        if (stepRow(replay.get())) {
             if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "session")
                 return Result<xuyan::domain::SimulationSession>::failure(
                     {ErrorCode::command_conflict, "命令标识已用于其他推演操作", false, "生成新的命令标识"});
@@ -4770,7 +5208,7 @@ Result<xuyan::domain::SimulationSession> WorkspaceRepository::commitDirectorInte
                 {ErrorCode::missing_context, "导演接管的人物不属于该会话", false, "选择已绑定人物"});
         Statement head(database_, "SELECT head_commit_id FROM branch WHERE id=?");
         bindText(head.get(), 1, session.branch_id);
-        if (sqlite3_step(head.get()) != SQLITE_ROW || columnText(head.get(), 0) != intent.input_commit_id)
+        if (!stepRow(head.get()) || columnText(head.get(), 0) != intent.input_commit_id)
             return Result<xuyan::domain::SimulationSession>::failure(
                 {ErrorCode::revision_conflict, "分支头已变化，不能提交过期导演指令", true, "刷新后重新介入"});
         const auto previous = readCommit(database_, intent.input_commit_id);
@@ -4811,7 +5249,7 @@ Result<int> WorkspaceRepository::recoverInterruptedSimulationSessions() {
         Transaction transaction(database_);
         Statement query(database_, "SELECT c.id,c.turn_id,t.session_id FROM simulation_provider_call c JOIN simulation_turn t ON t.id=c.turn_id WHERE c.status='sent'");
         std::vector<std::tuple<std::string, std::string, std::string>> calls;
-        while (sqlite3_step(query.get()) == SQLITE_ROW)
+        while (stepRow(query.get()))
             calls.emplace_back(columnText(query.get(), 0), columnText(query.get(), 1), columnText(query.get(), 2));
         const auto now = utcNow();
         for (const auto& [call_id, turn_id, session_id] : calls) {

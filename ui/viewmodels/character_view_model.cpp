@@ -1,4 +1,5 @@
 #include "character_view_model.h"
+#include "view_model_text.h"
 
 #include "xuyan/application/character_service.h"
 
@@ -51,8 +52,8 @@ void CharacterViewModel::loadCards(QString keep_id) {
         try {
             xuyan::application::CharacterService service(path);
             result = service.openAndList();
-        } catch (const std::exception& exception) {
-            result = decltype(result)::failure({xuyan::domain::ErrorCode::storage_error, exception.what(), true,
+        } catch (...) {
+            result = decltype(result)::failure({xuyan::domain::ErrorCode::storage_error, "工作区操作发生内部错误，请检查资料后重试", true,
                                                 "检查人物卡工作区后重试"});
         }
         if (!self) return;
@@ -60,7 +61,7 @@ void CharacterViewModel::loadCards(QString keep_id) {
             if (!self) return;
             self->busy_ = false;
             if (!result.ok()) {
-                self->error_text_ = QString::fromStdString(result.error->message);
+                self->error_text_ = view_model_text::errorText(*result.error);
                 emit self->changed(); return;
             }
             self->cards_ = std::move(*result.value);
@@ -113,17 +114,16 @@ void CharacterViewModel::saveCard(QString card_name, QString card_summary, QStri
             xuyan::application::CharacterService service(path);
             result = expected == 0 ? service.create(command, std::move(card))
                                    : service.save(command, std::move(card), expected);
-        } catch (const std::exception& exception) {
-            result = decltype(result)::failure({xuyan::domain::ErrorCode::storage_error, exception.what(), true,
+        } catch (...) {
+            result = decltype(result)::failure({xuyan::domain::ErrorCode::storage_error, "工作区操作发生内部错误，请检查资料后重试", true,
                                                 "检查人物卡工作区后重试"});
         }
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, result = std::move(result)]() mutable {
             if (!self) return;
             self->busy_ = false;
-            if (!result.ok()) { self->error_text_ = QString::fromStdString(result.error->message); emit self->changed(); return; }
+            if (!result.ok()) { self->error_text_ = view_model_text::errorText(*result.error); emit self->changed(); return; }
             self->loadCards(QString::fromStdString(result.value->id));
         }, Qt::QueuedConnection);
     });
 }
-

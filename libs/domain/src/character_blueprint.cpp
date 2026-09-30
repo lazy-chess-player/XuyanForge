@@ -5,12 +5,26 @@
 namespace xuyan::domain {
 namespace {
 
-/** @brief 检查文本是否含不允许出现在人物卡中的控制字符。 */
+/*
+ * 功能：检查人物卡名称中的禁用控制字符，保留制表符。
+ * 参数：
+ *   text：借用待检查字节文本，仅调用期间有效。
+ * 返回：有非制表符的低位控制字节为true，否则false。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：只读输入，不规范化或删除文本。
+ */
 bool hasControl(std::string_view text) {
     return std::any_of(text.begin(), text.end(), [](unsigned char value) { return value < 0x20 && value != '\t'; });
 }
 
-/** @brief 删除空项并排序去重人物卡的多值字段。 */
+/*
+ * 功能：删除集合的空项，按字节序排序并去重。
+ * 参数：
+ *   values：可变字符串集合引用；调用者拥有容器，元素顺序允许改变。
+ * 返回：无；原集合成为有序唯一的非空项集合。
+ * 失败：字符串或容器分配可抛标准异常。
+ * 副作用：原地修改容器并使迭代器失效，不读写文件。
+ */
 void normalize(std::vector<std::string>& values) {
     values.erase(std::remove_if(values.begin(), values.end(), [](const auto& value) { return value.empty(); }), values.end());
     std::sort(values.begin(), values.end());

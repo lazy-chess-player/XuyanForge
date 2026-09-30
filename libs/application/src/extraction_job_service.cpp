@@ -16,12 +16,24 @@
 namespace xuyan::application {
 namespace {
 
+/*
+ * 正文切片边界索引，仅在单次建任务调用中拥有码点偏移向量；不持有原文或跨线程共享。
+ * 两组索引都按扫描顺序递增，初始为空，单位均为 Unicode 码点而不是 UTF-8 字节。
+ */
 struct TextBoundaries {
+    /* 段尾后一个码点位置；扫描换行时追加，空正文保持空。 */
     std::vector<std::size_t> paragraphs;
+    /* 句末标点及紧随的右引号之后的位置；扫描句末时追加，空正文保持空。 */
     std::vector<std::size_t> sentences;
 };
 
-/** @brief 单次扫描标准化 UTF-8 正文，建立单换行段尾与句末的码点边界索引。 */
+/*
+ * 功能：一次扫描已标准化的 UTF-8 正文，建立段尾和句尾切片候选位置。
+ * 参数：utf8 为借用至返回的有效 UTF-8 正文，允许为空，位置从零开始。
+ * 返回：两个递增的码点边界向量；无可用标点时向量为空。
+ * 失败：未在此函数做编码校验，分配异常可传播。
+ * 副作用：仅构造索引，不修改正文；线程：同步，结果不借用输入。
+ */
 TextBoundaries textBoundaries(std::string_view utf8) {
     TextBoundaries result;
     std::size_t codepoint = 0;
@@ -49,7 +61,12 @@ TextBoundaries textBoundaries(std::string_view utf8) {
     return result;
 }
 
-/** @brief 在允许长度区间内选择最靠后的边界；不存在时返回零以触发下级回退。 */
+/*
+ * 功能：在有序码点边界中选取落在闭区间内的最后一个位置。
+ * 参数：boundaries 为调用期间借用且递增的码点位置；minimum、maximum 为闭区间下上限。
+ * 返回：匹配边界的码点偏移；未命中返回零供调用方回退。
+ * 失败：无主动校验或业务错误；副作用：只读边界；线程：同步，不保存引用。
+ */
 std::size_t lastBoundaryInRange(const std::vector<std::size_t>& boundaries,
                                 std::size_t minimum, std::size_t maximum) {
     const auto after = std::upper_bound(boundaries.begin(), boundaries.end(), maximum);

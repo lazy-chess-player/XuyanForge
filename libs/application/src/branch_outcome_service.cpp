@@ -21,16 +21,32 @@ using xuyan::domain::ErrorCode;
 using xuyan::domain::Result;
 using xuyan::package::JsonValue;
 
-/** @brief 将布尔值转成诊断和导出使用的稳定文本。 */
+/*
+ * 功能：把布尔状态转换为分支差异中的稳定协议文本。
+ * 参数：value 为待转换状态。返回：true 或 false 的字符串。
+ * 失败：字符串分配异常可传播。副作用：仅内存转换；线程：同步。
+ */
 std::string booleanText(bool value) { return value ? "true" : "false"; }
 
-/** @brief 仅在两个分支字段不同的情况下加入差异项。 */
+/*
+ * 功能：比较同一字段在左右分支的文本值，仅有差异时追加记录。
+ * 参数：result 为可写差异容器；field 为按值接收并移入记录的字段名；
+ * left、right 为借用至返回的左右字段值。
+ * 返回：无。失败：容器扩容或字符串复制异常可传播。
+ * 副作用：可能向 result 追加一条差异；线程：同步，不保留输入引用。
+ */
 void addDifference(std::vector<BranchDifference>& result, std::string field,
                    const std::string& left, const std::string& right) {
     if (left != right) result.push_back({std::move(field), left, right});
 }
 
-/** @brief 先写临时文件再替换目标；替换失败时尝试恢复原文件。 */
+/*
+ * 功能：先写同级临时文件，再替换导出目标；替换失败时尝试恢复原文件。
+ * 参数：destination 为目标文件路径，不能为空；content 为借用至返回的导出字节。
+ * 返回：成功时返回目标路径字符串，失败时返回含操作建议的 Result 错误。
+ * 失败：路径为空、建目录、写入或重命名失败；回滚也可能失败并进入错误结果。
+ * 副作用：创建目录和临时文件，可能替换目标并删除旧备份；线程：同步，不保持文件句柄。
+ */
 Result<std::string> writeAtomically(const std::filesystem::path& destination, const std::string& content) {
     if (destination.empty()) return Result<std::string>::failure(
         {ErrorCode::validation_failed, "导出路径不能为空", false, "选择目标文件"});
@@ -65,7 +81,12 @@ Result<std::string> writeAtomically(const std::filesystem::path& destination, co
     }
 }
 
-/** @brief 沿父提交链收集共同祖先之后的提交，并按时间顺序返回。 */
+/*
+ * 功能：沿提交父链从头结点回溯到指定祖先，再反转为祖先之后的提交顺序。
+ * 参数：repository 为调用期间借用的可读取仓储；head 为起点提交 ID；ancestor 为截止提交 ID。
+ * 返回：不含祖先的提交 ID 列表；若父链提前结束则返回已走过的整条链。
+ * 失败：仓储读取失败时抛异常，分配异常可传播。副作用：只读提交，不修改仓储；线程：调用线程同步执行。
+ */
 std::vector<std::string> chainAfter(xuyan::storage::WorkspaceRepository& repository,
                                     const std::string& head, const std::string& ancestor) {
     std::vector<std::string> result;
@@ -80,7 +101,12 @@ std::vector<std::string> chainAfter(xuyan::storage::WorkspaceRepository& reposit
     return result;
 }
 
-/** @brief 将一个推演会话的调用次数与令牌用量累计到指定比较侧。 */
+/*
+ * 功能：把一个会话已记录的调用和输入/输出令牌数累加到分支比较的一侧。
+ * 参数：comparison 为可写比较结果；session 为借用的会话；left 为 true 时累计左侧，否则右侧。
+ * 返回：无。失败：当前实现不做整数溢出检测；本函数不主动抛业务异常。
+ * 副作用：修改 comparison 的计数，不写仓储；线程：同步，不保留 session 引用。
+ */
 void addCost(BranchComparison& comparison, const xuyan::domain::SimulationSession& session, bool left) {
     int input = 0, output = 0;
     for (const auto& turn : session.turns) { input += turn.call.input_tokens; output += turn.call.output_tokens; }
@@ -93,7 +119,12 @@ void addCost(BranchComparison& comparison, const xuyan::domain::SimulationSessio
     }
 }
 
-/** @brief 将当前分支状态压缩成不依赖固定人物名称的可读概览。 */
+/*
+ * 功能：从提交状态生成当前回合、资源持有者及人物信任值的可读概览。
+ * 参数：head 为调用期间借用的提交视图，人物名为空时使用稳定 ID。
+ * 返回：独立拥有的中文摘要字符串。失败：格式化或分配异常可传播。
+ * 副作用：只读内存状态；线程：同步，不保留提交引用。
+ */
 std::string stateSummary(const CommitView& head) {
     std::ostringstream out;
     out << "回合 " << head.state.turn << "；唯一物品持有人 " << head.state.seal_holder_id
@@ -174,6 +205,12 @@ Result<std::string> BranchOutcomeService::exportBranch(
         xuyan::storage::WorkspaceRepository repository(database_path_);
         auto head = repository.loadHead(branch_id); if (!head.ok()) return Result<std::string>::failure(*head.error);
         auto branches = repository.listBranches(); if (!branches.ok()) return Result<std::string>::failure(*branches.error);
+        /*
+         * 功能：在当前仓储返回的分支列表中寻找调用方指定的稳定 ID。
+         * 参数：value 为本次遍历借用的分支记录；branch_id 由外层只读引用捕获，调用期间有效。
+         * 返回：ID 相同时为真。失败：比较本身不抛业务错误。
+         * 副作用：只读；线程：在当前调用线程同步执行，闭包不逃逸算法调用。
+         */
         auto branch = std::find_if(branches.value->begin(), branches.value->end(), [&](const auto& value) { return value.id == branch_id; });
         if (branch == branches.value->end()) return Result<std::string>::failure(
             {ErrorCode::missing_context, "找不到导出分支", false, "刷新分支列表"});
@@ -198,6 +235,12 @@ Result<std::string> BranchOutcomeService::exportBranch(
         std::reverse(commit_order.begin(), commit_order.end());
         std::unordered_map<std::string, std::size_t> commit_position;
         for (std::size_t index = 0; index < commit_order.size(); ++index) commit_position[commit_order[index]] = index;
+        /*
+         * 功能：按已提交的父链位置排列可导出的回合。
+         * 参数：a、b 为排序期间借用的回合；commit_position 为外层只在本次排序使用的可写映射。
+         * 返回：a 的提交位置先于 b 时为真。失败：映射访问可能分配异常；未知 ID 会被插入默认位置。
+         * 副作用：可能向 commit_position 插入缺失的 ID；线程：当前调用线程同步执行，捕获不逃逸。
+         */
         std::sort(turns.begin(), turns.end(), [&](const auto& a, const auto& b) {
             return commit_position[a.committed_commit_id] < commit_position[b.committed_commit_id];
         });

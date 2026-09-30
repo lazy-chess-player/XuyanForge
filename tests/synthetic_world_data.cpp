@@ -3,12 +3,12 @@
 
 namespace xuyan::test {
 
-/** @brief 在空白测试工作区显式创建有限合成条目；已有条目时保持原状。 */
 xuyan::domain::Result<bool> installSyntheticEntities(const std::filesystem::path& database_path) {
     xuyan::storage::WorkspaceRepository repository(database_path);
     auto page = repository.searchEntities({}, {}, 0, 1);
     if (!page.ok()) return xuyan::domain::Result<bool>::failure(*page.error);
     if (page.value->total > 0) return xuyan::domain::Result<bool>::success(false);
+    /* 有限夹具只由测试显式创建；各 createEntity 独立落库，后项失败不会撤销此前创建项。 */
     const std::vector<xuyan::domain::WorldEntity> samples{
         {"entity-xucheng", "world-synthetic-test", "character", "许澄", {"许代表"}, {"城卫署", "谈判"},
          "城卫署谈判代表，重视秩序；在场景开始时知道北门今夜封闭。", "{\"role\":\"negotiator\"}", "accepted"},
@@ -28,7 +28,6 @@ xuyan::domain::Result<bool> installSyntheticEntities(const std::filesystem::path
     return xuyan::domain::Result<bool>::success(true);
 }
 
-/** @brief 在测试工作区显式创建一张合成人物卡；已有卡片时保持原状。 */
 xuyan::domain::Result<bool> installSyntheticBlueprint(const std::filesystem::path& database_path) {
     xuyan::storage::WorkspaceRepository repository(database_path);
     auto existing = repository.listBlueprints();

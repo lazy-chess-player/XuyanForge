@@ -23,12 +23,23 @@ namespace {
 using xuyan::domain::Error;
 using xuyan::domain::ErrorCode;
 
-/** @brief 把文件或区间校验失败转换为带有用户下一步建议的领域错误。 */
+/*
+ * 功能：构造来源文件或原文范围无效的中文校验错误。
+ * 参数：message 为按值取得的原因；action 为按值取得的修复建议，省略时提示检查路径和权限。
+ * 返回：不建议自动重试的错误值。失败：字符串构造异常可传播。
+ * 副作用：仅内存构造，不读取文件；线程：同步，不保存输入引用。
+ */
 Error fileError(std::string message, std::string action = "检查文件路径与访问权限") {
     return Error{ErrorCode::validation_failed, std::move(message), false, std::move(action)};
 }
 
-/** @brief 从已知码点/字节锚点向前扫描到目标码点，并同步更新两个游标。 */
+/*
+ * 功能：从已扫描锚点向前计算指定 Unicode 码点对应的 UTF-8 字节偏移。
+ * 参数：utf8 为调用期间有效的已验证正文；wanted 为目标绝对码点；byte、codepoint 为输入/输出游标，
+ * 分别以字节和码点计，调用前二者须对应同一文本位置且 wanted 不早于 codepoint。
+ * 返回：目标字节偏移，同时更新两个游标。失败：倒退或超出正文时抛异常。
+ * 副作用：仅改变游标，不改正文；线程：同步，不保存视图。
+ */
 std::size_t advanceByteOffsetForCodepoint(std::string_view utf8, std::size_t wanted,
                                           std::size_t& byte, std::size_t& codepoint) {
     if (wanted < codepoint) throw std::runtime_error("章节码点边界顺序无效");
@@ -41,7 +52,13 @@ std::size_t advanceByteOffsetForCodepoint(std::string_view utf8, std::size_t wan
     return byte;
 }
 
-/** @brief 从章节锚点顺序读取原文半开码点区间，逐字符验证 UTF-8 并保留原字节。 */
+/*
+ * 功能：从最近章节锚点顺序读取标准化资产的原文码点半开区间。
+ * 参数：path 为只读资产路径；anchor_byte 为文件中字节起点；anchor_codepoint 为同一位置的绝对码点；
+ * start_codepoint、end_codepoint 为请求的绝对半开范围，须满足锚点不晚于起点且起点不晚于终点。
+ * 返回：原样 UTF-8 字节；等长区间返回空串。失败：范围、打开、截断或字符无效返回 Result。
+ * 副作用：只读文件，流于返回关闭；线程：同步，不保存路径或字节视图。
+ */
 xuyan::domain::Result<std::string> readCodepointRange(const std::filesystem::path& path,
                                                       std::size_t anchor_byte,
                                                       std::size_t anchor_codepoint,
@@ -78,28 +95,58 @@ xuyan::domain::Result<std::string> readCodepointRange(const std::filesystem::pat
     return xuyan::domain::Result<std::string>::success(std::move(result));
 }
 
+/*
+ * 主干候选句段的临时范围对象，仅在一次预览构造中存活，不持有或修改正文。
+ * 每个半开边界都有字节与 Unicode 码点两套单位，初值为零，由顺序扫描填充。
+ */
 struct PreviewUnit {
+    /* 句段的 UTF-8 起始字节偏移，初始 0，扫描器写入，筛选器读取。 */
     std::size_t start_byte{0};
+    /* 句段的 UTF-8 结束字节偏移，初始 0，半开终点。 */
     std::size_t end_byte{0};
+    /* 句段的片内起始 Unicode 码点偏移，初始 0。 */
     std::size_t start_codepoint{0};
+    /* 句段的片内结束 Unicode 码点偏移，初始 0，半开终点。 */
     std::size_t end_codepoint{0};
 };
 
-/** @brief 去掉句段两端的 ASCII 空白；返回的视图只在输入文本存活期间有效。 */
+/*
+ * 功能：从句段视图两端剔除 ASCII 控制和空格字节，不复制正文。
+ * 参数：text 为调用期间有效的 UTF-8 字节视图，允许为空。
+ * 返回：指向原有存储的子视图，寿命不得超过输入正文。
+ * 失败：无主动错误；副作用：仅修改局部视图边界；线程：同步，不保留视图。
+ */
 std::string_view trimAsciiSpace(std::string_view text) {
     while (!text.empty() && static_cast<unsigned char>(text.front()) <= 0x20) text.remove_prefix(1);
     while (!text.empty() && static_cast<unsigned char>(text.back()) <= 0x20) text.remove_suffix(1);
     return text;
 }
 
-/** @brief 判断句段是否包含词表里的任意完整 UTF-8 字节序列。 */
+/*
+ * 功能：检查句段是否出现任一关键词的完整字节序列。
+ * 参数：text 为借用的句段视图；terms 为调用期间有效的关键词视图列表，可为空。
+ * 返回：命中任一词返回真；空词表或未命中返回假。失败：无主动错误。
+ * 副作用：只读输入；线程：在调用线程同步遍历，捕获视图不逃逸。
+ */
 bool containsAny(std::string_view text, std::initializer_list<std::string_view> terms) {
+    /*
+     * 功能：判断当前关键词是否在本句段的字节序列中出现。
+     * 参数：term 为本次遍历借用的关键词；text 按值捕获视图，仅在同步算法调用期间有效。
+     * 返回：找到时为真。失败：无主动错误；副作用：只读，不保留捕获。
+     */
     return std::any_of(terms.begin(), terms.end(), [text](std::string_view term) {
         return text.find(term) != std::string_view::npos;
     });
 }
 
-/** @brief 按 backbone-v1 生成可追溯的非权威主干；改变切句、筛选或拼接语义须提升算法版本。 */
+/*
+ * 功能：按 backbone-v1 将单片原文切成可回查句段，并生成非权威主干预览。
+ * 参数：source_text 为按值取得的有效 UTF-8 原文；base_codepoint 为来源绝对起点；
+ * density 为保留密度档位，不表示事实正确率。
+ * 返回：拥有原文、派生预览及逐段字节/码点映射；正文非法时返回 Result 错误。
+ * 失败：非法 UTF-8 返回错误，容器分配异常可传播；不对算法事实召回作保证。
+ * 副作用：仅内存构造，不修改原文资产或候选；线程：同步，临时 string_view 均不逃逸返回。
+ */
 xuyan::domain::Result<NarrativePreview> buildNarrativePreview(std::string source_text,
                                                                std::size_t base_codepoint,
                                                                NarrativePreviewDensity density) {
@@ -245,9 +292,16 @@ xuyan::domain::Result<SourceTextRange> locateNarrativeQuote(const NarrativePrevi
     if (quote_codepoints == 0) return xuyan::domain::Result<SourceTextRange>::failure(
         fileError("引文不能为空且必须是合法文本", "从保留的原文句段选择引文"));
     const std::string_view source = preview.source_text;
+    /*
+     * 连续保留的原文区间，仅在本次引文定位中存活；跳过的句段会断开区间。
+     * 三个偏移均从已校验的预览映射读取，未提供默认值，由追加时完整初始化。
+     */
     struct RetainedRun {
+        /* 连续区间的 UTF-8 起始字节偏移，搜索与回查时只读。 */
         std::size_t start_byte;
+        /* 连续区间的 UTF-8 半开结束字节偏移，相邻句段合并时更新。 */
         std::size_t end_byte;
+        /* 与 start_byte 对应的来源绝对 Unicode 码点偏移，只读。 */
         std::size_t start_codepoint;
     };
     std::vector<RetainedRun> runs;
@@ -370,6 +424,12 @@ xuyan::domain::Result<xuyan::domain::SourceDocument> SourceImportService::import
     if (world_id.empty()) return xuyan::domain::Result<xuyan::domain::SourceDocument>::failure(
         fileError("导入前必须选择世界", "先创建或选择世界模板"));
     auto extension = source_path.extension().string();
+    /*
+     * 功能：把扩展名的 ASCII 大写字节转为小写，以进行格式白名单比较。
+     * 参数：value 为扩展名当前字节，按值传入，不借用原字符串。
+     * 返回：转换后的字节。失败：区域设置转换无 Result 错误。
+     * 副作用：lambda 本身无状态，外层 transform 原位更新 extension；线程：同步，不逃逸。
+     */
     std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
         return static_cast<char>(std::tolower(value));
     });
@@ -428,6 +488,15 @@ xuyan::domain::Result<std::vector<xuyan::domain::SourceDocument>> SourceImportSe
     return repository.listSourcesForWorld(world_id);
 }
 
+xuyan::domain::Result<xuyan::domain::SourceDocument> SourceImportService::load(const std::string& source_id) {
+    try {
+        return xuyan::storage::WorkspaceRepository(database_path_).loadSource(source_id);
+    } catch (...) {
+        return xuyan::domain::Result<xuyan::domain::SourceDocument>::failure(
+            {ErrorCode::storage_error, "无法读取来源资料，详情已隐藏", true, "检查工作区后重试"});
+    }
+}
+
 xuyan::domain::Result<std::string> SourceImportService::loadNormalizedText(const std::string& source_id) {
     xuyan::storage::WorkspaceRepository repository(database_path_);
     auto document = repository.loadSource(source_id);
@@ -474,6 +543,12 @@ xuyan::domain::Result<xuyan::domain::SourceDocument> SourceImportService::saveCh
         auto text = loadNormalizedText(source_id);
         if (!text.ok()) return xuyan::domain::Result<xuyan::domain::SourceDocument>::failure(*text.error);
         const auto total = xuyan::domain::utf8CodepointCount(*text.value);
+        /*
+         * 功能：按章节原文起始码点排序，以便随后验证连续覆盖。
+         * 参数：left、right 为排序期间借用的章节对象，均不允许在比较中修改。
+         * 返回：left 起点早于 right 时为真。失败：比较本身无业务错误。
+         * 副作用：lambda 只读；外层 sort 重排按值取得的 chapters；线程：同步，引用不逃逸。
+         */
         std::sort(chapters.begin(), chapters.end(), [](const auto& left, const auto& right) {
             return left.start_codepoint < right.start_codepoint;
         });

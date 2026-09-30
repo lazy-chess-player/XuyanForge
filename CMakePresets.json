@@ -3,7 +3,7 @@
   "configurePresets": [
     {
       "name": "windows-dev",
-      "displayName": "Windows development",
+      "displayName": "桌面开发构建",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-dev",
       "cacheVariables": {
@@ -13,7 +13,7 @@
     },
     {
       "name": "windows-release",
-      "displayName": "Windows release",
+      "displayName": "桌面发行构建",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-release",
       "cacheVariables": {
@@ -22,7 +22,7 @@
     },
     {
       "name": "core-dev",
-      "displayName": "Headless core development",
+      "displayName": "无界面核心开发构建",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/core-dev",
       "cacheVariables": {
@@ -49,4 +49,3 @@
     }
   ]
 }
-

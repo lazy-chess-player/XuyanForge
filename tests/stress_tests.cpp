@@ -13,12 +13,26 @@
 
 namespace {
 
-/** @brief 将压力回归的失败条件转换为可报告的异常。 */
+/*
+ * 功能：把压力断言失败交给入口统一报告。
+ * 参数：condition：输入，true 为通过；message：输入，失败场景说明，可为空，只读引用在调用期间借用。
+ * 返回：无。
+ * 失败：condition 为 false 抛带 message 的 runtime_error，异常分配失败传播。
+ * 副作用：不打印，不改变被测数据。
+ * 线程与生命周期：调用线程同步执行，不保留引用。
+ */
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-/** @brief 移除本次压力测试的数据库及 SQLite 旁路文件。 */
+/*
+ * 功能：移除当前压力测试拥有的数据库及旁路文件。
+ * 参数：path：输入，自有临时数据库路径，只读借用；函数不校验归属，禁止用户工作区。
+ * 返回：无。
+ * 失败：remove 的错误由 error_code 忽略；路径或字符串构造异常可传播。
+ * 副作用：分别删除精确文件及 -wal/-shm，不删除父目录。
+ * 线程与生命周期：同步执行，调用前必须释放连接且不能有其他进程使用路径。
+ */
 void removeDatabase(const std::filesystem::path& path) {
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
@@ -26,14 +40,32 @@ void removeDatabase(const std::filesystem::path& path) {
     std::filesystem::remove(path.string() + "-shm", ignored);
 }
 
-/** @brief 在仓储连接关闭后清理本次压力测试的数据库。 */
+/*
+ * 职责：作用域持有压力测试数据库清理责任，不拥有活动 SQLite 连接。
+ * 生命周期与线程：调用线程最后销毁；仅当前用例使用，不复制到其他清理责任对象。
+ */
 struct DatabaseCleanup final {
+    /* 压力测试拥有的精确数据库路径，无默认值，初始化时写入、析构只读，不接管父目录。 */
     std::filesystem::path path;
-    /** @brief 仅移除压力测试明确使用的数据库文件。 */
+    /*
+     * 功能：在测试仓储销毁后清理数据库及旁路文件。
+     * 参数：无。
+     * 返回：完成清理尝试及守卫销毁。
+     * 失败：文件删除错误忽略；removeDatabase 的路径分配异常未捕获，在隐式 noexcept 析构中可导致终止。
+     * 副作用：只删除 path 及 -wal/-shm，不删除目录，不清理其他素材。
+     * 线程与生命周期：调用线程同步析构，关联连接须先关闭。
+     */
     ~DatabaseCleanup() { removeDatabase(path); }
 };
 
-/** @brief 只在压力测试数据库中生成一万条候选、一个类型化身份候选和一个异世界候选。 */
+/*
+ * 功能：为已初始化的压力测试库生成一万候选，其中末条替换为 v3 身份候选，另生成一个异世界候选。
+ * 参数：path：输入，测试独占临时 SQLite 路径，须已存在所需业务表；只借用本次调用。
+ * 返回：无。
+ * 失败：连接、SQL 执行、准备或替换行数不符时抛 runtime_error；绑定返回值未单独检查。
+ * 副作用：事务插入两世界及候选，提交后单独更新末条；更新失败不会回滚已提交夹具，不联网。
+ * 线程与生命周期：同步创建独立连接和语句，由 unique_ptr 释放；不接管文件所有权。
+ */
 void seedCandidateLoad(const std::filesystem::path& path) {
     sqlite3* opened = nullptr;
     require(sqlite3_open(path.string().c_str(), &opened) == SQLITE_OK && opened != nullptr,
@@ -86,7 +118,14 @@ COMMIT;
 
 } // namespace
 
-/** @brief 导入一万条合成实体并验证分页检索及候选身份建议仍保持精确有界。 */
+/*
+ * 功能：显式生成一万实体及候选，验证首/中/末页、世界隔离、精确身份建议和反复重开成本。
+ * 参数：无。
+ * 返回：断言全部满足返回 0；捕获 std::exception 后报告并返回 1。
+ * 失败：断言不满足抛异常；30 秒限值按实际本机耗时检查，不证明所有平台性能；非标准异常不捕获。
+ * 副作用：重建系统临时 xuyanforge-tests/stress.sqlite，导入合成数据并打印统计，守卫退出尝试删除数据库。
+ * 线程与生命周期：主线程同步执行；固定文件名需由本压力进程独占，仓储先于清理守卫销毁。
+ */
 int main() {
     try {
         const auto path = std::filesystem::temp_directory_path() / "xuyanforge-tests" / "stress.sqlite";
@@ -149,11 +188,11 @@ int main() {
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - started).count();
         require(elapsed < 30, "local 10k-entity import and three paged searches exceeded 30 seconds");
-        std::cout << "XuyanForge 10k-entity stress smoke passed in " << elapsed
-                  << " s; 10 candidate-page reopen cycles: " << reopen_milliseconds << " ms.\n";
+        std::cout << "叙演工坊一万条目压力回归通过，耗时 " << elapsed
+                  << " 秒；候选分页重开 10 次耗时 " << reopen_milliseconds << " 毫秒。\n";
         return 0;
     } catch (const std::exception& exception) {
-        std::cerr << "Stress test failure: " << exception.what() << '\n';
+        std::cerr << "压力测试失败： " << exception.what() << '\n';
         return 1;
     }
 }

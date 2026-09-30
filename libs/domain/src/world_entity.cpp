@@ -6,14 +6,28 @@
 namespace xuyan::domain {
 namespace {
 
-/** @brief 检查实体字段是否包含禁止的控制字符。 */
+/*
+ * 功能：检查世界条目字段的禁用控制字符。
+ * 参数：
+ *   value：借用待检查字节文本，允许制表符。
+ * 返回：有禁用控制字节为true，否则false。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：只读输入。
+ */
 bool containsControl(std::string_view value) {
     return std::any_of(value.begin(), value.end(), [](unsigned char character) {
         return character < 0x20 && character != '\t';
     });
 }
 
-/** @brief 清理实体标签或别名中的空项与重复项。 */
+/*
+ * 功能：清理条目的标签或别名列表，去空、排序并去重。
+ * 参数：
+ *   values：调用者拥有的可变列表；不能依赖原顺序或元素引用。
+ * 返回：无；更新原集合。
+ * 失败：字符串或容器分配可抛标准异常。
+ * 副作用：修改列表，不自动关联实体。
+ */
 void normalizeList(std::vector<std::string>& values) {
     values.erase(std::remove_if(values.begin(), values.end(), [](const auto& value) { return value.empty(); }), values.end());
     std::sort(values.begin(), values.end());
@@ -31,7 +45,7 @@ bool isSupportedEntityKind(std::string_view kind) {
     return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
 }
 
-/** @brief 校验实体的有界字段、分类与审核状态，并规范化别名及标签集合。 */
+
 Result<WorldEntity> validateEntity(WorldEntity entity) {
     if (entity.name.empty() || entity.name.size() > 512 || containsControl(entity.name)) {
         return Result<WorldEntity>::failure(
@@ -39,7 +53,7 @@ Result<WorldEntity> validateEntity(WorldEntity entity) {
     }
     if (!isSupportedEntityKind(entity.kind)) {
         return Result<WorldEntity>::failure(
-            {ErrorCode::validation_failed, "不支持的条目类型", false, "选择已支持类型或使用 other"});
+            {ErrorCode::validation_failed, "不支持的条目类型", false, "选择已支持类型或其他类型"});
     }
     if (entity.description.size() > 1024 * 1024) {
         return Result<WorldEntity>::failure(

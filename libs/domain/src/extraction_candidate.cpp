@@ -30,7 +30,7 @@ Result<ExtractionCandidate> validateExtractionCandidate(ExtractionCandidate cand
     if (candidate.fields_json.empty() || candidate.fields_json.size() > 1024 * 1024
         || candidate.fields_json.front() != '{' || candidate.fields_json.back() != '}')
         return Result<ExtractionCandidate>::failure(
-            {ErrorCode::validation_failed, "候选 fields 必须是受限 JSON 对象", false, "修正输出协议"});
+            {ErrorCode::validation_failed, "候选字段必须是大小受限的结构化对象", false, "修正输出协议"});
     if (std::find(provenance.begin(), provenance.end(), candidate.provenance_type) == provenance.end())
         return Result<ExtractionCandidate>::failure(
             {ErrorCode::validation_failed, "候选来源性质无效", false, "修正来源性质"});

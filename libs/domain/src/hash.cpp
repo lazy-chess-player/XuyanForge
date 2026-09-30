@@ -9,6 +9,7 @@
 namespace xuyan::domain {
 namespace {
 
+// SHA-256标准的64轮只读常量，单位为32位字，所有摘要计算共享，不是业务样例。
 constexpr std::array<std::uint32_t, 64> constants{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -20,7 +21,15 @@ constexpr std::array<std::uint32_t, 64> constants{
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
-/** @brief 将 32 位字按 SHA-256 所需位数循环右移。 */
+/*
+ * 功能：对SHA-256的32位字进行循环右移。
+ * 参数：
+ *   value：输入的无符号32位字。
+ *   amount：循环右移位数，内部调用固定为1—31，不能为0或32。
+ * 返回：右移后回卷高位的32位字。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：只计算整数，不改全局状态。
+ */
 std::uint32_t rotateRight(std::uint32_t value, int amount) {
     return (value >> amount) | (value << (32 - amount));
 }
@@ -28,6 +37,7 @@ std::uint32_t rotateRight(std::uint32_t value, int amount) {
 } // namespace
 
 std::string sha256(std::string_view bytes) {
+    // 独立字节缓冲按512位块填充：末尾附加原始长度（位），不借用调用者内存。
     std::vector<std::uint8_t> message(bytes.begin(), bytes.end());
     const auto bit_length = static_cast<std::uint64_t>(message.size()) * 8;
     message.push_back(0x80);
@@ -36,11 +46,13 @@ std::string sha256(std::string_view bytes) {
         message.push_back(static_cast<std::uint8_t>((bit_length >> shift) & 0xff));
     }
 
+    // 八个32位链式状态字，每块压缩累加；初值由SHA-256标准定义。
     std::array<std::uint32_t, 8> hash{
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     };
     for (std::size_t chunk = 0; chunk < message.size(); chunk += 64) {
+        // 当前块的64字消息调度数组，前16字按大端读取，余下由标准递推生成。
         std::array<std::uint32_t, 64> words{};
         for (std::size_t index = 0; index < 16; ++index) {
             const auto offset = chunk + index * 4;

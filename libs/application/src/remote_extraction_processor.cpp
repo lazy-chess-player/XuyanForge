@@ -23,19 +23,35 @@ using xuyan::domain::ExtractionJobState;
 using xuyan::domain::Result;
 using xuyan::package::JsonValue;
 
-/** @brief 保存本进程正在执行的工作区/任务键；锁只保护集合，不跨越网络或回调。 */
+/*
+ * 远程批次进程内登记表，函数静态对象持有至进程退出，不拥有网络传输或线程。
+ * 仅用于防止同一工作区任务在本进程重复发送，不提供跨进程排他保证。
+ */
 struct ExecutionRegistry {
+    /* 保护 active 的互斥锁，默认未锁定；租约只在登记和释放时持有。 */
     std::mutex mutex;
+    /* 当前被租约占用的工作区/任务键，初始为空，租约构造或析构时更新。 */
     std::unordered_set<std::string> active;
 };
 
-/** @brief 返回跨处理器实例共享的租约注册表。 */
+/*
+ * 功能：取得跨处理器实例共享的进程内执行登记表。
+ * 参数：无。返回：进程寿命内有效的 ExecutionRegistry 引用。
+ * 失败：首次初始化分配异常可传播；副作用：首次调用创建空集合。
+ * 线程：静态初始化安全，访问集合仍须持有 mutex。
+ */
 ExecutionRegistry& executionRegistry() {
     static ExecutionRegistry registry;
     return registry;
 }
 
-/** @brief 以规范 UTF-8 路径标识任务；Windows 的 ASCII 大小写别名归一化。 */
+/*
+ * 功能：把工作区数据库路径与任务 ID 编成进程内排他键。
+ * 参数：database 为借用的数据库路径；job_id 为借用的稳定任务 ID。
+ * 返回：规范路径及任务 ID 的 JSON 数组文本；Windows 仅折叠路径的 ASCII 大小写。
+ * 失败：路径规范化、编码或分配异常可传播；副作用：只读文件系统路径信息，不写数据库。
+ * 线程：同步，不保存路径或任务引用；此键不保证跨进程唯一。
+ */
 std::string executionKey(const std::filesystem::path& database, const std::string& job_id) {
     const auto path = std::filesystem::weakly_canonical(database).generic_u8string();
     std::string encoded(path.begin(), path.end());
@@ -45,44 +61,81 @@ std::string executionKey(const std::filesystem::path& database, const std::strin
     return xuyan::package::writeJson(JsonValue::Array{encoded, job_id});
 }
 
-/** @brief 通过作用域释放执行权，覆盖失败返回与异常；不拥有线程或传输端口。 */
+/*
+ * 单次远程处理的进程内执行租约；成功构造后至析构前占用任务键，禁止复制。
+ * 不拥有线程或传输端口；退出只释放本进程登记，不撤销已经发出的请求。
+ */
 class ExecutionLease {
 public:
-    /** @brief 原子尝试登记任务，不等待已存在的执行者。 */
+    /*
+     * 功能：尝试登记同一工作区任务的进程内唯一执行权，不等待现有执行者。
+     * 参数：database 为工作区路径；job_id 为任务 ID，均只在构造时借用。
+     * 返回：完成租约初始化，通过 acquired() 查询是否取得。
+     * 失败：规范化或分配异常可传播；副作用：成功时向共享集合插入键。
+     * 线程：仅登记时短暂持锁，后续网络和 SQL 不持锁。
+     */
     ExecutionLease(const std::filesystem::path& database, const std::string& job_id)
         : key_(executionKey(database, job_id)) {
         auto& registry = executionRegistry();
         const std::lock_guard lock(registry.mutex);
         acquired_ = registry.active.insert(key_).second;
     }
-    /** @brief 仅释放本实例成功取得的执行权。 */
+    /*
+     * 功能：释放本租约成功登记的任务键；未取得时不触碰共享集合。
+     * 参数：无。返回：无。失败：预期不传播异常。
+     * 副作用：可能移除进程内 active 键；线程：仅释放时短暂持锁，不取消网络调用。
+     */
     ~ExecutionLease() {
         if (!acquired_) return;
         auto& registry = executionRegistry();
         const std::lock_guard lock(registry.mutex);
         registry.active.erase(key_);
     }
+    /* 禁止复制构造，避免同一任务键由两个租约释放；无运行时参数、返回或副作用。 */
     ExecutionLease(const ExecutionLease&) = delete;
+    /* 禁止复制赋值，避免覆盖已有执行权；无运行时参数、返回或副作用。 */
     ExecutionLease& operator=(const ExecutionLease&) = delete;
-    /** @brief 查询是否取得执行权，未取得时禁止领取或发送。 */
+    /*
+     * 功能：查询本对象是否成功登记任务执行权。参数：无。
+     * 返回：已取得为真，否则为假。失败：不抛异常。
+     * 副作用：只读本对象；线程：调用方须保证对象在查询期间存活。
+     */
     bool acquired() const noexcept { return acquired_; }
 private:
+    /* 工作区路径与任务 ID 的编码键；构造时生成，析构后销毁，只由当前租约拥有。 */
     std::string key_;
+    /* 本租约是否成功插入键；初值假，构造时写入、析构时读取。 */
     bool acquired_{false};
 };
 
-/** @brief 检测必须由人工结算或恢复的步骤，防止跳过未知结果继续消耗预算。 */
+/*
+ * 功能：判断检查点是否要求人工处理，阻止未知结果后继续发送。
+ * 参数：job 为调用期间借用的只读任务检查点。
+ * 返回：requires_attention 的当前布尔值。失败：无主动错误。
+ * 副作用：只读任务状态；线程：同步，不保存引用。
+ */
 bool needsAttention(const ExtractionJobState& job) {
     return job.requires_attention;
 }
 
-/** @brief 为同一步骤/尝试生成稳定命令 ID，使领取与完成回报可安全重放。 */
+/*
+ * 功能：由任务、步骤及尝试序号生成稳定的领取或完成命令 ID。
+ * 参数：prefix 为固定操作前缀；job_id 为任务 ID；ordinal 为从 1 开始的步骤序号；
+ * attempt 为该步骤当前尝试次数，均只在调用期间借用或复制。
+ * 返回：带摘要截断值的独立字符串。失败：分配异常可传播。
+ * 副作用：仅内存计算，不写仓储；线程：同步，不保存输入引用。
+ */
 std::string commandId(std::string_view prefix, const std::string& job_id, int ordinal, int attempt) {
     return std::string(prefix) + '-' + xuyan::domain::sha256(job_id + '|' + std::to_string(ordinal)
         + '|' + std::to_string(attempt)).substr(0, 24);
 }
 
-/** @brief 构造可直接展示给用户的校验失败结果，不包含请求正文或凭据。 */
+/*
+ * 功能：把远程任务前置校验失败包装为指定任务结果类型。
+ * 参数：模板 JobResult 为完整任务或检查点类型；message 为按值接收的中文提示，不得含正文或凭据。
+ * 返回：validation_failed 的 Result<JobResult> 失败值。失败：分配异常可传播。
+ * 副作用：仅构造内存对象；线程：同步，不保存输入引用。
+ */
 template<class JobResult = ExtractionJobState>
 Result<JobResult> error(std::string message) {
     return Result<JobResult>::failure(
@@ -139,6 +192,13 @@ Result<RemoteBatchResult> RemoteExtractionProcessor::processBatch(
             // 回调可以取消任务；重新读取后才判断是否允许下一次发送。
             current = jobs.loadState(job_id);
             if (!current.ok()) return BatchResult::failure(*current.error);
+            /*
+             * 功能：停止批次时只读取一次完整任务，并校验与当前轻量检查点同一修订。
+             * 参数：reason 为已确定的停止原因；jobs、job_id、current、processed 只在同步调用期间引用。
+             * 返回：成功时为完整任务、计数及原因，读取或修订冲突时为失败 Result。
+             * 失败：仓储读取及修订检查失败不触发再次发送。
+             * 副作用：只读持久任务；线程：当前批次线程同步执行，捕获不逃逸。
+             */
             const auto stopped = [&](RemoteBatchStopReason reason) {
                 // 仅返回时读取一次完整结果，批次运行过程不复制前序模型输出。
                 auto full = jobs.load(job_id);
@@ -216,6 +276,13 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
     if (!claimed.ok()) return Result<JobResult>::failure(*claimed.error);
     const auto& step = *claimed.value;
     // 所有请求失败均按同一尝试次数持久化，避免状态停留在运行中。
+    /*
+     * 功能：将已领取步骤的失败或未知状态按同一尝试落盘，避免永久停在运行中。
+     * 参数：status 为终态协议值；reason 为不含正文和凭据的中文说明；其余上下文借用至本次同步调用结束。
+     * 返回：完整任务或检查点 Result，具体类型由 JobResult 决定。
+     * 失败：仓储提交失败返回 Result；副作用：更新步骤和预算状态，不自动重发。
+     * 线程：当前处理线程同步执行，捕获局部仓储与步骤不逃逸。
+     */
     const auto finishFailure = [&](const std::string& status, const std::string& reason) {
         if constexpr (std::is_same_v<JobResult, ExtractionJobState>)
             return jobs.finishStepState(commandId("remote-finish", job_id, step.ordinal, step.attempt), job_id,
@@ -269,6 +336,13 @@ Result<JobResult> RemoteExtractionProcessor::processNextUnchecked(const std::str
             {"rejected_candidates", static_cast<std::int64_t>(rejected_candidates)},
             {"candidates", std::move(candidates)}});
         CandidateService ingestion(database_path_);
+        /*
+         * 功能：根据调用方要求把已校验候选提交为完整任务或轻量检查点。
+         * 参数：无；借用当前步骤、候选服务和 output，均在本次同步调用期间有效。
+         * 返回：对应 JobResult 的提交结果，失败保持仓储错误。
+         * 失败：候选及证据校验、修订或持久化错误由 Result 报告。
+         * 副作用：成功时提交候选与步骤；线程：当前处理线程同步执行，捕获不逃逸。
+         */
         const auto commit = [&] {
             if constexpr (std::is_same_v<JobResult, ExtractionJobState>)
                 return ingestion.ingestStepOutputState(commandId("remote-commit", job_id, step.ordinal, step.attempt),

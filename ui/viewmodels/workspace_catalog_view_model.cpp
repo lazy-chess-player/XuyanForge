@@ -1,8 +1,8 @@
 #include "workspace_catalog_view_model.h"
+#include "view_model_text.h"
 
-#include "xuyan/application/workspace_service.h"
+#include "xuyan/application/world_catalog_service.h"
 #include "xuyan/application/source_import_service.h"
-#include "xuyan/storage/workspace_repository.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -30,13 +30,19 @@ WorkspaceCatalogViewModel::WorkspaceCatalogViewModel(std::filesystem::path datab
 
 void WorkspaceCatalogViewModel::refreshWorlds() {
     QPointer<WorkspaceCatalogViewModel> self(this); const auto path = database_path_;
-    QThreadPool::globalInstance()->start([self, path] {
-        xuyan::storage::WorkspaceRepository repository(path);
-        auto result = repository.listWorldTemplates();
+    const auto generation = ++world_listing_generation_;
+    QThreadPool::globalInstance()->start([self, path, generation] {
+        xuyan::domain::Result<std::vector<xuyan::domain::WorldTemplate>> result;
+        try {
+            result = xuyan::application::WorldCatalogService(path).list();
+        } catch (...) {
+            result = decltype(result)::failure({xuyan::domain::ErrorCode::storage_error,
+                "世界目录读取失败", true, "检查工作区后刷新目录"});
+        }
         if (!self) return;
-        QMetaObject::invokeMethod(self, [self, result = std::move(result)]() mutable {
-            if (!self) return;
-            if (!result.ok()) { self->error_text_ = QString::fromStdString(result.error->message); emit self->changed(); return; }
+        QMetaObject::invokeMethod(self, [self, generation, result = std::move(result)]() mutable {
+            if (!self || self->world_listing_generation_ != generation) return;
+            if (!result.ok()) { self->error_text_ = view_model_text::errorText(*result.error); emit self->changed(); return; }
             self->worlds_.clear();
             for (const auto& world : *result.value) self->worlds_.push_back(QVariantMap{
                 {"id", QString::fromStdString(world.id)}, {"name", QString::fromStdString(world.name)},
@@ -52,49 +58,51 @@ void WorkspaceCatalogViewModel::createWorld(QString name, const QUrl& novel_file
     name = name.trimmed();
     if (busy_) return;
     if (name.isEmpty() || name.size() > 120) {
-        error_text_ = QStringLiteral("世界名称不能为空且不能超过 120 个字符"); emit changed(); return;
+        error_text_ = tr("世界名称不能为空且不能超过 120 个字符"); emit changed(); return;
     }
     if (!novel_file.isEmpty() && !novel_file.isLocalFile()) {
-        error_text_ = QStringLiteral("请选择本机纯文本或标记文本小说"); emit changed(); return;
+        error_text_ = tr("请选择本机纯文本或标记文本小说"); emit changed(); return;
     }
     busy_ = true; error_text_.clear(); created_source_id_.clear(); created_chapter_count_ = 0;
-    status_text_ = QStringLiteral("正在创建世界并解析章节…"); emit changed();
+    status_text_ = tr("正在创建世界并解析章节…"); emit changed();
     const auto path = database_path_;
     const auto id = QStringLiteral("world-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
     const auto file = novel_file.isEmpty() ? QString{} : novel_file.toLocalFile();
     QPointer<WorkspaceCatalogViewModel> self(this);
     QThreadPool::globalInstance()->start([self, path, id, name, file] {
-        QString error; QString source_id; int chapters = 0;
+        QString error; QString source_id; int chapters = 0; bool world_created = false;
         try {
-            xuyan::storage::WorkspaceRepository repository(path);
-            auto created = repository.createWorldTemplate(id.toStdString(), name.toStdString());
-            if (!created.ok()) error = QString::fromStdString(created.error->message);
+            xuyan::application::WorldCatalogService catalog(path);
+            auto created = catalog.create(id.toStdString(), name.toStdString());
+            if (!created.ok()) error = view_model_text::errorText(*created.error);
+            else world_created = true;
             if (error.isEmpty() && !file.isEmpty()) {
                 xuyan::application::SourceImportService importer(path);
                 auto imported = importer.importTextFile(
                     QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString(),
                     std::filesystem::path(file.toStdWString()), "1", id.toStdString());
-                if (!imported.ok()) error = QString::fromStdString(imported.error->message);
+                if (!imported.ok()) error = view_model_text::errorText(*imported.error);
                 else {
-                    auto attached = repository.attachWorldSource(id.toStdString(), imported.value->id);
-                    if (!attached.ok()) error = QString::fromStdString(attached.error->message);
+                    auto attached = catalog.attachSource(id.toStdString(), imported.value->id);
+                    if (!attached.ok()) error = view_model_text::errorText(*attached.error);
                     else { source_id = QString::fromStdString(imported.value->id);
                            chapters = static_cast<int>(imported.value->chapters.size()); }
                 }
             }
-        } catch (const std::exception& exception) { error = QString::fromUtf8(exception.what()); }
+        } catch (...) { error = tr("世界创建或小说导入发生内部错误，请检查工作区和文件后重试"); }
         if (!self) return;
-        QMetaObject::invokeMethod(self, [self, error, source_id, chapters, id] {
+        QMetaObject::invokeMethod(self, [self, error, source_id, chapters, id, world_created] {
             if (!self) return;
             self->busy_ = false;
             self->error_text_ = error;
             self->created_source_id_ = source_id;
             self->created_chapter_count_ = chapters;
-            self->active_world_id_ = id;
+            if (world_created) self->active_world_id_ = id;
             self->status_text_ = error.isEmpty()
-                ? (source_id.isEmpty() ? QStringLiteral("空白世界已创建，可稍后导入小说")
-                                       : QStringLiteral("小说已导入，检测到 %1 个章节；请校对后创建提取任务").arg(chapters))
-                : QStringLiteral("世界已创建，但小说导入未完成；请检查文件后重试");
+                ? (source_id.isEmpty() ? tr("空白世界已创建，可稍后导入小说")
+                                       : tr("小说已导入，检测到 %1 个章节；请校对后创建提取任务").arg(chapters))
+                : (world_created ? tr("世界已创建，但小说导入未完成；请检查文件后重试")
+                                 : tr("世界创建未完成，请检查工作区后重试"));
             self->refreshWorlds(); emit self->changed();
             if (error.isEmpty()) emit self->worldCreated();
         }, Qt::QueuedConnection);
@@ -179,45 +187,55 @@ void WorkspaceCatalogViewModel::registerRecent(QString name, const QString& path
     saveRecent(); emit changed();
 }
 
-void WorkspaceCatalogViewModel::restartAt(const QString& path) {
-    QProcess::startDetached(QCoreApplication::applicationFilePath(), {QStringLiteral("--workspace"), path});
+bool WorkspaceCatalogViewModel::restartAt(const QString& path) {
+    if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), {QStringLiteral("--workspace"), path}))
+        return false;
     QCoreApplication::quit();
+    return true;
 }
 
 void WorkspaceCatalogViewModel::initializeAndSwitch(QString name, std::filesystem::path path) {
     if (busy_) return;
-    busy_ = true; error_text_.clear(); status_text_ = QStringLiteral("正在打开工作区…"); emit changed();
+    busy_ = true; error_text_.clear(); status_text_ = tr("正在打开工作区…"); emit changed();
     QPointer<WorkspaceCatalogViewModel> self(this);
     QThreadPool::globalInstance()->start([self, name, path = std::move(path)] {
         QString error;
         try {
-            xuyan::application::WorkspaceService service(path);
-            auto opened = service.openAndList(1);
-            if (!opened.ok()) error = QString::fromStdString(opened.error->message);
-        } catch (const std::exception& exception) { error = QString::fromUtf8(exception.what()); }
+            auto opened = xuyan::application::WorldCatalogService(path).initialize();
+            if (!opened.ok()) error = view_model_text::errorText(*opened.error);
+        } catch (...) { error = tr("工作区操作发生内部错误，请检查资料后重试"); }
         if (!self) return;
         const auto path_text = QDir::toNativeSeparators(QString::fromStdWString(path.wstring()));
         QMetaObject::invokeMethod(self, [self, name, path_text, error] {
             if (!self) return;
             self->busy_ = false;
             if (!error.isEmpty()) { self->error_text_ = error; self->status_text_.clear(); emit self->changed(); return; }
-            self->registerRecent(name, path_text); self->status_text_ = QStringLiteral("正在切换工作区…"); emit self->changed();
-            restartAt(path_text);
+            self->registerRecent(name, path_text); self->status_text_ = tr("正在切换工作区…"); emit self->changed();
+            if (!restartAt(path_text)) {
+                self->error_text_ = tr("无法启动新工作区进程，请检查程序文件与权限后重试");
+                self->status_text_ = tr("切换未完成，当前工作区继续保持打开");
+                emit self->changed();
+            }
         }, Qt::QueuedConnection);
     });
 }
 
 void WorkspaceCatalogViewModel::createWorkspace(QString name) {
+    if (busy_) return;
     name = name.trimmed();
-    if (name.isEmpty() || name.size() > 120) { error_text_ = QStringLiteral("工作区名称不能为空且不能超过 120 个字符"); emit changed(); return; }
+    if (name.isEmpty() || name.size() > 120) { error_text_ = tr("工作区名称不能为空且不能超过 120 个字符"); emit changed(); return; }
     const auto root = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + QStringLiteral("/workspaces/")
         + QUuid::createUuid().toString(QUuid::WithoutBraces);
-    QDir().mkpath(root);
+    if (!QDir().mkpath(root)) {
+        error_text_ = tr("无法创建工作区目录，请检查目录权限和可用空间");
+        emit changed();
+        return;
+    }
     initializeAndSwitch(name, std::filesystem::path((root + QStringLiteral("/workspace.sqlite")).toStdWString()));
 }
 
 void WorkspaceCatalogViewModel::openWorkspace(const QUrl& source) {
-    if (!source.isLocalFile()) { error_text_ = QStringLiteral("请选择本机工作区数据库文件"); emit changed(); return; }
+    if (!source.isLocalFile()) { error_text_ = tr("请选择本机工作区数据库文件"); emit changed(); return; }
     const auto path = source.toLocalFile();
     initializeAndSwitch({}, std::filesystem::path(path.toStdWString()));
 }

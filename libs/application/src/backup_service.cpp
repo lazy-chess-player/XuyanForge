@@ -22,10 +22,21 @@ constexpr std::uintmax_t maximum_asset_file = 128ULL * 1024 * 1024;
 constexpr std::uintmax_t maximum_total = 4ULL * 1024 * 1024 * 1024;
 constexpr int maximum_files = 10000;
 
-/** @brief 构造不暴露资产内容的备份失败结果。 */
+/*
+ * 功能：把备份或恢复失败包装成带操作建议的存储错误，不附加资产正文。
+ * 参数：message 为按值接收的中文原因，移入返回对象；调用方不得传入私密内容。
+ * 返回：不建议自动重试的错误值。失败：字符串分配异常可传播。
+ * 副作用：仅构造内存对象；线程：同步，不保存输入引用。
+ */
 Error backupError(std::string message) { return {ErrorCode::storage_error, std::move(message), false, "检查备份路径、完整性和磁盘空间"}; }
 
-/** @brief 在给定大小上限内读取备份或资产文件。 */
+/*
+ * 功能：先检查文件大小，再以二进制方式读取备份数据库、清单或资产。
+ * 参数：path 为借用至返回的文件路径；limit 为允许的最大字节数，默认 128 MiB。
+ * 返回：独立拥有的文件字节，零字节文件返回空串。
+ * 失败：大小超限、元数据读取或打开失败时抛异常；流中途读错当前实现不单独检查。
+ * 副作用：只读文件；线程：同步，文件流于返回时关闭。
+ */
 std::string readFile(const std::filesystem::path& path, std::uintmax_t limit = maximum_asset_file) {
     const auto size = std::filesystem::file_size(path);
     if (size > limit) throw std::runtime_error("备份文件超过大小上限");
@@ -34,7 +45,12 @@ std::string readFile(const std::filesystem::path& path, std::uintmax_t limit = m
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-/** @brief 创建父目录后完整写入备份文件，写入失败时抛出异常。 */
+/*
+ * 功能：创建目标父目录并将字节写入备份暂存文件。
+ * 参数：path 为写入目标；bytes 为借用至返回的字节视图，允许为空。
+ * 返回：无。失败：建目录、打开或写入失败时抛异常。
+ * 副作用：以截断模式覆盖目标文件；线程：同步，不保留字节视图。
+ */
 void writeFile(const std::filesystem::path& path, std::string_view bytes) {
     std::filesystem::create_directories(path.parent_path());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -43,20 +59,35 @@ void writeFile(const std::filesystem::path& path, std::string_view bytes) {
     if (!output) throw std::runtime_error("写入备份文件失败");
 }
 
-/** @brief 为一次备份或恢复生成同级临时目录路径。 */
+/*
+ * 功能：在正式目标的父目录中生成本次操作的暂存目录名。
+ * 参数：destination 为尚不存在的正式目录路径，借用至返回。
+ * 返回：由目标文件名和单调时钟计数组成的同级路径；不保证跨进程唯一。
+ * 失败：路径或字符串分配异常可传播。副作用：不创建目录；线程：同步，无持久状态。
+ */
 std::filesystem::path stagingPath(const std::filesystem::path& destination) {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     return destination.parent_path() / (destination.filename().string() + ".partial-" + std::to_string(stamp));
 }
 
-/** @brief 从备份清单读取必需的字符串字段，缺失或类型不符时拒绝。 */
+/*
+ * 功能：从已解析清单中读取必需的字符串字段。
+ * 参数：object 为借用至返回的 JSON 对象；key 为待查字段名视图，调用期间有效。
+ * 返回：字段字符串的独立副本。失败：字段缺失或不是字符串时抛异常，分配异常可传播。
+ * 副作用：只读清单；线程：同步，不保留对象或字段名。
+ */
 std::string requiredString(const JsonValue& object, std::string_view key) {
     const auto* value = object.find(key);
     if (value == nullptr || !value->isString()) throw std::runtime_error("备份清单字段缺失或类型错误");
     return value->string();
 }
 
-/** @brief 拒绝绝对路径、越界分量和资产目录外的备份条目。 */
+/*
+ * 功能：核对清单资产路径仅指向 assets 目录下的规范相对条目，防止恢复越界。
+ * 参数：value 为路径字符串，借用至返回；空值、绝对路径、反斜杠及点分量均无效。
+ * 返回：无；校验通过时不改写路径。失败：非法路径抛异常，路径解析异常可传播。
+ * 副作用：纯内存校验，不访问文件；线程：同步。
+ */
 void validateRelativeAssetPath(const std::string& value) {
     const std::filesystem::path path(value);
     if (path.empty() || path.is_absolute() || value.find('\\') != std::string::npos)

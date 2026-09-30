@@ -55,7 +55,7 @@ Result<ExtractionJob> validateExtractionJob(ExtractionJob job) {
         || job.budget.sample_steps < 0 || job.budget.sample_steps > job.total_steps
         || (!job.budget.price_known && (job.budget.estimated_cost_microunits != 0 || !job.budget.currency.empty())))
         return Result<ExtractionJob>::failure(
-            {ErrorCode::validation_failed, "提取调用、输出 token 或价格预算无效", false, "设置正数硬上限；价格未知时不要填写零费用"});
+            {ErrorCode::validation_failed, "提取调用、输出词元或价格预算无效", false, "设置正数硬上限；价格未知时不要填写零费用"});
     return Result<ExtractionJob>::success(std::move(job));
 }
 

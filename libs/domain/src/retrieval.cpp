@@ -9,7 +9,7 @@ Result<EntityRetrievalScope> validateEntityRetrievalScope(EntityRetrievalScope s
     constexpr std::array allowed{std::string_view{"public"}, std::string_view{"author"}, std::string_view{"restricted"}};
     if (scope.entity_id.empty() || std::find(allowed.begin(), allowed.end(), scope.visibility) == allowed.end())
         return Result<EntityRetrievalScope>::failure(
-            {ErrorCode::validation_failed, "条目检索范围缺少实体或可见性无效", false, "使用 public、author 或 restricted"});
+            {ErrorCode::validation_failed, "条目检索范围缺少实体或可见性无效", false, "选择公开、作者可见或指定人物可见"});
     if (scope.valid_from && scope.valid_to && *scope.valid_from > *scope.valid_to)
         return Result<EntityRetrievalScope>::failure(
             {ErrorCode::validation_failed, "条目生效时间晚于失效时间", false, "修正故事时间范围"});
@@ -30,7 +30,7 @@ Result<RetrievalRequest> validateRetrievalRequest(RetrievalRequest request) {
             {ErrorCode::validation_failed, "检索世界、查询文本或数量上限无效", false, "限制查询为 512 字节、结果为 1—100 条"});
     if (!request.author_view && request.actor_id.empty())
         return Result<RetrievalRequest>::failure(
-            {ErrorCode::validation_failed, "人物视角检索缺少 actor_id", false, "指定人物或改用作者视角"});
+            {ErrorCode::validation_failed, "人物视角检索缺少人物标识", false, "指定人物或改用作者视角"});
     return Result<RetrievalRequest>::success(std::move(request));
 }
 

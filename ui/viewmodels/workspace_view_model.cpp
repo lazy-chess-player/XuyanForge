@@ -1,4 +1,5 @@
 #include "workspace_view_model.h"
+#include "view_model_text.h"
 
 #include "xuyan/application/workspace_service.h"
 #include "xuyan/domain/hash.h"
@@ -120,8 +121,8 @@ void WorkspaceViewModel::loadPage(QString query, QString kind, QString keep_id) 
             result = query.isEmpty() && kind.isEmpty() && offset == 0
                 ? service.openAndList(limit)
                 : service.search(query.toStdString(), kind.toStdString(), offset, limit);
-        } catch (const std::exception& exception) {
-            result = PageResult::failure({xuyan::domain::ErrorCode::storage_error, exception.what(), true,
+        } catch (...) {
+            result = PageResult::failure({xuyan::domain::ErrorCode::storage_error, "工作区操作发生内部错误，请检查资料后重试", true,
                                           "检查工作区后重试"});
         }
         if (!self) return;
@@ -134,7 +135,7 @@ void WorkspaceViewModel::loadPage(QString query, QString kind, QString keep_id) 
 void WorkspaceViewModel::applyPage(PageResult result, const QString& keep_id) {
     busy_ = false;
     if (!result.ok()) {
-        error_text_ = QString::fromStdString(result.error->message);
+        error_text_ = view_model_text::errorText(*result.error);
         emit changed();
         return;
     }
@@ -185,8 +186,8 @@ void WorkspaceViewModel::runEntity(std::function<EntityResult(const std::filesys
         EntityResult result;
         try {
             result = work(path);
-        } catch (const std::exception& exception) {
-            result = EntityResult::failure({xuyan::domain::ErrorCode::storage_error, exception.what(), true,
+        } catch (...) {
+            result = EntityResult::failure({xuyan::domain::ErrorCode::storage_error, "工作区操作发生内部错误，请检查资料后重试", true,
                                             "检查工作区后重试"});
         }
         if (!self) return;
@@ -194,7 +195,7 @@ void WorkspaceViewModel::runEntity(std::function<EntityResult(const std::filesys
             if (!self) return;
             self->busy_ = false;
             if (!result.ok()) {
-                self->error_text_ = QString::fromStdString(result.error->message);
+                self->error_text_ = view_model_text::errorText(*result.error);
                 emit self->changed();
                 return;
             }
@@ -277,10 +278,10 @@ void WorkspaceViewModel::nextPage() {
 void WorkspaceViewModel::mergeSelectedInto(QString target_id) {
     target_id = target_id.trimmed();
     if (busy_ || selected_index_ < 0 || target_id.isEmpty()) return;
-    if (draftAvailable()) { error_text_ = QStringLiteral("合并前请先保存或丢弃当前草稿"); emit changed(); return; }
+    if (draftAvailable()) { error_text_ = tr("合并前请先保存或丢弃当前草稿"); emit changed(); return; }
     const auto source_id = entities_[selected_index_].id; const auto source_revision = entities_[selected_index_].revision;
-    if (target_id.toStdString() == source_id) { error_text_ = QStringLiteral("合并目标不能是当前条目"); emit changed(); return; }
-    busy_ = true; error_text_.clear(); status_text_ = QStringLiteral("正在原子合并条目与引用…"); emit changed();
+    if (target_id.toStdString() == source_id) { error_text_ = tr("合并目标不能是当前条目"); emit changed(); return; }
+    busy_ = true; error_text_.clear(); status_text_ = tr("正在原子合并条目与引用…"); emit changed();
     const auto path = database_path_; const auto command = commandId().toStdString(); QPointer<WorkspaceViewModel> self(this);
     QThreadPool::globalInstance()->start([self, path, command, source_id, source_revision, target_id] {
         xuyan::domain::Result<xuyan::domain::EntityMergeResult> result;
@@ -289,14 +290,14 @@ void WorkspaceViewModel::mergeSelectedInto(QString target_id) {
             auto target = service.load(target_id.toStdString());
             if (!target.ok()) result = decltype(result)::failure(*target.error);
             else result = service.merge(command, source_id, source_revision, target.value->id, target.value->revision);
-        } catch (const std::exception& exception) { result = decltype(result)::failure(
-            {xuyan::domain::ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
+        } catch (...) { result = decltype(result)::failure(
+            {xuyan::domain::ErrorCode::storage_error, "工作区操作发生内部错误，请检查资料后重试", true, "检查工作区后重试"}); }
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, result = std::move(result)]() mutable {
             if (!self) return;
             self->busy_ = false;
-            if (!result.ok()) { self->error_text_ = QString::fromStdString(result.error->message); emit self->changed(); return; }
-            self->status_text_ = QStringLiteral("合并完成，可用记录 %1 拆分恢复").arg(QString::fromStdString(result.value->merge_id));
+            if (!result.ok()) { self->error_text_ = view_model_text::errorText(*result.error); emit self->changed(); return; }
+            self->status_text_ = tr("合并完成，可用记录 %1 拆分恢复").arg(QString::fromStdString(result.value->merge_id));
             self->offset_ = 0; self->loadPage(self->last_query_, self->last_kind_, QString::fromStdString(result.value->target.id));
         }, Qt::QueuedConnection);
     });
@@ -305,21 +306,21 @@ void WorkspaceViewModel::mergeSelectedInto(QString target_id) {
 void WorkspaceViewModel::splitMerge(QString merge_id) {
     merge_id = merge_id.trimmed();
     if (busy_ || merge_id.isEmpty()) return;
-    busy_ = true; error_text_.clear(); status_text_ = QStringLiteral("正在校验并拆分合并记录…"); emit changed();
+    busy_ = true; error_text_.clear(); status_text_ = tr("正在校验并拆分合并记录…"); emit changed();
     const auto path = database_path_; const auto command = commandId().toStdString(); QPointer<WorkspaceViewModel> self(this);
     QThreadPool::globalInstance()->start([self, path, command, merge_id] {
         xuyan::domain::Result<xuyan::domain::EntityMergeResult> result;
         try {
             xuyan::application::WorkspaceService service(path);
             result = service.splitMerge(command, merge_id.toStdString());
-        } catch (const std::exception& exception) { result = decltype(result)::failure(
-            {xuyan::domain::ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
+        } catch (...) { result = decltype(result)::failure(
+            {xuyan::domain::ErrorCode::storage_error, "工作区操作发生内部错误，请检查资料后重试", true, "检查工作区后重试"}); }
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, result = std::move(result)]() mutable {
             if (!self) return;
             self->busy_ = false;
-            if (!result.ok()) { self->error_text_ = QString::fromStdString(result.error->message); emit self->changed(); return; }
-            self->status_text_ = QStringLiteral("拆分完成；双方稳定标识与证据引用已恢复");
+            if (!result.ok()) { self->error_text_ = view_model_text::errorText(*result.error); emit self->changed(); return; }
+            self->status_text_ = tr("拆分完成；双方稳定标识与证据引用已恢复");
             self->offset_ = 0; self->loadPage(self->last_query_, self->last_kind_, QString::fromStdString(result.value->source.id));
         }, Qt::QueuedConnection);
     });
@@ -327,7 +328,7 @@ void WorkspaceViewModel::splitMerge(QString merge_id) {
 
 void WorkspaceViewModel::createEntity(QString name, QString kind, QString description,
                                       QString aliases, QString tags, QString attributes) {
-    if (world_id_.isEmpty()) { error_text_ = QStringLiteral("请先在首页创建或选择世界"); emit changed(); return; }
+    if (world_id_.isEmpty()) { error_text_ = tr("请先在首页创建或选择世界"); emit changed(); return; }
     auto entity = fromForm(std::move(name), std::move(kind), std::move(description),
                            std::move(aliases), std::move(tags), std::move(attributes));
     entity.world_id = world_id_.toStdString();
@@ -335,7 +336,7 @@ void WorkspaceViewModel::createEntity(QString name, QString kind, QString descri
     runEntity([command, entity = std::move(entity)](const auto& path) mutable {
         xuyan::application::WorkspaceService service(path);
         return service.create(command, std::move(entity));
-    }, QStringLiteral("条目已创建"));
+    }, tr("条目已创建"));
 }
 
 void WorkspaceViewModel::saveSelected(QString name, QString kind, QString description,
@@ -355,7 +356,7 @@ void WorkspaceViewModel::saveSelected(QString name, QString kind, QString descri
     runEntity([command, entity = std::move(entity), expected](const auto& path) mutable {
         xuyan::application::WorkspaceService service(path);
         return service.save(command, std::move(entity), expected);
-    }, QStringLiteral("条目修订已保存"));
+    }, tr("条目修订已保存"));
 }
 
 void WorkspaceViewModel::deleteSelected() {
@@ -366,5 +367,5 @@ void WorkspaceViewModel::deleteSelected() {
     runEntity([command, id, expected](const auto& path) {
         xuyan::application::WorkspaceService service(path);
         return service.remove(command, id, expected);
-    }, QStringLiteral("条目已移入修订历史"));
+    }, tr("条目已移入修订历史"));
 }

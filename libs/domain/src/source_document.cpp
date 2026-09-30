@@ -2,11 +2,19 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 
 namespace xuyan::domain {
 namespace {
 
-/** @brief 根据首字节判定 UTF-8 序列宽度；非法首字节返回零。 */
+/*
+ * 功能：按首字节位模式识别UTF-8候选序列长度。
+ * 参数：
+ *   first：输入首字节的无符号值，不是已解码Unicode码点。
+ * 返回：候选宽度1—4字节；不符合首字节模式为0，仍须validateSequence校验。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：只进行整数计算。
+ */
 std::size_t sequenceLength(unsigned char first) {
     if (first <= 0x7f) return 1;
     if ((first & 0xe0) == 0xc0) return 2;
@@ -15,7 +23,16 @@ std::size_t sequenceLength(unsigned char first) {
     return 0;
 }
 
-/** @brief 校验单个 UTF-8 序列的续字节、最短编码、代理项和 Unicode 上界。 */
+/*
+ * 功能：检查一个UTF-8序列的边界、续字节、最短编码和Unicode范围。
+ * 参数：
+ *   text：借用完整字节序列。
+ *   offset：从零开始的字节偏移，非码点位置。
+ *   length：候选字节宽度，调用者由sequenceLength取得0—4。
+ * 返回：序列合法为true，截断/代理项/越界/非最短编码为false。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：只读文本，不做编码修复。
+ */
 bool validateSequence(std::string_view text, std::size_t offset, std::size_t length) {
     if (length == 0 || offset + length > text.size()) return false;
     const auto first = static_cast<unsigned char>(text[offset]);
@@ -31,14 +48,29 @@ bool validateSequence(std::string_view text, std::size_t offset, std::size_t len
     return true;
 }
 
-/** @brief 去除章节标题两端的 ASCII 空格和制表符并返回独立字符串。 */
+/*
+ * 功能：复制标题文本，去除两端ASCII空格及制表符，不删除其他字符。
+ * 参数：
+ *   text：调用期间借用的字节文本。
+ * 返回：独立拥有的去边界空白字符串，原文不改。
+ * 失败：字符串或容器分配可抛标准异常。
+ * 副作用：仅分配返回字符串。
+ */
 std::string trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
     while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1);
     return std::string{text};
 }
 
-/** @brief 识别 Markdown 标题或中文章回标题，并把识别出的标题写入输出参数。 */
+/*
+ * 功能：识别1—6级Markdown或以中文序数开头的短章回标题。
+ * 参数：
+ *   line：调用期间借用的一行原文，不含行分隔符。
+ *   title：调用者拥有的输出字符串；命中写标题，未命中不保证清空旧值。
+ * 返回：命中有效非空标题为true，否则false；中文标题最多96字节，此启发式不证明正文结构。
+ * 失败：字符串或容器分配可抛标准异常。
+ * 副作用：可能改写title，不修改原文。
+ */
 bool isHeading(std::string_view line, std::string& title) {
     auto clean = trim(line);
     if (clean.empty()) return false;
@@ -58,7 +90,15 @@ bool isHeading(std::string_view line, std::string& title) {
     return false;
 }
 
-/** @brief 从文本开头扫描到目标码点，返回其 UTF-8 字节起点。 */
+/*
+ * 功能：从合法UTF-8文本起点线性定位一个码点位置。
+ * 参数：
+ *   text：已验证合法的UTF-8文本；非法输入可能使扫描不前进，调用者必须先验证。
+ *   target：零基码点偏移，须不超文本码点总数；末端返回字节总长。
+ * 返回：目标码点对应的零基字节起点。
+ * 失败：约束内的纯计算不产生业务异常；调用者须遵守参数前置条件。
+ * 副作用：只读扫描，不复制正文。
+ */
 std::size_t byteAtCodepoint(std::string_view text, std::size_t target) {
     std::size_t byte = 0;
     std::size_t codepoint = 0;
@@ -110,6 +150,11 @@ std::size_t utf8CodepointCount(std::string_view utf8) {
 }
 
 Result<std::vector<SourceChapter>> detectChapters(std::string_view text, std::string_view document_id) {
+    // 计数接口的0同时表示空串和非法编码；先区分，避免生成看似合法的零码点索引。
+    if (!text.empty() && utf8CodepointCount(text) == 0)
+        return Result<std::vector<SourceChapter>>::failure(
+            {ErrorCode::validation_failed, "章节检测输入不是合法的统一编码文本", false, "先解码并规范化来源正文"});
+    // 每项拥有标题副本和正文中的零基字节起点，不复制章节正文。
     std::vector<std::pair<std::size_t, std::string>> headings;
     std::size_t line_start = 0;
     while (line_start <= text.size()) {
@@ -129,11 +174,9 @@ Result<std::vector<SourceChapter>> detectChapters(std::string_view text, std::st
     std::vector<SourceChapter> chapters;
     chapters.reserve(headings.size());
     std::size_t cumulative_codepoints = 0;
-    std::size_t previous_byte = 0;
-    // 相邻标题之间的字节和码点范围在同一轮累积，避免每章从头重复扫描。
+    // 每个章节正文只计数一次，累加形成双锚点，避免重复扫描上一章节。
     for (std::size_t index = 0; index < headings.size(); ++index) {
         const auto start = headings[index].first;
-        cumulative_codepoints += utf8CodepointCount(text.substr(previous_byte, start - previous_byte));
         const auto end = index + 1 < headings.size() ? headings[index + 1].first : text.size();
         SourceChapter chapter;
         chapter.id = std::string(document_id) + "-chapter-" + std::to_string(index + 1);
@@ -144,13 +187,16 @@ Result<std::vector<SourceChapter>> detectChapters(std::string_view text, std::st
         chapter.start_codepoint = cumulative_codepoints;
         chapter.end_codepoint = cumulative_codepoints + utf8CodepointCount(text.substr(start, end - start));
         chapters.push_back(std::move(chapter));
-        previous_byte = start;
+        cumulative_codepoints = chapters.back().end_codepoint;
     }
     return Result<std::vector<SourceChapter>>::success(std::move(chapters));
 }
 
 Result<std::string> codepointSlice(std::string_view utf8, std::size_t start, std::size_t end) {
     const auto count = utf8CodepointCount(utf8);
+    if (!utf8.empty() && count == 0)
+        return Result<std::string>::failure(
+            {ErrorCode::validation_failed, "原文切片输入编码无效", false, "先规范化来源正文"});
     if (end < start || end > count) {
         return Result<std::string>::failure(
             {ErrorCode::validation_failed, "证据码点区间超出标准化文本", false, "重新定位来源证据"});

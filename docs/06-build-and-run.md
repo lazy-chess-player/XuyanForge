@@ -38,13 +38,17 @@ cmake --build build/linux-core-dev
 ctest --test-dir build/linux-core-dev --output-on-failure
 ```
 
-界面和测试同时启用时，CTest 运行 `core_tests`、`stress_tests`、`tst_qmltests` 和 `tst_world_views_vm`，找到 Python 解释器时另运行 `contract_tests`；`check-contracts` 仍是独立构建目标。`tst_qmltests` 使用离屏平台和内存工作区替身，视图模型测试使用独立临时工作区；二者都不读取用户工作区、不发模型请求。可按单个 QML 用例输出 JUnit：
+界面和测试同时启用时，CTest运行`core_tests`、`stress_tests`、`storage_support_tests`、`domain_boundary_tests`、`application_catalog_tests`、`tst_qmltests`和`tst_world_views_vm`。找到Python时另运行`contract_tests`、`development_standards_tests`及`development_standards`，共10项；`check-contracts`仍是独立构建目标。Qt Quick采用离屏平台和内存替身，视图模型及目录用例使用独占临时工作区，不读取用户资料或发送模型请求。可按单个QML用例输出JUnit：
 
 ```powershell
 ./build/windows-dev/tst_qmltests.exe -o ./build/qmltests.xml,junitxml
 ```
 
 纯核心预设不生成 Qt Quick 测试目标；正式发行构建关闭 `XUYANFORGE_BUILD_TESTS` 后也不需要 Qt QuickTest。契约可单独执行 `python tools/validate_contracts.py`（WSL 用 `python3`），脚本仅使用标准库，不需要额外 jsonschema 包。它只覆盖本仓库使用的部分关键字与选定夹具，不等于完整 JSON Schema 运行时校验器。Qt Quick 组件测试不能替代完整 UI 端到端、中文输入法或真实系统对话框验收。
+
+构建边界：根`CMakeLists.txt`配置版本、工具链与开关；`libs/CMakeLists.txt`管理纯C++库，`ui/CMakeLists.txt`管理Qt传输、桌面和工具，`tests/CMakeLists.txt`只在启用测试时加入。`version.json`是版本唯一入口，数字版本和内部渠道用于构建身份，`displayName`用于中文展示；构建生成`release-version.json`，打包发现与源码不一致时拒绝继续。
+
+规范静态检查可单独执行`python tools/check_development_standards.py`，其回归为`python -m unittest discover -s tools -p test_development_standards.py -v`。扫描不代替逐函数契约审查、中文交互或空首启/包隔离验收。
 
 应用数据存放在 Qt 返回的 `AppLocalDataLocation` 中，不写入源码仓库。首次启动使用空白的 `workspace.sqlite`；不会自动创建世界、来源或人物资料。界面左侧选择项目，右侧新建世界并导入小说，可在侧栏切换深色和浅色主题。
 
@@ -152,7 +156,7 @@ cmake --build --preset windows-release
 ./tools/package-windows.ps1
 ```
 
-脚本只接受项目目录内的构建/输出路径，并用 `windeployqt` 收集 Qt/QML、平台、运行库与 TLS 组件。XF-02 已验证全新暂存目录与便携包资源隔离；当前剩余工作由 XF-29 跟踪，包括版本统一及无 Qt SDK 的 Windows 安装/升级验收。不能将复用旧输出目录生成的包直接视为已无素材残留的正式发行包。
+脚本只接受项目 `build` 下相互分离的构建/输出路径，并用 `windeployqt` 收集 Qt/QML、平台、运行库与 TLS 组件。数字版本、发行渠道及中文展示名称统一来自根目录 `version.json`，打包前核对构建目录的冻结副本。2026-09-30 已在本机新部署目录验证移除 Qt SDK 路径后启动并截图；这不等同于独立干净 Windows 的安装、升级或卸载验收，后者仍由 XF-29 跟踪。不能将复用旧输出目录生成的包直接视为无素材残留的正式发行包。
 
 生成便携 ZIP：
 

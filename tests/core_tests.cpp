@@ -49,12 +49,26 @@
 
 namespace {
 
-/** @brief 把测试断言失败转成包含具体场景说明的异常。 */
+/*
+ * 功能：把测试断言失败转成包含具体场景说明的异常。
+ * 参数：condition：输入，true 表示通过；message：输入，失败说明，可为空，只读引用仅在调用期间借用。
+ * 返回：无。
+ * 失败：condition 为 false 时抛出带 message 的 runtime_error，分配失败继续传播。
+ * 副作用：通过时不改变状态，失败由调用方统一报告。
+ * 线程与生命周期：同步执行，不保存消息引用。
+ */
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-/** @brief 从临时测试数据库读取单行整数结果并自动释放查询语句。 */
+/*
+ * 功能：从临时测试数据库读取单行整数结果并自动释放查询语句。
+ * 参数：database：输入，已打开的测试连接观察指针，不接管所有权；sql：输入，非空零结尾只读语句，仅本次调用借用。
+ * 返回：首行首列经 sqlite3_column_int64 转换的整数，不额外检查列类型或更多行。
+ * 失败：准备失败或首步不是 SQLITE_ROW 时抛出 SQLite 原因；空指针由调用方禁止。
+ * 副作用：执行传入语句并自动 finalize，不关闭连接；调用方须保证 SQL 只读。
+ * 线程与生命周期：在连接所属线程同步执行，语句不逃逸。
+ */
 std::int64_t sqliteScalar(sqlite3* database, const char* sql) {
     sqlite3_stmt* prepared = nullptr;
     if (sqlite3_prepare_v2(database, sql, -1, &prepared, nullptr) != SQLITE_OK)
@@ -64,14 +78,28 @@ std::int64_t sqliteScalar(sqlite3* database, const char* sql) {
     return sqlite3_column_int64(query.get(), 0);
 }
 
-/** @brief 返回核心测试共用的系统临时数据库路径。 */
+/*
+ * 功能：返回核心测试共用的系统临时数据库路径。
+ * 参数：无。
+ * 返回：系统临时目录下 xuyanforge-tests/workspace.sqlite 的路径值。
+ * 失败：临时路径获取或建目录失败抛出 filesystem_error，分配异常传播。
+ * 副作用：创建测试父目录，不创建数据库或读取生产工作区。
+ * 线程与生命周期：同步执行；文件名固定，须由本进程独占，不能多进程同时运行。
+ */
 std::filesystem::path temporaryDatabase() {
     auto path = std::filesystem::temp_directory_path() / "xuyanforge-tests";
     std::filesystem::create_directories(path);
     return path / "workspace.sqlite";
 }
 
-/** @brief 清理指定测试数据库及其日志旁路文件，避免历史测试状态干扰。 */
+/*
+ * 功能：清理指定测试数据库及其日志旁路文件，避免历史测试状态干扰。
+ * 参数：path：输入，调用方拥有的测试临时数据库路径，调用期间借用；本函数不校验归属。
+ * 返回：无。
+ * 失败：remove 的错误由被忽略的 error_code 消耗，路径/字符串构造异常仍可传播。
+ * 副作用：分别删除精确数据库及 -wal/-shm 文件，不递归删除父目录。
+ * 线程与生命周期：同步执行，调用前应关闭连接并保证没有其他线程或进程使用该路径。
+ */
 void removeDatabase(const std::filesystem::path& path) {
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
@@ -79,7 +107,14 @@ void removeDatabase(const std::filesystem::path& path) {
     std::filesystem::remove(path.string() + "-shm", ignored);
 }
 
-/** @brief 验证合成领域状态的操作约束、知识隔离和修订行为。 */
+/*
+ * 功能：验证合成领域状态的操作约束、知识隔离和修订行为。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：仅在内存验证物品转移、角色知识和修订，不读写磁盘。
+ * 线程与生命周期：同步执行，状态值只在本用例内存活。
+ */
 void testDomainRules() {
     using namespace xuyan::domain;
     const auto initial = xuyan::test::makeSyntheticInitialState();
@@ -101,7 +136,14 @@ void testDomainRules() {
             "private inspection must not leak to another actor");
 }
 
-/** @brief 验证打开空工作区不生成世界或分支，根分支只能由调用方显式创建。 */
+/*
+ * 功能：验证打开空工作区不生成世界或分支，根分支只能由调用方显式创建。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：重建 explicit-root.sqlite，显式创建测试根并拒绝重复创建，正常末尾删除库。
+ * 线程与生命周期：固定临时文件名须由本进程独占；同步执行。
+ */
 void testExplicitSyntheticInitializationOnly() {
     const auto path = temporaryDatabase().parent_path() / "explicit-root.sqlite";
     removeDatabase(path);
@@ -126,7 +168,14 @@ void testExplicitSyntheticInitializationOnly() {
     removeDatabase(path);
 }
 
-/** @brief 验证任意人数的快照完整往返，并拒绝重复角色和被篡改的内容。 */
+/*
+ * 功能：验证任意人数的快照完整往返，并拒绝重复角色和被篡改的内容。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：创建 0/1/3 人快照，重开、分叉、插入重复人物并篡改摘要，正常末尾删除各库。
+ * 线程与生命周期：同步执行，仓储按阶段作用域释放，测试路径不能被其他进程使用。
+ */
 void testGenericSnapshotRoundTrip() {
     using xuyan::domain::ScenarioState;
     const auto directory = temporaryDatabase().parent_path();
@@ -191,7 +240,14 @@ void testGenericSnapshotRoundTrip() {
     }
 }
 
-/** @brief 为迁移回归创建旧版列形态，可选写入一条无法转换的提交。 */
+/*
+ * 功能：为迁移回归创建旧版列形态，可选写入一条无法转换的提交。
+ * 参数：database：输入，测试独占且已打开的 SQLite 观察指针；with_row：输入，true 插入一条旧快照，false 只建空表。
+ * 返回：无。
+ * 失败：建表/插入失败由 require 抛出 runtime_error，不回滚先前已成功的建表。
+ * 副作用：只向测试库建 state_snapshot 并按开关写旧格式行，不关闭连接。
+ * 线程与生命周期：同步使用所属线程连接，由调用方管理连接生命周期。
+ */
 void createOldSnapshotSchema(sqlite3* database, bool with_row) {
     constexpr auto schema =
         "CREATE TABLE state_snapshot("
@@ -208,7 +264,14 @@ void createOldSnapshotSchema(sqlite3* database, bool with_row) {
                 "old snapshot row must be created");
 }
 
-/** @brief 验证旧快照明确拒绝且保留原文件，空旧表可保留其他世界资料升级。 */
+/*
+ * 功能：验证旧快照明确拒绝且保留原文件，空旧表可保留其他世界资料升级。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：构造两种旧列数据库，核对拒绝时保留原数据/版本及空表升级，正常末尾删除文件。
+ * 线程与生命周期：同步执行，原生连接与查询在正常路径显式释放。
+ */
 void testLegacySnapshotRejectionAndEmptySchemaUpgrade() {
     const auto directory = temporaryDatabase().parent_path();
     const auto unsupported = directory / "unsupported-snapshot.sqlite";
@@ -274,14 +337,28 @@ void testLegacySnapshotRejectionAndEmptySchemaUpgrade() {
     removeDatabase(empty);
 }
 
-/** @brief 用固定向量验证 SHA-256 计算结果。 */
+/*
+ * 功能：用固定向量验证 SHA-256 计算结果。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：只计算内存中公开 abc 向量的 SHA-256，不读文件。
+ * 线程与生命周期：调用线程同步执行，摘要值随用例销毁。
+ */
 void testSha256() {
     require(xuyan::domain::sha256("abc") ==
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             "SHA-256 implementation must match the published abc test vector");
 }
 
-/** @brief 检查文本编码识别、换行标准化和非法输入拒绝。 */
+/*
+ * 功能：检查文本编码识别、换行标准化和非法输入拒绝。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：只解码内存中的 UTF-16 字节、代理对和换行；Windows 另检查 GB18030，不导入文件。
+ * 线程与生命周期：调用线程同步执行，输入缓冲区只借用当前调用。
+ */
 void testSourceEncodingDetection() {
     const std::string utf16le{"\xff\xfe\x2d\x4e\x87\x65\x3d\xd8\x42\xde\x0d\x00\x0a\x00", 14};
     auto decoded_utf16 = xuyan::application::decodeSourceText(utf16le);
@@ -300,7 +377,14 @@ void testSourceEncodingDetection() {
             "truncated UTF-16 input must be rejected instead of repaired silently");
 }
 
-/** @brief 验证 JSON 往返与结构限制，以及 ZIP 安全路径和完整性校验。 */
+/*
+ * 功能：验证 JSON 往返与结构限制，以及 ZIP 安全路径和完整性校验。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：在固定临时目录写安全/恶意 ZIP，验证路径、CRC 与总量约束，正常末尾清理。
+ * 线程与生命周期：同步执行，固定 ZIP 目录须由本进程独占。
+ */
 void testJsonAndSafeZipPrimitives() {
     using xuyan::package::JsonValue;
     JsonValue value(JsonValue::Object{
@@ -356,7 +440,14 @@ void testJsonAndSafeZipPrimitives() {
     std::filesystem::remove_all(directory, ignored);
 }
 
-/** @brief 验证提交恢复、命令去重、知识范围和分支隔离的持久化契约。 */
+/*
+ * 功能：验证提交恢复、命令去重、知识范围和分支隔离的持久化契约。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：在临时库推进三回合、重放、暂停恢复、备份和分叉，正常末尾删除主库及备份。
+ * 线程与生命周期：同步执行，合成推进会阻塞模拟延迟；仓储连接分作用域释放。
+ */
 void testPersistenceRecoveryDedupAndBranchIsolation() {
     const auto path = temporaryDatabase();
     const auto backup_path = path.parent_path() / "workspace-backup.sqlite";
@@ -427,7 +518,14 @@ void testPersistenceRecoveryDedupAndBranchIsolation() {
     removeDatabase(backup_path);
 }
 
-/** @brief 用不同字节分片尺寸验证 SSE 事件边界、UTF-8 和终止帧。 */
+/*
+ * 功能：用不同字节分片尺寸验证 SSE 事件边界、UTF-8 和终止帧。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：在内存按所有字节分片尺寸解析 SSE，检查 UTF-8、截断和缓存上限，不联网。
+ * 线程与生命周期：同步执行，每轮拥有独立解析器。
+ */
 void testIncrementalSseParsing() {
     const std::string stream =
         "event: delta\r\nid: 7\r\ndata: {\"text\":\"测试场景🙂\"}\r\n\r\n"
@@ -459,7 +557,14 @@ void testIncrementalSseParsing() {
     require(!bounded.feed("data: this response is too large").ok(), "configured buffer limit must be enforced");
 }
 
-/** @brief 验证各原生厂商协议的请求与结构化响应转换。 */
+/*
+ * 功能：验证各原生厂商协议的请求与结构化响应转换。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：在内存构造四种厂商请求并解析合成响应，验证推理配置与错误分类，不发网络请求。
+ * 线程与生命周期：同步执行，协议值对象不依赖真实模型或凭据。
+ */
 void testNativeProviderProtocolAdapters() {
     using xuyan::providers::ProviderProtocol;
     const xuyan::providers::StructuredGenerationRequest request{
@@ -525,10 +630,29 @@ void testNativeProviderProtocolAdapters() {
             "DeepSeek must use its current Responses API for native JSON Schema output");
 }
 
-/** @brief 检查模型网关响应解析及凭据只在传输边界可见。 */
+/*
+ * 功能：检查模型网关响应解析及凭据只在传输边界可见。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：写测试连接元数据，用伪凭据及传输替身，读库字节检查泄露并尝试删除测试库。
+ * 线程与生命周期：同步执行，内存凭据和替身只在本用例存活；不联网。
+ */
 void testProviderGenerationGatewayAndCredentialIsolation() {
+    /*
+     * 职责：仅为网关请求及凭据隔离回归提供无网络传输替身，拥有计数和自有响应配置。
+     * 生命周期与线程：局部于当前用例，调用线程同步使用；不拥有数据库、连接或工作线程。
+     */
     class FakeTransport final : public xuyan::application::IProviderTransport {
     public:
+        /*
+         * 功能：为网关请求及凭据隔离回归模拟传输边界。
+         * 参数：request：输入，请求的只读引用，校验正文及凭据排除；credential：输入，伪凭据只读引用，不保存；timeout_ms：输入，毫秒，断言为 30000。
+         * 返回：固定 HTTP 200、自有结构化网关响应及合成用量。
+         * 失败：边界断言失败抛 runtime_error；throw_after_validation 注入异常；JSON/字符串构造异常传播。
+         * 副作用：标记 called；只返回合成响应，不发网络、不写凭据。
+         * 线程与生命周期：调用线程同步执行；请求/凭据引用不逃逸，钩子捕获资源须覆盖 send 调用；成员仅用于本用例。
+         */
         xuyan::domain::Result<xuyan::application::ProviderTransportResponse> send(
             const xuyan::providers::ProviderHttpRequest& request,
             const std::string& credential, int timeout_ms) override {
@@ -548,7 +672,9 @@ void testProviderGenerationGatewayAndCredentialIsolation() {
                 200, false, false,
                 R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"ok\":true,\"provider\":\"deepseek\"}"}]}],"usage":{"input_tokens":31,"output_tokens":12}})"});
         }
+        /* 是否到达传输边界，默认 false，send 首先置 true，测试读断言，无外部资源。 */
         bool called{false};
+        /* 校验后异常注入开关，默认 false，测试设置、send 读取，不代表真实凭据。 */
         bool throw_after_validation{false};
     };
 
@@ -582,7 +708,14 @@ void testProviderGenerationGatewayAndCredentialIsolation() {
     removeDatabase(path);
 }
 
-/** @brief 只在测试调用时组装四类自有候选文本，不参与正式程序或资源链接。 */
+/*
+ * 功能：只在测试调用时组装四类自有候选文本，不参与正式程序或资源链接。
+ * 参数：无。
+ * 返回：拥有 v3 版本、四类各一条候选及自有引文的 JsonValue 值。
+ * 失败：内存分配或 JSON 值构造异常传播。
+ * 副作用：仅组装合成内存数据，不写文件、网络或生产资源。
+ * 线程与生命周期：同步创建，返回对象拥有字段，寿命由调用方管理。
+ */
 xuyan::package::JsonValue typedResponseFixture() {
     using xuyan::package::JsonValue;
     return JsonValue::Object{
@@ -598,7 +731,14 @@ xuyan::package::JsonValue typedResponseFixture() {
             {"fields", JsonValue::Object{{"scope", "学徒"}, {"statement", "通过考核才能入门"}, {"modality", "obligation"}}}}}}};
 }
 
-/** @brief 验证四类版本化字段、封闭属性、证据标识、长度与请求文本的数据边界。 */
+/*
+ * 功能：验证四类版本化字段、封闭属性、证据标识、长度与请求文本的数据边界。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：修改合成四类响应检查属性封闭/上限，读取仓库内公开 v3 Schema 核对实际发送契约。
+ * 线程与生命周期：同步执行，变异 JSON 为值副本，不读取外部私有素材。
+ */
 void testTypedExtractionOutputContract() {
     using xuyan::package::JsonValue;
     using xuyan::package::writeJson;
@@ -623,13 +763,27 @@ void testTypedExtractionOutputContract() {
                     == writeJson(*fixture.find(group)->array()[0].find("fields")),
                 "typed parser must retain every type-specific field rather than only title and quote");
     }
-    /** @brief 验证根协议或整份输出错误被拒绝，且错误信息不回显测试原文。 */
+    /*
+     * 功能：断言整份类型化输出拒绝且错误不回显原文。
+     * 参数：modified：输入，响应值副本，可自由变异；reason：输入，失败场景说明，只读借用。
+     * 返回：无。
+     * 失败：解析或脱敏断言失败抛 runtime_error，序列化/分配异常传播。
+     * 副作用：仅检查合成响应，不写库。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto rejects = [&](JsonValue modified, const std::string& reason) {
         auto rejected = parseTypedExtractionResponse(writeJson(modified));
         require(!rejected.ok() && rejected.error->message.find("青岚") == std::string::npos,
                 "invalid typed output must fail without echoing source data: " + reason);
     };
-    /** @brief 验证一条语义无效候选被隔离，同时保留夹具中的三条合法候选。 */
+    /*
+     * 功能：断言一个非法候选被隔离且三条合法项保留。
+     * 参数：modified：输入，响应值副本；reason：输入，断言场景说明，只读借用。
+     * 返回：无。
+     * 失败：解析、合法数或淘汰数断言失败抛异常。
+     * 副作用：在本次调用局部记录淘汰数，不写库。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto filters = [&](JsonValue modified, const std::string& reason) {
         std::size_t rejected_count = 0;
         auto accepted = parseTypedExtractionResponse(writeJson(modified), &rejected_count);
@@ -782,7 +936,14 @@ void testTypedExtractionOutputContract() {
             "published wire contract and actual provider schema must not drift");
 }
 
-/** @brief 验证类型化提取到入库、重放、审核和版本缓存的纵向闭环，完全使用伪传输。 */
+/*
+ * 功能：验证类型化提取到入库、重放、审核和版本缓存的纵向闭环，完全使用伪传输。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：独占目录写自有原文，模拟传输、入库、重放、审核、版本缓存及统计伪造，退出清理。
+ * 线程与生命周期：同步执行，仓储对象先于目录守卫释放，凭据只存在内存。
+ */
 void testTypedExtractionPersistenceAndVersionIsolation() {
     using xuyan::package::JsonValue;
     using xuyan::package::writeJson;
@@ -790,17 +951,51 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
     const auto directory = parent / ("typed-contract-" + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(std::filesystem::create_directory(directory), "typed contract test requires a fresh owned directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path root;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 接管本测试刚创建的目录清理责任，不读取或接管用户素材目录。 */
+        /*
+         * 功能：接管本用例已创建目录的清理责任。
+         * 参数：owned_root：输入，独占临时目录路径值，移动保存；expected_parent：输入，已核实的父目录路径值，移动保存；均不能为空。
+         * 返回：完成守卫初始化。
+         * 失败：路径移动/构造异常传播；构造不校验路径归属，调用方须先核实并创建。
+         * 副作用：只保存路径，不扫描、不删除目录。
+         * 线程与生命周期：在调用线程创建，守卫必须晚于所有数据库及文件对象销毁。
+         */
         Cleanup(std::filesystem::path owned_root, std::filesystem::path expected_parent)
             : root(std::move(owned_root)), parent(std::move(expected_parent)) {}
-        /** @brief 禁止复制目录清理责任，避免两个对象重复清理同一路径。 */
+        /*
+         * 功能：禁止复制目录清理责任。
+         * 参数：未命名 Cleanup 引用：输入，拟复制的源守卫。
+         * 返回：不产生对象。
+         * 失败：调用在编译期拒绝。
+         * 副作用：无，不共享或重复接管清理责任。
+         * 线程与生命周期：不可复制，源守卫仍管理原目录。
+         */
         Cleanup(const Cleanup&) = delete;
-        /** @brief 禁止通过赋值转移或覆盖已有清理责任。 */
+        /*
+         * 功能：禁止赋值覆盖目录清理责任。
+         * 参数：未命名 Cleanup 引用：输入，拟赋值的源守卫。
+         * 返回：无可调用返回值，赋值被禁止。
+         * 失败：调用在编译期拒绝。
+         * 副作用：无，不丢弃现有目录所有权。
+         * 线程与生命周期：不可赋值，各守卫的责任保持独立。
+         */
         Cleanup& operator=(const Cleanup&) = delete;
-        /** @brief 异常或成功退出时，只清理本测试新建且父路径匹配的素材目录。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配且目录名前缀正确时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             std::error_code ignored;
             if (root.parent_path() == parent && root.filename().string().starts_with("typed-contract-"))
@@ -828,11 +1023,24 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
     connection.default_model = "deepseek-flash"; connection.data_policy = "remote_allowed";
     require(connections.save("typed-save", connection, 0, std::string{"synthetic-test-secret"}).ok(),
             "typed test credential must be isolated in memory");
+    /*
+     * 职责：仅为四类版本化响应回归提供无网络传输替身，拥有计数和自有响应配置。
+     * 生命周期与线程：局部于当前用例，调用线程同步使用；不拥有数据库、连接或工作线程。
+     */
     class FakeTransport final : public xuyan::application::IProviderTransport {
     public:
+        /* 拥有的四类响应值，默认运行时自有夹具；测试变异、send 序列化，随替身销毁。 */
         JsonValue output{typedResponseFixture()};
+        /* 本替身累计 send 次数，单位次、默认 0；send 递增，测试读取，非原子只用于同步调用。 */
         int calls{0};
-        /** @brief 返回运行时组装的结构化响应，检查传输边界但从不发网络请求。 */
+        /*
+         * 功能：为四类版本化响应回归模拟传输边界。
+         * 参数：request：输入，请求的只读引用，校验正文及凭据排除；credential：输入，伪凭据只读引用，不保存；timeout_ms：输入，毫秒，断言为 60000。
+         * 返回：固定 HTTP 200、当前 output 的 JSON 包装及合成用量。
+         * 失败：边界断言失败抛 runtime_error；JSON/字符串构造异常传播。
+         * 副作用：递增 calls；只返回合成响应，不发网络、不写凭据。
+         * 线程与生命周期：调用线程同步执行；请求/凭据引用不逃逸，钩子捕获资源须覆盖 send 调用；成员仅用于本用例。
+         */
         xuyan::domain::Result<xuyan::application::ProviderTransportResponse> send(
             const xuyan::providers::ProviderHttpRequest& request, const std::string& credential, int timeout_ms) override {
             ++calls;
@@ -900,6 +1108,14 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
     auto cached = jobs.create("typed-job-same-version", source.value->id, 500, 0, 1, 1200, connection.id);
     require(cached.ok() && cached.value->status == "completed" && cached.value->budget.consumed_requests == 0
                 && transport.calls == 1, "unchanged typed semantics may reuse validated cache without sending");
+    /*
+     * 功能：定位新协议任务的实体候选。
+     * 参数：item：输入，候选数组中的只读值。
+     * 返回：任务标识匹配 new_version 且类型为 entity 时为 true。
+     * 失败：无显式失败路径，只执行值比较。
+     * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto entity = std::find_if(items.value->begin(), items.value->end(), [&](const auto& item) {
         return item.job_id == new_version.value->id && item.candidate_type == "entity";
     });
@@ -1016,7 +1232,14 @@ void testTypedExtractionPersistenceAndVersionIsolation() {
             "legal generic history must still be reviewable without inventing new typed fields");
 }
 
-/** @brief 验证冻结主干输入、逐片恢复、缓存隔离及来源篡改拒绝；所有文本和响应均由测试生成。 */
+/*
+ * 功能：验证冻结主干输入、逐片恢复、缓存隔离及来源篡改拒绝；所有文本和响应均由测试生成。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：独占目录生成两章，冻结主干及推理配置、模拟在途资产篡改并检查缓存/恢复。
+ * 线程与生命周期：同步执行伪传输和钩子；退出清理自有目录，不联网。
+ */
 void testFrozenBackboneExtractionInput() {
     using namespace xuyan::application;
     using xuyan::package::JsonValue;
@@ -1024,9 +1247,21 @@ void testFrozenBackboneExtractionInput() {
     const auto directory = parent / ("xuyanforge-input-" + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory), "input test must own its directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path root;
-        /** @brief 只清理刚由测试创建的独占目录，不触碰用户素材。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：直接递归删除初始化时接管的自有目录；本守卫没有额外路径归属校验。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(root, ignored); }
     } cleanup{directory};
     const auto database = directory / "workspace.sqlite";
@@ -1050,9 +1285,20 @@ void testFrozenBackboneExtractionInput() {
     connection.endpoint = "https://api.deepseek.com"; connection.default_model = "deepseek-chat";
     connection.data_policy = "remote_allowed";
     require(connections.save("input-provider", connection, 0, std::string{"owned-input-secret"}).ok(), "input provider must save");
+    /*
+     * 职责：仅为冻结主干和推理配置回归提供无网络传输替身，拥有计数和自有响应配置。
+     * 生命周期与线程：局部于当前用例，调用线程同步使用；不拥有数据库、连接或工作线程。
+     */
     class Transport final : public IProviderTransport {
     public:
-        /** @brief 检查实际请求已省略描写，返回当前指定引文；回调仅用于模拟在途资产篡改。 */
+        /*
+         * 功能：为冻结主干和推理配置回归模拟传输边界。
+         * 参数：request：输入，请求值的只读引用，仅调用期间借用；第二个未命名 string 引用为伪凭据，第三个未命名 int 为毫秒超时，均忽略，不保留凭据。
+         * 返回：固定成功 HTTP 200、当前 quote 的 v3 事件及合成用量。
+         * 失败：请求不是 JSON、推理配置或主干正文不符时断言抛异常；on_send 的异常及分配异常继续传播。
+         * 副作用：递增 calls，同步调用可选 on_send 以篡改测试资产，随后构造响应，不发网络。
+         * 线程与生命周期：调用线程同步执行；请求/凭据引用不逃逸，钩子捕获资源须覆盖 send 调用；成员仅用于本用例。
+         */
         xuyan::domain::Result<ProviderTransportResponse> send(const xuyan::providers::ProviderHttpRequest& request,
             const std::string&, int) override {
             ++calls;
@@ -1078,9 +1324,13 @@ void testFrozenBackboneExtractionInput() {
                         {"type", "output_text"}, {"text", typed}}}}}}},
                     {"usage", JsonValue::Object{{"input_tokens", 40}, {"output_tokens", 40}}}})});
         }
+        /* 本替身累计 send 次数，单位次、默认 0；send 递增，测试读取，非原子只用于同步调用。 */
         int calls{0};
+        /* 当前自有事件的逐字 UTF-8 引文，默认空；测试赋值、send 校验及组装，随替身拥有。 */
         std::string quote;
+        /* 期望的冻结推理协议值，默认 provider_default；测试写、send 校验请求，不用作可见标签。 */
         std::string expected_effort{"provider_default"};
+        /* 无参同步发送钩子，默认空、无返回；测试赋值，send 调用，可修改自有资产/取消任务，异常传播；捕获须存活至 send 结束。 */
         std::function<void()> on_send;
     } transport;
     ExtractionJobService jobs(database);
@@ -1154,6 +1404,14 @@ void testFrozenBackboneExtractionInput() {
         "candidate service must independently reject omitted evidence and commit nothing");
     // 在发送前和回报后都改写未引用的描写；引文本身仍相同，单纯引文校验无法发现这个错误。
     const auto asset = directory / source.value->normalized_asset_ref;
+    /*
+     * 功能：在模拟发送期间篡改自有标准化资产以检验摘要复核。
+     * 参数：无。
+     * 返回：无。
+     * 失败：找不到替换位置或字符串构造异常传播；流写失败未单独抛异常检查。
+     * 副作用：复制 text 并将指定描写改为另一字符串，截断重写 asset；不修改用户小说。
+     * 线程与生命周期：由本用例传输替身同步调用，引用捕获的资源须存活到 send 返回，钩子不交给真实网络。
+     */
     const auto replaceDescription = [&] {
         auto changed = text;
         changed.replace(changed.find("蔚蓝"), std::string("蔚蓝").size(), "阴暗");
@@ -1213,11 +1471,29 @@ void testFrozenBackboneExtractionInput() {
         && transport.calls == calls_before_corruption, "current task missing input snapshot must refuse rather than silently switching modes");
 }
 
-/** @brief 验证远程抽样须显式单步触发，且连接变更和旧任务不会泄露原文。 */
+/*
+ * 功能：验证远程抽样须显式单步触发，且连接变更和旧任务不会泄露原文。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：在临时库显式执行单片伪发送，检查正文、协议、连接修订和未知调用保护。
+ * 线程与生命周期：同步执行传输替身及钩子，无真实模型请求。
+ */
 void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
+    /*
+     * 职责：仅为显式单片发送和在途取消回归提供无网络传输替身，拥有计数和自有响应配置。
+     * 生命周期与线程：局部于当前用例，调用线程同步使用；不拥有数据库、连接或工作线程。
+     */
     class FakeTransport final : public xuyan::application::IProviderTransport {
     public:
-        /** @brief 只返回合成的类型化事件响应，并验证显式发送的正文、版本和凭据边界。 */
+        /*
+         * 功能：为显式单片发送和在途取消回归模拟传输边界。
+         * 参数：request：输入，请求的只读引用，校验正文及凭据排除；credential：输入，伪凭据只读引用，不保存；timeout_ms：输入，毫秒，断言为 60000。
+         * 返回：固定 HTTP 200、自有找到钥匙事件及合成用量。
+         * 失败：边界断言失败抛 runtime_error；throw_after_validation 注入异常；on_send 异常继续传播；JSON/字符串构造异常传播。
+         * 副作用：递增 calls；同步调用可选 on_send；只返回合成响应，不发网络、不写凭据。
+         * 线程与生命周期：调用线程同步执行；请求/凭据引用不逃逸，钩子捕获资源须覆盖 send 调用；成员仅用于本用例。
+         */
         xuyan::domain::Result<xuyan::application::ProviderTransportResponse> send(
             const xuyan::providers::ProviderHttpRequest& request,
             const std::string& credential, int timeout_ms) override {
@@ -1237,8 +1513,11 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
                 200, false, false,
                 R"({"status":"completed","output":[{"content":[{"type":"output_text","text":"{\"schema_version\":\"candidate-v3\",\"prompt_version\":\"extract-v3\",\"entities\":[],\"relations\":[],\"rules\":[],\"events\":[{\"name\":\"找到钥匙\",\"quote\":\"林舟找到了失落的钥匙\",\"fields\":{\"action\":\"找到钥匙\",\"participants\":[\"林舟\"],\"location\":\"\",\"time_text\":\"\"}}]}"}]}],"usage":{"input_tokens":80,"output_tokens":28}})"});
         }
+        /* 本替身累计 send 次数，单位次、默认 0；send 递增，测试读取，非原子只用于同步调用。 */
         int calls{0};
+        /* 校验后异常注入开关，默认 false，测试设置、send 读取，不代表真实凭据。 */
         bool throw_after_validation{false};
+        /* 无参同步发送钩子，默认空、无返回；测试赋值，send 调用，可修改自有资产/取消任务，异常传播；捕获须存活至 send 结束。 */
         std::function<void()> on_send;
     };
     const auto directory = temporaryDatabase().parent_path() / "remote-extraction-synthetic";
@@ -1341,6 +1620,14 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
     require(cancelling_job.ok() && cancelling_job.value->total_steps > 1,
             "in-flight cancellation fixture must have unsent steps");
     transport.throw_after_validation = false;
+    /*
+     * 功能：在单片模拟发送中提交外部取消。
+     * 参数：无。
+     * 返回：无。
+     * 失败：加载任务或取消失败由断言抛异常。
+     * 副作用：写 cancelling_job 的取消命令与修订，保留已提交片段。
+     * 线程与生命周期：由本用例传输替身同步调用，引用捕获的资源须存活到 send 返回，钩子不交给真实网络。
+     */
     transport.on_send = [&] {
         auto current = jobs.load(cancelling_job.value->id);
         require(current.ok() && jobs.cancel("remote-cancel-during-send", current.value->id,
@@ -1373,13 +1660,25 @@ void testRemoteExtractionOneStepIsExplicitAndEvidenceBound() {
     std::filesystem::remove_all(directory, ignored);
 }
 
-/** @brief 仅在本测试线程中记录历史步骤输出的整表读取次数，不接触 SQL 绑定值。 */
+/*
+ * 职责：统计当前测试线程中选择历史 output_json 的非单步查询，不记录绑定值、正文或凭据。
+ * 生命周期：由 ScopedExtractionReadAudit 拥有，挂接连接必须先关闭；不跨线程共享。
+ */
 struct ExtractionReadAudit {
+    /* 自守卫注册以来的历史输出读取次数，单位次、默认 0；trace 钩子累加，用例读取。 */
     int full_history_reads{0};
 };
+/* 当前线程借用的审计计数指针，默认空；守卫注册/注销写入，扩展回调读取，不拥有计数对象。 */
 thread_local ExtractionReadAudit* active_extraction_read_audit = nullptr;
 
-/** @brief 统计显式选择历史输出的步骤查询，不保存原文、结果或凭据。 */
+/*
+ * 功能：统计当前连接选择历史步骤输出的非单步 SELECT。
+ * 参数：第一个未命名 unsigned 为事件种类，当前只注册 STMT；context：输入，非空审计对象观察指针；statement：输入，当前语句指针；末个未命名 void* 为 SQLite 事件附加信息，忽略。
+ * 返回：恒为 0，表示 trace 正常返回；计数从上下文读取。
+ * 失败：无显式错误结果；指针合法性由 SQLite 挂接契约保证，回调不得抛越过 C 接口。
+ * 副作用：匹配查询时增加整表历史读取数，不读取绑定值或响应正文。
+ * 线程与生命周期：在 SQLite 执行语句的当前线程同步调用，context 必须覆盖连接挂接期。
+ */
 int traceExtractionReads(unsigned, void* context, void* statement, void*) {
     auto& audit = *static_cast<ExtractionReadAudit*>(context);
     const auto* sql = sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
@@ -1390,17 +1689,34 @@ int traceExtractionReads(unsigned, void* context, void* statement, void*) {
     return 0;
 }
 
-/** @brief 为本测试新开的连接挂接只读语句计数器，其他线程不挂接。 */
+/*
+ * 功能：为本线程新连接挂接语句计数，仅有活动审计守卫时启用。
+ * 参数：database：输入，SQLite 提供的连接观察指针；未命名 char** 为扩展错误输出，本回调不写；未命名 api_routines 指针为 API 表，忽略。
+ * 返回：挂接时返回 sqlite3_trace_v2 状态码，无活动计数时返回 SQLITE_OK。
+ * 失败：挂接错误原样返回；不校验 SQLite 提供的连接。
+ * 副作用：设置当前连接的 trace，可能替换已有 trace；不改数据，不对其他线程挂计数。
+ * 线程与生命周期：auto_extension 注册在进程级，计数指针 thread_local；被挂连接须在本线程守卫销毁前关闭。
+ */
 int attachExtractionReadAudit(sqlite3* database, char**, const sqlite3_api_routines*) {
     if (active_extraction_read_audit != nullptr)
         return sqlite3_trace_v2(database, SQLITE_TRACE_STMT, traceExtractionReads, active_extraction_read_audit);
     return SQLITE_OK;
 }
 
-/** @brief 作用域内注册 SQLite 测试扩展；所有被挂接连接必须在本对象销毁前关闭。 */
+/*
+ * 职责：临时注册进程级 SQLite 自动扩展并拥有本线程审计计数，退出注销。
+ * 生命周期与线程：不允许当前线程嵌套；本用例在同线程使用，所有挂接连接须先于守卫关闭。
+ */
 class ScopedExtractionReadAudit {
 public:
-    /** @brief 注册语句计数钩子，函数指针转换仅适配 SQLite 指定的 C 扩展接口。 */
+    /*
+     * 功能：注册当前线程审计及 SQLite 自动扩展。
+     * 参数：无。
+     * 返回：完成计数守卫初始化，counts 从零开始。
+     * 失败：嵌套审计断言失败；扩展注册失败重置线程指针并抛 runtime_error。
+     * 副作用：借用 counts 地址到 thread_local 并注册进程扩展，函数指针转换遵循 SQLite 接口。
+     * 线程与生命周期：同线程创建/销毁，不跨线程移动，连接须在销毁前关闭。
+     */
     ScopedExtractionReadAudit() {
         require(active_extraction_read_audit == nullptr, "read audits must not nest");
         active_extraction_read_audit = &counts;
@@ -1409,17 +1725,48 @@ public:
             throw std::runtime_error("cannot install read audit");
         }
     }
-    /** @brief 注销仅属于本测试的扩展，避免影响后续核心用例。 */
+    /*
+     * 功能：退出时注销本扩展并清空线程审计指针。
+     * 参数：无。
+     * 返回：完成守卫销毁。
+     * 失败：取消注册返回值被忽略，无显式失败报告。
+     * 副作用：不关闭连接，不修改数据；取消自动扩展并解除线程指针。
+     * 线程与生命周期：同线程同步析构，挂接连接须已关闭，否则仍持有 counts 的悬空观察指针。
+     */
     ~ScopedExtractionReadAudit() {
         sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(attachExtractionReadAudit));
         active_extraction_read_audit = nullptr;
     }
+    /*
+     * 功能：禁止复制活动扩展的注销责任。
+     * 参数：未命名 ScopedExtractionReadAudit 引用：输入，拟复制或赋值的源守卫。
+     * 返回：复制禁止，不产生对象。
+     * 失败：调用在编译期拒绝。
+     * 副作用：无，避免多对象注销同一扩展。
+     * 线程与生命周期：守卫只在创建线程作用域内使用。
+     */
     ScopedExtractionReadAudit(const ScopedExtractionReadAudit&) = delete;
+    /*
+     * 功能：禁止覆盖活动扩展的注销责任。
+     * 参数：未命名 ScopedExtractionReadAudit 引用：输入，拟复制或赋值的源守卫。
+     * 返回：赋值禁止，无可调用返回值。
+     * 失败：调用在编译期拒绝。
+     * 副作用：无，避免多对象注销同一扩展。
+     * 线程与生命周期：守卫只在创建线程作用域内使用。
+     */
     ScopedExtractionReadAudit& operator=(const ScopedExtractionReadAudit&) = delete;
+    /* 本守卫拥有的计数值，默认零；trace 借用它，当前用例读取，销毁前必须解除所有连接引用。 */
     ExtractionReadAudit counts;
 };
 
-/** @brief 验证原文远程批次遍历、持久化续跑、次数硬上限和所有停止边界；不访问真实网络。 */
+/*
+ * 功能：验证原文远程批次遍历、持久化续跑、次数硬上限和所有停止边界；不访问真实网络。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：自有目录内以伪传输验证逐片恢复、上限、停止边界与历史输出读取次数，退出清理。
+ * 线程与生命周期：同步进度回调不逃逸；审计连接须先于计数守卫关闭，不联网。
+ */
 void testRemoteBatchCheckpoints() {
     using namespace xuyan::application;
     using xuyan::package::JsonValue;
@@ -1428,10 +1775,23 @@ void testRemoteBatchCheckpoints() {
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
             "remote batch test must own a fresh temporary directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path root;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 仅清理本测试拥有的精确临时目录。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (root.parent_path() == parent) {
                 std::error_code ignored;
@@ -1455,6 +1815,14 @@ void testRemoteBatchCheckpoints() {
     ExtractionJobService jobs(database);
     SourceImportService sources(database);
     // 每个用例生成不同正文，避免前一个任务的已完成缓存替代本用例的实际发送。
+    /*
+     * 功能：按标签生成独立章节并创建未缓存远程任务。
+     * 参数：label：输入，测试文件/命令后缀，只读借用；chapters：输入，章数，默认 4、应为正数；requests：输入，请求硬上限，默认 50，合法性由任务服务校验。
+     * 返回：拥有完整步骤的任务值。
+     * 失败：文件、导入或切片数量断言失败抛异常。
+     * 副作用：写 directory 下自有文本、导入并创建任务；large_batch 的 full 标签选主干模式。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto createJob = [&](const std::string& label, int chapters = 4, int requests = 50) {
         const auto manuscript = directory / (label + ".txt");
         {
@@ -1478,9 +1846,20 @@ void testRemoteBatchCheckpoints() {
                 "each owned chapter must create an uncached ready step");
         return *job.value;
     };
+    /*
+     * 职责：仅为批次逐字引文与失败边界回归提供无网络传输替身，拥有计数和自有响应配置。
+     * 生命周期与线程：局部于当前用例，调用线程同步使用；不拥有数据库、连接或工作线程。
+     */
     class FakeTransport final : public IProviderTransport {
     public:
-        /** @brief 从当前请求的数据片段生成逐字事件；故障及发送钩子仅在测试中使用。 */
+        /*
+         * 功能：为批次逐字引文与失败边界回归模拟传输边界。
+         * 参数：request：输入，待发送请求，只读借用；secret：输入，伪凭据引用，只在边界校验；timeout：输入，毫秒，断言为 60000。
+         * 返回：成功包装的传输响应：可由 http_status/timed_out/cancelled 模拟失败，否则返回从当前片段提取的事件；malformed 可令结构无效。
+         * 失败：凭据、请求格式或合成事件定位不符时断言抛异常；throw_after_send 注入异常；on_send/分配异常传播。
+         * 副作用：累计 calls、发送 Unicode 码点和自有 quotes，执行同步钩子，故障仍可能在计数增加后发生；无网络。
+         * 线程与生命周期：调用线程同步执行；请求/凭据引用不逃逸，钩子捕获资源须覆盖 send 调用；成员仅用于本用例。
+         */
         xuyan::domain::Result<ProviderTransportResponse> send(
             const xuyan::providers::ProviderHttpRequest& request, const std::string& secret, int timeout) override {
             using Response = xuyan::domain::Result<ProviderTransportResponse>;
@@ -1522,14 +1901,23 @@ void testRemoteBatchCheckpoints() {
                 {"usage", JsonValue::Object{{"input_tokens", 100}, {"output_tokens", 80}}}});
             return Response::success({200, false, false, response});
         }
+        /* 本替身累计 send 次数，单位次、默认 0；send 递增，测试读取，非原子只用于同步调用。 */
         int calls{0};
+        /* 模拟 HTTP 状态码，默认 200；测试设置、send 读取，不触发真实请求。 */
         int http_status{200};
+        /* 累计请求片段的 Unicode 码点数（非 UTF-8 字节），默认 0；send 累加，测试读。 */
         std::size_t sent_fragment_codepoints{0};
+        /* 模拟超时未知结果，默认 false；测试设置、send 复制到响应。 */
         bool timed_out{false};
+        /* 模拟在途取消标记，默认 false；测试设置、send 返回，不自动退款。 */
         bool cancelled{false};
+        /* 无效结构响应开关，默认 false；测试写，send 决定返回空对象或合法类型化 JSON。 */
         bool malformed{false};
+        /* 记录片段后抛异常的故障开关，默认 false；测试设置、send 读取，计数不回滚。 */
         bool throw_after_send{false};
+        /* 无参同步发送钩子，默认空、无返回；测试赋值，send 调用，可修改自有资产/取消任务，异常传播；捕获须存活至 send 结束。 */
         std::function<void()> on_send;
+        /* 拥有的各次发送自有引文，UTF-8，默认空；send 追加、测试读，长度随本用例发送数增长，绝不接收私有模型输出。 */
         std::vector<std::string> quotes;
     } transport;
     RemoteExtractionProcessor processor(database, credentials, transport);
@@ -1537,6 +1925,14 @@ void testRemoteBatchCheckpoints() {
     RemoteBatchOptions pause;
     pause.maximum_steps = 50;
     int notifications = 0;
+    /*
+     * 功能：核对远程进度已持久化并在第二片暂停。
+     * 参数：progress：输入，当前回调的只读进度引用，次数非负。
+     * 返回：processed_steps 为 2 返回 pause，否则 proceed。
+     * 失败：任务读取、修订、预算计数不符时断言抛异常。
+     * 副作用：读取 jobs、递增 notifications，不读取正文。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     pause.on_progress = [&](const RemoteBatchProgress& progress) {
         auto durable = jobs.load(progress.job_id);
         require(durable.ok() && durable.value->revision == progress.revision
@@ -1567,14 +1963,22 @@ void testRemoteBatchCheckpoints() {
                 && finished.value->processed_steps == full_chapters - 3
                 && finished.value->job.completed_steps == full_chapters
                 && transport.calls == full_chapters && std::all_of(finished.value->job.steps.begin(), finished.value->job.steps.end(),
+                    /*
+                     * 功能：核对恢复后步骤只完成一次。
+                     * 参数：step：输入，步骤的只读引用。
+                     * 返回：状态 completed 且 attempt 为 1 时为 true。
+                     * 失败：无显式失败路径，只执行值比较。
+                     * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+                     */
                     [](const auto& step) { return step.status == "completed" && step.attempt == 1; }),
             "every owned chapter must complete once across pause and reconstruction");
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - batch_started).count();
-    std::cout << "Owned remote batch validation: " << full_chapters << " chapters, "
-              << finished.value->job.steps.back().end_codepoint << " source codepoints, "
-              << transport.sent_fragment_codepoints << " sent fragment codepoints, "
-              << finished.value->processed_steps << " resumed steps, " << read_audit.counts.full_history_reads
-              << " historical output SELECTs, " << elapsed << " seconds.\n";
+    std::cout << "自有素材远程批次回归： " << full_chapters << " 章， "
+              << finished.value->job.steps.back().end_codepoint << " 原文码点， "
+              << transport.sent_fragment_codepoints << " 发送片段码点， "
+              << finished.value->processed_steps << " 续跑片段， " << read_audit.counts.full_history_reads
+              << " 次历史输出查询， " << elapsed << " 秒。\n";
     require(read_audit.counts.full_history_reads <= 1,
             "batch scheduling must read historical outputs only once for its final full snapshot");
     if (large_batch) require(finished.value->job.input.mode == "backbone"
@@ -1614,6 +2018,14 @@ void testRemoteBatchCheckpoints() {
                 && claim_replay.value->status == "completed" && claim_replay.value->attempt == 1,
             "claim replay must retain its original full single-step result without changing budget");
     auto completion_options = all;
+    /*
+     * 功能：从远程检查点请求永久取消。
+     * 参数：未命名 RemoteBatchProgress 引用：输入，当前进度，忽略。
+     * 返回：固定 RemoteBatchAction::cancel。
+     * 失败：无显式失败路径。
+     * 副作用：不直接写库，交由批次处理器提交取消。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     completion_options.on_progress = [](const RemoteBatchProgress&) { return RemoteBatchAction::cancel; };
     const auto replay = reopened.processBatch(full.id, completion_options);
     require(replay.ok() && replay.value->reason == RemoteBatchStopReason::completed
@@ -1651,6 +2063,14 @@ void testRemoteBatchCheckpoints() {
             "pre-requested stop must preserve all ready steps and send nothing");
     std::stop_source during_send;
     stopped_options.stop_token = during_send.get_token();
+    /*
+     * 功能：发送期间请求协作停止。
+     * 参数：无。
+     * 返回：无。
+     * 失败：无显式失败路径。
+     * 副作用：调用 during_send.request_stop，可能同步触发已注册停止回调。
+     * 线程与生命周期：由本用例传输替身同步调用，引用捕获的资源须存活到 send 返回，钩子不交给真实网络。
+     */
     transport.on_send = [&] { during_send.request_stop(); };
     auto stopped_in_flight = processor.processBatch(stopped_job.id, stopped_options);
     transport.on_send = {};
@@ -1660,12 +2080,28 @@ void testRemoteBatchCheckpoints() {
             "stop during send must settle the valid reply and prevent the next request");
     const auto nested = createJob("nested");
     int nested_rejections = 0;
+    /*
+     * 功能：验证在途发送期间同任务租约拒绝嵌套调度。
+     * 参数：无。
+     * 返回：无。
+     * 失败：处理器未包装的异常传播。
+     * 副作用：尝试 processNext/processBatch，每次失败累加 nested_rejections；有效租约应阻止新增发送。
+     * 线程与生命周期：由本用例传输替身同步调用，引用捕获的资源须存活到 send 返回，钩子不交给真实网络。
+     */
     transport.on_send = [&] {
         if (!reopened.processNext(nested.id).ok()) ++nested_rejections;
         if (!reopened.processBatch(nested.id, all).ok()) ++nested_rejections;
     };
     const auto before_nested = transport.calls;
     auto nested_options = one;
+    /*
+     * 功能：验证首个远程检查点持有租约并继续外层批次。
+     * 参数：progress：输入，当前进度只读引用。
+     * 返回：固定 proceed。
+     * 失败：处理器未包装的异常传播。
+     * 副作用：processed_steps 为 0 时尝试嵌套单步/批次，累计拒绝数。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     nested_options.on_progress = [&](const RemoteBatchProgress& progress) {
         if (progress.processed_steps == 0) {
             // 此时任务仍排队，拒绝必须来自共享租约，不能仅靠 running 状态判断。
@@ -1679,6 +2115,14 @@ void testRemoteBatchCheckpoints() {
     require(nested_result.ok() && nested_rejections == 4 && transport.calls == before_nested + 1,
             "single-step and batch entry must share a nonblocking per-job execution lease");
     const auto external_cancel = createJob("cancel-flight");
+    /*
+     * 功能：验证在途事务不阻塞外部取消。
+     * 参数：无。
+     * 返回：无。
+     * 失败：加载/取消失败时断言抛异常。
+     * 副作用：写 external_cancel 的取消命令和修订。
+     * 线程与生命周期：由本用例传输替身同步调用，引用捕获的资源须存活到 send 返回，钩子不交给真实网络。
+     */
     transport.on_send = [&] {
         auto current = jobs.load(external_cancel.id);
         require(current.ok() && jobs.cancel("batch-cancel-flight", current.value->id, current.value->revision).ok(),
@@ -1691,6 +2135,14 @@ void testRemoteBatchCheckpoints() {
             "in-flight cancellation must settle once and stop every later send");
     const auto callback_cancel = createJob("cancel-callback");
     auto cancel_options = all;
+    /*
+     * 功能：在进度回调中提交外部取消但继续返回调度动作。
+     * 参数：progress：输入，已持久化任务标识和修订的只读进度。
+     * 返回：固定 proceed，由处理器再读已取消状态。
+     * 失败：取消失败由断言抛异常。
+     * 副作用：提交批次取消命令，验证不因 proceed 恢复发送。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     cancel_options.on_progress = [&](const RemoteBatchProgress& progress) {
         require(jobs.cancel("batch-callback-external-cancel", progress.job_id, progress.revision).ok(),
                 "callback must be allowed to commit external cancellation");
@@ -1702,6 +2154,14 @@ void testRemoteBatchCheckpoints() {
                 && transport.calls == before_cancel,
             "batch must reload callback mutations before claiming a step");
     const auto action_cancel = createJob("cancel-action");
+    /*
+     * 功能：在远程预调度回调中请求取消。
+     * 参数：未命名 RemoteBatchProgress 引用：输入，当前进度，忽略。
+     * 返回：固定 cancel。
+     * 失败：无显式失败路径。
+     * 副作用：无直接写库，取消由批次处理器执行。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     cancel_options.on_progress = [](const RemoteBatchProgress&) { return RemoteBatchAction::cancel; };
     auto action_cancelled = processor.processBatch(action_cancel.id, cancel_options);
     require(action_cancelled.ok() && action_cancelled.value->reason == RemoteBatchStopReason::cancelled
@@ -1709,6 +2169,14 @@ void testRemoteBatchCheckpoints() {
             "cancel action must persist the cancellation without sending");
     const auto callback_error = createJob("callback-error");
     auto throwing = all;
+    /*
+     * 功能：在第一片远程输出持久化后注入回调异常。
+     * 参数：progress：输入，已处理片数的只读进度。
+     * 返回：未触发故障时为 proceed。
+     * 失败：processed_steps 为 1 抛出合成私密标记异常。
+     * 副作用：不写原文或凭据，用于测试处理器错误脱敏。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     throwing.on_progress = [](const RemoteBatchProgress& progress) {
         if (progress.processed_steps == 1) throw std::runtime_error("private owned-test-secret");
         return RemoteBatchAction::proceed;
@@ -1761,7 +2229,14 @@ void testRemoteBatchCheckpoints() {
             "fake model candidates must never create accepted world facts automatically");
 }
 
-/** @brief 检查世界条目增删改查、中文检索和过期修订冲突。 */
+/*
+ * 功能：检查世界条目增删改查、中文检索和过期修订冲突。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库安装合成条目，检查中文查找、增改删和过期修订。
+ * 线程与生命周期：同步执行，固定临时文件需独占。
+ */
 void testEntityCrudSearchAndOptimisticLocking() {
     const auto path = temporaryDatabase().parent_path() / "entities.sqlite";
     removeDatabase(path);
@@ -1824,7 +2299,14 @@ void testEntityCrudSearchAndOptimisticLocking() {
     removeDatabase(path);
 }
 
-/** @brief 验证来源导入、章节校正与 Unicode 码点证据定位。 */
+/*
+ * 功能：验证来源导入、章节校正与 Unicode 码点证据定位。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：固定测试目录写合成原文、导入与校正章节，创建和回查码点证据。
+ * 线程与生命周期：同步执行，字节/码点分别验证；固定目录不能并发使用。
+ */
 void testSourceImportAndCodepointEvidence() {
     const auto directory = std::filesystem::temp_directory_path() / "xuyanforge-source-tests";
     const auto database = directory / "workspace.sqlite";
@@ -2054,7 +2536,14 @@ void testSourceImportAndCodepointEvidence() {
     std::filesystem::remove_all(rejected_directory, ignored);
 }
 
-/** @brief 验证离线抽取在来源资产丢失后将已领取步骤持久化为需处理状态。 */
+/*
+ * 功能：验证离线抽取在来源资产丢失后将已领取步骤持久化为需处理状态。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：生成自有来源后移除标准化资产，核对已领取步骤转为需处理状态。
+ * 线程与生命周期：同步离线执行，不发送模型；临时路径需独占。
+ */
 void testOfflineMissingAssetRecovery() {
     const auto directory = std::filesystem::temp_directory_path()
         / ("xuyanforge-offline-asset-" + std::to_string(
@@ -2085,7 +2574,14 @@ void testOfflineMissingAssetRecovery() {
     std::filesystem::remove_all(directory, ignored);
 }
 
-/** @brief 验证批次进度、暂停检查点、重建恢复、取消和回调错误不会重复处理小说片段。 */
+/*
+ * 功能：验证批次进度、暂停检查点、重建恢复、取消和回调错误不会重复处理小说片段。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：独占目录生成多章，按进度暂停、续跑、取消及抛异常，退出守卫清理。
+ * 线程与生命周期：同步离线回调借用本调用栈，不逃逸 processBatch。
+ */
 void testOfflineBatchCheckpoints() {
     using namespace xuyan::application;
     const auto temporary_root = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
@@ -2093,10 +2589,23 @@ void testOfflineBatchCheckpoints() {
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == temporary_root && std::filesystem::create_directory(directory),
             "offline batch test must use a new private temporary directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path root;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 仅清理本测试创建且仍位于精确临时父目录下的文件。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (root.parent_path() == parent) {
                 std::error_code ignored;
@@ -2123,6 +2632,14 @@ void testOfflineBatchCheckpoints() {
     MockExtractionProcessor offline(database);
     OfflineBatchOptions pause;
     int notifications = 0;
+    /*
+     * 功能：核对离线检查点落库并在第二片暂停。
+     * 参数：progress：输入，持久化步骤与本批处理数的只读进度。
+     * 返回：processed_steps 为 2 返回 pause，否则 proceed。
+     * 失败：计数或读取断言失败抛异常。
+     * 副作用：读取 jobs 并累计 notifications，未提交片不得提前公布。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     pause.on_progress = [&](const OfflineBatchProgress& progress) {
         require(progress.completed_steps == progress.processed_steps
                     && progress.completed_steps == notifications,
@@ -2139,6 +2656,14 @@ void testOfflineBatchCheckpoints() {
                 && notifications == 3,
             "pause must stop at the second committed checkpoint, not finish the full book");
     require(std::none_of(paused.value->job.steps.begin(), paused.value->job.steps.end(),
+                        /*
+                         * 功能：检查暂停后没有运行中步骤。
+                         * 参数：step：输入，步骤只读引用。
+                         * 返回：status 为 running 时为 true。
+                         * 失败：无显式失败路径，只执行值比较。
+                         * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                         * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+                         */
                         [](const auto& step) { return step.status == "running"; }),
             "pause must not leave an in-flight offline step");
     MockExtractionProcessor reopened(database);
@@ -2152,6 +2677,14 @@ void testOfflineBatchCheckpoints() {
     require(finished.ok() && finished.value->reason == OfflineBatchStopReason::completed
                 && finished.value->job.completed_steps == job.value->total_steps
                 && std::all_of(finished.value->job.steps.begin(), finished.value->job.steps.end(),
+                               /*
+                                * 功能：核对离线恢复只执行每片一次。
+                                * 参数：step：输入，步骤只读引用。
+                                * 返回：completed 且 attempt 为 1 时为 true。
+                                * 失败：无显式失败路径，只执行值比较。
+                                * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                                * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+                                */
                                [](const auto& step) { return step.status == "completed" && step.attempt == 1; }),
             "resuming must finish every step exactly once");
     auto finished_again = reopened.processBatch(job.value->id);
@@ -2173,6 +2706,14 @@ void testOfflineBatchCheckpoints() {
                 && not_started.value->job.budget.consumed_requests == 0,
             "an already stopped batch must claim no step or request budget");
     OfflineBatchOptions cancel;
+    /*
+     * 功能：第一片离线提交后请求取消。
+     * 参数：progress：输入，本批处理数的只读进度。
+     * 返回：processed_steps 为 1 返回 cancel，否则 proceed。
+     * 失败：无显式失败路径。
+     * 副作用：不直接改库，由处理器落实取消。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     cancel.on_progress = [](const OfflineBatchProgress& progress) {
         return progress.processed_steps == 1 ? OfflineBatchAction::cancel : OfflineBatchAction::proceed;
     };
@@ -2186,6 +2727,14 @@ void testOfflineBatchCheckpoints() {
     auto callback_job = jobs.create("batch-callback-error", source.value->id, 700, 0);
     require(callback_job.ok(), "callback-error fixture must create");
     OfflineBatchOptions failing_callback;
+    /*
+     * 功能：第一片离线提交后注入回调错误。
+     * 参数：progress：输入，本批处理数的只读进度。
+     * 返回：未触发故障时返回 proceed。
+     * 失败：processed_steps 为 1 抛合成私密标记 runtime_error。
+     * 副作用：只注入错误，不持久化私密标记。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     failing_callback.on_progress = [](const OfflineBatchProgress& progress) {
         if (progress.processed_steps == 1) throw std::runtime_error("private-callback-detail");
         return OfflineBatchAction::proceed;
@@ -2201,6 +2750,14 @@ void testOfflineBatchCheckpoints() {
     std::stop_source running_stop;
     OfflineBatchOptions stopping;
     stopping.stop_token = running_stop.get_token();
+    /*
+     * 功能：第一片离线提交后请求停止令牌。
+     * 参数：progress：输入，本批处理数的只读进度。
+     * 返回：固定 proceed。
+     * 失败：request_stop 无显式失败路径。
+     * 副作用：processed_steps 为 1 时请求 running_stop，处理器后续检查令牌。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     stopping.on_progress = [&](const OfflineBatchProgress& progress) {
         if (progress.processed_steps == 1) running_stop.request_stop();
         return OfflineBatchAction::proceed;
@@ -2214,6 +2771,14 @@ void testOfflineBatchCheckpoints() {
     require(duplicate_job.ok(), "duplicate-start fixture must create");
     bool duplicate_rejected = false;
     OfflineBatchOptions duplicate;
+    /*
+     * 功能：验证离线同任务租约拒绝重复批次。
+     * 参数：未命名 OfflineBatchProgress 引用：输入，当前进度，忽略。
+     * 返回：固定 pause。
+     * 失败：处理器未包装异常传播。
+     * 副作用：尝试嵌套批次并记录是否为 rule_conflict，不释放外层租约。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     duplicate.on_progress = [&](const OfflineBatchProgress&) {
         auto nested = reopened.processBatch(duplicate_job.value->id, one_step);
         duplicate_rejected = !nested.ok() && nested.error->code == xuyan::domain::ErrorCode::rule_conflict;
@@ -2224,7 +2789,14 @@ void testOfflineBatchCheckpoints() {
             "same workspace/job batch must reject a duplicate start without holding locks across callbacks");
 }
 
-/** @brief 验证持久化提取队列、切片边界、预算、恢复、缓存和审核流程。 */
+/*
+ * 功能：验证持久化提取队列、切片边界、预算、恢复、缓存和审核流程。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库写原文、队列、预算及审核记录，检查切片、恢复、缓存和重放。
+ * 线程与生命周期：同步离线执行；固定路径由本进程独占，不联网。
+ */
 void testPersistentExtractionQueue() {
     const auto directory = std::filesystem::temp_directory_path() / "xuyanforge-extraction-tests";
     const auto database = directory / "workspace.sqlite";
@@ -2387,6 +2959,14 @@ void testPersistentExtractionQueue() {
             "accepted candidate must atomically create its reviewed world entity");
     auto accepted_evidence = xuyan::application::EvidenceService(database).listForSource(imported.value->id);
     require(accepted_evidence.ok() && std::any_of(accepted_evidence.value->begin(), accepted_evidence.value->end(),
+                /*
+                 * 功能：定位已接受实体的证据引用。
+                 * 参数：value：输入，证据引用只读值。
+                 * 返回：entity_id 与 accepted_entity 的稳定标识相同为 true。
+                 * 失败：无显式失败路径，只执行值比较。
+                 * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                 * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+                 */
                 [&](const auto& value) { return value.entity_id == accepted_entity.value->id; }),
             "accepted candidate must atomically attach its verified source evidence");
     require(!candidates.review("candidate-stale-review", accepted_id, 1, "rejected", "段落零",
@@ -2408,6 +2988,14 @@ void testPersistentExtractionQueue() {
     auto with_mock_candidates = candidates.list();
     require(with_mock_candidates.ok() && with_mock_candidates.value->size() >= 4,
             "mock extraction must produce review candidates without an API key");
+    /*
+     * 功能：检查候选不保留伪凭据描述字段。
+     * 参数：value：输入，候选只读引用。
+     * 返回：名称含 API Key 或字段串含 credential 时为 true。
+     * 失败：无显式失败路径，只执行值比较。
+     * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     require(std::none_of(with_mock_candidates.value->begin(), with_mock_candidates.value->end(), [](const auto& value) {
                 return value.name.find("API Key") != std::string::npos || value.fields_json.find("credential") != std::string::npos;
             }), "instructions embedded in novel text must remain untrusted content and cannot request credentials or tools");
@@ -2420,6 +3008,14 @@ void testPersistentExtractionQueue() {
     require(cached_job.ok() && cached_job.value->status == "completed"
                 && cached_job.value->completed_steps == cached_job.value->total_steps
                 && std::all_of(cached_job.value->steps.begin(), cached_job.value->steps.end(),
+                               /*
+                                * 功能：核对缓存步骤不消耗执行尝试。
+                                * 参数：step：输入，步骤只读引用。
+                                * 返回：completed 且 attempt 为 0 时为 true。
+                                * 失败：无显式失败路径，只执行值比较。
+                                * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                                * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+                                */
                                [](const auto& step) { return step.status == "completed" && step.attempt == 0; }),
             "unchanged chunks with matching prompt/schema must reuse committed extraction cache without a request");
     auto cached_candidates = candidates.list();
@@ -2489,17 +3085,37 @@ void testPersistentExtractionQueue() {
     std::filesystem::remove_all(directory, ignored);
 }
 
-/** @brief 验证 SQLite 候选查询按世界、来源和状态隔离并提供稳定分页总数。 */
+/*
+ * 功能：验证 SQLite 候选查询按世界、来源和状态隔离并提供稳定分页总数。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：独占目录用 SQL 生成两世界候选，检查世界/来源/状态过滤与分页总数，退出清理。
+ * 线程与生命周期：同步读取，仓储连接先于目录守卫释放。
+ */
 void testScopedCandidatePaging() {
     const auto temporary_root = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
     const auto directory = temporary_root / ("xuyanforge-candidate-page-" + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == temporary_root && std::filesystem::create_directory(directory),
             "candidate paging test must use a new system temporary directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path root;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 仅在临时根目录仍匹配时清理本测试生成的数据库。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (root.parent_path() == parent) {
                 std::error_code ignored;
@@ -2629,7 +3245,14 @@ COMMIT;
             "deleted last page must return an empty page with updated total for pagination recovery");
 }
 
-/** @brief 验证图语义迁移保留旧数值/位置，新格式区分未知，损坏或未来格式不被偷偷修复。 */
+/*
+ * 功能：验证图语义迁移保留旧数值/位置，新格式区分未知，损坏或未来格式不被偷偷修复。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：独占目录构造旧图数据，验证迁移保留、损坏/未来格式拒绝及显式图写入。
+ * 线程与生命周期：同步操作测试库，连接先于目录清理守卫销毁。
+ */
 void testGraphSemanticsMigrationAndExplicitWrites() {
     using namespace xuyan::domain;
     const auto parent = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
@@ -2637,10 +3260,23 @@ void testGraphSemanticsMigrationAndExplicitWrites() {
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
             "graph migration must own its temporary directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path directory;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 只移除本测试独占目录，不递归操作用户目录或其他工作区。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (directory.parent_path() == parent) {
                 std::error_code ignored; std::filesystem::remove_all(directory, ignored);
@@ -2754,7 +3390,14 @@ void testGraphSemanticsMigrationAndExplicitWrites() {
             "future schema must be rejected without modifying existing records");
 }
 
-/** @brief 验证关系明确绑定与地点未知位置在同一审核事务落库，故障/重放不会产生部分资料。 */
+/*
+ * 功能：验证关系明确绑定与地点未知位置在同一审核事务落库，故障/重放不会产生部分资料。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：自有原文和临时库显式创建端点，接受关系/未知位置，并验证非法专用投影原子拒绝。
+ * 线程与生命周期：同步事务断言；退出只清理当前独占目录。
+ */
 void testAcceptedRelationAndLocationProjection() {
     using namespace xuyan::application;
     using xuyan::domain::ErrorCode;
@@ -2764,10 +3407,23 @@ void testAcceptedRelationAndLocationProjection() {
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
             "graph review must own an isolated temporary workspace");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path directory;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 仅移除本次独占的临时目录；数据库连接先于本守卫释放。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (directory.parent_path() == parent) {
                 std::error_code ignored; std::filesystem::remove_all(directory, ignored);
@@ -2779,7 +3435,14 @@ void testAcceptedRelationAndLocationProjection() {
     auto world = repository.createWorldTemplate("graph-review-world", "专用图审核测试");
     auto other_world = repository.createWorldTemplate("graph-review-other", "其他测试世界");
     require(world.ok() && other_world.ok(), "graph review worlds must be created explicitly");
-    /** @brief 只在隔离测试工作区显式创建作者确认的端点，不用小说名称自动选中。 */
+    /*
+     * 功能：显式创建关系审核端点夹具。
+     * 参数：id：输入，稳定标识；world_id：输入，所属测试世界；name：输入，名称；kind：输入，类型协议，默认 character；字符串只借用本调用。
+     * 返回：创建后的独立实体值。
+     * 失败：创建失败断言抛异常；字段合法性由仓储校验。
+     * 副作用：写测试库条目及创建命令；指定名称额外配置测试别名。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto person = [&](const std::string& id, const std::string& world_id, const std::string& name,
                             const std::string& kind = "character") {
         xuyan::domain::WorldEntity value;
@@ -2895,6 +3558,14 @@ void testAcceptedRelationAndLocationProjection() {
         require(map.ok() && map.value->locations.size() == index + 1 && map.value->routes.empty(),
                 "same-name locations must remain separate and must not invent routes");
         const auto placement = std::find_if(map.value->locations.begin(), map.value->locations.end(),
+            /*
+             * 功能：查找当前候选对应地点投影。
+             * 参数：value：输入，地点投影只读值。
+             * 返回：location_id 等于 entity-from- 加 candidate.id 时为 true。
+             * 失败：无显式失败路径，只执行值比较。
+             * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+             * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+             */
             [&](const auto& value) { return value.location_id == "entity-from-" + candidate.id; });
         require(placement != map.value->locations.end() && placement->truth_status == truths[index]
                     && placement->evidence_status == (index == 0 ? "evidence" : "assumption") && placement->revision == 1
@@ -2908,7 +3579,14 @@ void testAcceptedRelationAndLocationProjection() {
     auto edited = repository.saveEntity("graph-endpoint-revision", first_person, 1);
     require(edited.ok() && edited.value->revision == 2, "endpoint revision fixture must save");
     const xuyan::domain::RelationEndpointSelection selected{first_person.id, 2, target.id, 1};
-    /** @brief 使用显式端点尝试接受同一待审关系；所有无效选择不得提前推进审核修订。 */
+    /*
+     * 功能：验证非法显式端点选择不会推进候选修订。
+     * 参数：selection：输入，端点选择只读引用；command：输入，本次尝试的命令标识，只读借用。
+     * 返回：无。
+     * 失败：审核没有拒绝或候选状态变化时断言抛异常。
+     * 副作用：尝试审核并重读候选；预期错误必须在写入审核之前发生。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto reject_selection = [&](const xuyan::domain::RelationEndpointSelection& selection, const std::string& command) {
         auto result = service.review(command, bidirectional_candidate.id, 1, "accepted", bidirectional_candidate.name,
                                      bidirectional_candidate.fields_json, "original_fact", selection);
@@ -2979,11 +3657,26 @@ void testAcceptedRelationAndLocationProjection() {
     const auto accepted_entity = repository.loadEntity("entity-from-" + bidirectional_candidate.id);
     require(accepted_relation.ok() && accepted_entity.ok(), "projection bypass fixture must load accepted relation and entity");
     auto fact_record = std::find_if(relations.value->begin(), relations.value->end(),
+        /*
+         * 功能：定位关系审核产生的实体记录。
+         * 参数：value：输入，实体只读引用。
+         * 返回：id 与 accepted_entity 稳定标识相同为 true。
+         * 失败：无显式失败路径，只执行值比较。
+         * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+         * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+         */
         [&](const auto& value) { return value.id == accepted_entity.value->id; });
     require(fact_record != relations.value->end(), "projection bypass fixture must find the stable relation record");
     xuyan::domain::CandidateGraphProjection projection;
     projection.relation = *fact_record; projection.relation->revision = 0; projection.endpoints = selected;
-    /** @brief 绕过应用入口尝试伪造专用投影，仓储必须在写入审核前拒绝。 */
+    /*
+     * 功能：验证仓储先拒绝伪造关系投影再检查终结修订。
+     * 参数：forged：输入，伪造投影值，移动传入审核；command：输入，测试命令标识只读借用。
+     * 返回：无。
+     * 失败：不是 validation_failed 时断言抛异常。
+     * 副作用：尝试审核专用投影，预期不产生写入，不借修订冲突掩盖校验错误。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto reject_projection = [&](xuyan::domain::CandidateGraphProjection forged, const std::string& command) {
         const auto result = repository.reviewExtractionCandidate(command, *accepted_relation.value, 1, *accepted_entity.value,
                     std::nullopt, std::move(forged));
@@ -3013,7 +3706,14 @@ void testAcceptedRelationAndLocationProjection() {
     xuyan::domain::LocationPlacement location_record;
     location_record.location_id = location_entity.value->id; location_record.truth_status = "fact";
     location_projection.location = location_record;
-    /** @brief 验证仓储不接受类型化地点中没有证据的坐标、层级、底图或混合类型。 */
+    /*
+     * 功能：验证无证据地点坐标等字段在仓储边界被拒绝。
+     * 参数：value：输入，伪造图投影值，移动交给仓储。
+     * 返回：无。
+     * 失败：不是 validation_failed 时断言抛异常。
+     * 副作用：尝试审核地点，不应提交发明的坐标、层级或底图。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto reject_location = [&](xuyan::domain::CandidateGraphProjection value) {
         const auto result = repository.reviewExtractionCandidate("graph-forged-location", *accepted_location.value, 1, *location_entity.value,
                     std::nullopt, std::move(value));
@@ -3071,7 +3771,14 @@ void testAcceptedRelationAndLocationProjection() {
             "location and relationship semantic records must survive reopening");
 }
 
-/** @brief 验证跨章人物合并同步修复关系端点，拆分可追溯且不能覆盖合并后的图编辑。 */
+/*
+ * 功能：验证跨章人物合并同步修复关系端点，拆分可追溯且不能覆盖合并后的图编辑。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库写跨章人物和关系，注入 SQL 故障，验证端点修复、拆分追溯和后续编辑保护。
+ * 线程与生命周期：同步执行；连接和事务先于自有目录守卫释放。
+ */
 void testEntityMergeRelationReferenceRepair() {
     using xuyan::domain::DirectedRelation;
     using xuyan::domain::WorldEntity;
@@ -3080,10 +3787,23 @@ void testEntityMergeRelationReferenceRepair() {
     const auto directory = parent / ("xuyanforge-merge-reference-" + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory), "merge reference test must own its directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path directory;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 仅清理本次自有目录，保留用户小说、工作区与其他测试资料。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() { if (directory.parent_path() == parent) { std::error_code ignored; std::filesystem::remove_all(directory, ignored); } }
     } cleanup{directory, parent};
     const auto database = directory / "workspace.sqlite";
@@ -3140,7 +3860,14 @@ void testEntityMergeRelationReferenceRepair() {
     const auto opened_status = sqlite3_open(database.string().c_str(), &opened);
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> sql(opened, &sqlite3_close);
     require(opened_status == SQLITE_OK && sql, "merge reference fixture must open its owned database");
-    /** @brief 只执行当前独占临时数据库的故障注入，SQL不包含用户输入或外部素材。 */
+    /*
+     * 功能：执行当前合并测试数据库的故障注入 SQL。
+     * 参数：statement：输入，非空零结尾测试 SQL，只借用本调用，禁止用户输入。
+     * 返回：无。
+     * 失败：SQLite 执行失败由断言抛异常。
+     * 副作用：按语句修改测试库或创建/移除故障触发器，不回滚此前命令。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto execute = [&](const char* statement) {
         require(sqlite3_exec(sql.get(), statement, nullptr, nullptr, nullptr) == SQLITE_OK, "owned merge reference SQL must execute");
     };
@@ -3299,7 +4026,14 @@ void testEntityMergeRelationReferenceRepair() {
             "blocked split must retain author description and its revision");
 }
 
-/** @brief 验证跨章明确关联累积证据和逐字别名，保留作者字段并在失败时原子回滚。 */
+/*
+ * 功能：验证跨章明确关联累积证据和逐字别名，保留作者字段并在失败时原子回滚。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库创建作者字段及候选，显式关联已有条目、累积证据/别名并验证修订/回滚。
+ * 线程与生命周期：同步执行，候选和原文由测试生成，清理只限独占目录。
+ */
 void testCandidateAcceptanceIntoExistingEntity() {
     using namespace xuyan::application;
     using xuyan::package::JsonValue;
@@ -3308,9 +4042,23 @@ void testCandidateAcceptanceIntoExistingEntity() {
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
             "entity link must own an isolated workspace");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
-        std::filesystem::path directory, parent;
-        /** @brief 只清理本次独占测试目录，保持外部小说和用户工作区不变。 */
+        /* directory：本次创建的独占目录，无默认值，析构读取并清理。 */
+        std::filesystem::path directory,
+            /* parent：创建时确认的临时父路径，无默认值，仅用于析构边界核对。 */
+            parent;
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (directory.parent_path() == parent) {
                 std::error_code ignored;
@@ -3323,7 +4071,14 @@ void testCandidateAcceptanceIntoExistingEntity() {
     auto world = repository.createWorldTemplate("entity-link-world", "跨章关联测试");
     auto other = repository.createWorldTemplate("entity-link-other", "其他测试世界");
     require(world.ok() && other.ok(), "entity link worlds must be explicitly created");
-    /** @brief 显式创建具有作者自定义字段的同名条目，不由候选或生产代码预填资料。 */
+    /*
+     * 功能：显式创建带作者字段的同名关联目标。
+     * 参数：id：输入，稳定标识；world_id：输入，测试世界；status：输入，审核协议值；均为只读引用。
+     * 返回：创建后的独立实体值。
+     * 失败：创建失败断言抛异常。
+     * 副作用：写临时库，保留自定义说明/标签/属性用于验证关联不覆盖。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto create = [&](const std::string& id, const std::string& world_id, const std::string& status) {
         xuyan::domain::WorldEntity entity;
         entity.id = id; entity.world_id = world_id; entity.kind = "character";
@@ -3419,8 +4174,24 @@ void testCandidateAcceptanceIntoExistingEntity() {
     require(all_suggestions.ok() && all_suggestions.value->items.size() == 4,
             "candidate name and aliases must match every eligible exact identity without automatic selection");
     const auto alias_named_match = std::find_if(all_suggestions.value->items.begin(), all_suggestions.value->items.end(),
+        /*
+         * 功能：区分别名与名称恰好相同的匹配项。
+         * 参数：item：输入，身份建议只读引用。
+         * 返回：entity_id 与 alias_name.id 相同时为 true。
+         * 失败：无显式失败路径，只执行值比较。
+         * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+         * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+         */
         [&](const auto& item) { return item.entity_id == alias_name.id; });
     const auto target_match = std::find_if(all_suggestions.value->items.begin(), all_suggestions.value->items.end(),
+        /*
+         * 功能：定位显式关联目标的建议项。
+         * 参数：item：输入，身份建议只读引用。
+         * 返回：entity_id 与 target.id 相同时为 true。
+         * 失败：无显式失败路径，只执行值比较。
+         * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+         * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+         */
         [&](const auto& item) { return item.entity_id == target.id; });
     require(alias_named_match != all_suggestions.value->items.end() && alias_named_match->name_match
                 && !alias_named_match->alias_match && target_match != all_suggestions.value->items.end()
@@ -3534,7 +4305,14 @@ void testCandidateAcceptanceIntoExistingEntity() {
             "accepted candidates must leave the suggestion queue instead of proposing another identity link");
 }
 
-/** @brief 验证实体审核保留逐字别名，关系端点只提供当前世界的精确、已确认匹配建议。 */
+/*
+ * 功能：验证实体审核保留逐字别名，关系端点只提供当前世界的精确、已确认匹配建议。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：自有原文生成实体/关系候选，审核逐字别名，核对同世界精确建议、分页和拒绝。
+ * 线程与生命周期：同步执行，建议不自动接受端点，退出清理测试目录。
+ */
 void testAcceptedEntityAliasesAndEndpointMatches() {
     using namespace xuyan::application;
     using xuyan::package::JsonValue;
@@ -3543,10 +4321,23 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
             "endpoint review must own an isolated temporary workspace");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path directory;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 仅清理本次独占的测试目录，不触及用户小说或其他测试工作区。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (directory.parent_path() == parent) {
                 std::error_code ignored;
@@ -3657,7 +4448,14 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
     auto unsafe_identity = service.matchCandidateEntities(unsafe_probe.id, unsafe_probe.revision, 20, 0);
     require(unsafe_identity.ok() && unsafe_identity.value->kind == "other" && unsafe_identity.value->total == 0,
             "candidate suggestions must exclude matching entities created from claims or model hypotheses");
-    /** @brief 查询当前世界的匹配总数，先检查错误再读取结果，避免测试失败变成空指针访问。 */
+    /*
+     * 功能：读取当前世界的精确端点建议总数。
+     * 参数：mention：输入，待匹配提及字符串，只读借用，可为空由服务校验。
+     * 返回：匹配结果 total，单位条。
+     * 失败：服务失败先断言抛异常，避免读取无值结果。
+     * 副作用：只读当前测试世界建议，不接受或选中端点。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto match_total = [&](const std::string& mention) {
         const auto matches = service.matchRelationEndpoints(world.value->id, mention);
         require(matches.ok(), "endpoint count query must succeed");
@@ -3688,7 +4486,14 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
         auto result = service.matchRelationEndpoints(world.value->id, mention);
         require(result.ok() && result.value->total == 0, "substrings, wildcards and SQL text must not broaden exact matching");
     }
-    /** @brief 显式创建测试条目，避免生产代码预置任何端点、世界或示例资料。 */
+    /*
+     * 功能：显式创建过滤用端点资料。
+     * 参数：id：输入，稳定标识；world_id：输入，测试世界；kind：输入，实体类型；status：输入，审核状态；均只读借用。
+     * 返回：创建后的独立实体值。
+     * 失败：创建失败断言抛异常。
+     * 副作用：写带长说明及别名的测试条目，用于类型/状态/世界过滤。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto create = [&](const std::string& id, const std::string& world_id,
                             const std::string& kind, const std::string& status) {
         xuyan::domain::WorldEntity value;
@@ -3815,7 +4620,14 @@ void testAcceptedEntityAliasesAndEndpointMatches() {
             "legacy entity acceptance replay must return the old result without repairing historical aliases");
 }
 
-/** @brief 验证类型化事件审核原子生成带原文证据的时间线，并保留真实性和重放语义。 */
+/*
+ * 功能：验证类型化事件审核原子生成带原文证据的时间线，并保留真实性和重放语义。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库生成同名事件候选，审核后核对时间线、证据、重放与非法专用记录回滚。
+ * 线程与生命周期：同步执行，连接先于不可复制的目录守卫释放。
+ */
 void testAcceptedEventTimelineProjection() {
     using namespace xuyan::application;
     using xuyan::package::JsonValue;
@@ -3824,17 +4636,51 @@ void testAcceptedEventTimelineProjection() {
         std::chrono::steady_clock::now().time_since_epoch().count()));
     require(directory.parent_path() == parent && std::filesystem::create_directory(directory),
             "event review must own an isolated temporary workspace");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path directory;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
-        /** @brief 接管独占目录的清理责任，不扫描或接管其他目录。 */
+        /*
+         * 功能：接管本用例已创建目录的清理责任。
+         * 参数：owned：输入，独占临时目录路径值，移动保存；expected_parent：输入，已核实的父目录路径值，移动保存；均不能为空。
+         * 返回：完成守卫初始化。
+         * 失败：路径移动/构造异常传播；构造不校验路径归属，调用方须先核实并创建。
+         * 副作用：只保存路径，不扫描、不删除目录。
+         * 线程与生命周期：在调用线程创建，守卫必须晚于所有数据库及文件对象销毁。
+         */
         Cleanup(std::filesystem::path owned, std::filesystem::path expected_parent)
             : directory(std::move(owned)), parent(std::move(expected_parent)) {}
-        /** @brief 禁止复制清理责任，避免重复移除同一目录。 */
+        /*
+         * 功能：禁止复制目录清理责任。
+         * 参数：未命名 Cleanup 引用：输入，拟复制的源守卫。
+         * 返回：不产生对象。
+         * 失败：调用在编译期拒绝。
+         * 副作用：无，不共享或重复接管清理责任。
+         * 线程与生命周期：不可复制，源守卫仍管理原目录。
+         */
         Cleanup(const Cleanup&) = delete;
-        /** @brief 禁止覆盖已拥有的目录清理责任。 */
+        /*
+         * 功能：禁止赋值覆盖目录清理责任。
+         * 参数：未命名 Cleanup 引用：输入，拟赋值的源守卫。
+         * 返回：无可调用返回值，赋值被禁止。
+         * 失败：调用在编译期拒绝。
+         * 副作用：无，不丢弃现有目录所有权。
+         * 线程与生命周期：不可赋值，各守卫的责任保持独立。
+         */
         Cleanup& operator=(const Cleanup&) = delete;
-        /** @brief 仅清理本次创建的临时工作区，不接触用户小说或其他测试目录。 */
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (directory.parent_path() == parent) {
                 std::error_code ignored;
@@ -3937,6 +4783,14 @@ void testAcceptedEventTimelineProjection() {
         require(events.ok() && events.value->size() == index + 1, "event review replay must not duplicate projections");
         const auto id = "entity-from-" + candidate.id;
         const auto event = std::find_if(events.value->begin(), events.value->end(),
+                                       /*
+                                        * 功能：定位当前审核产生的时间事件。
+                                        * 参数：value：输入，时间事件只读引用。
+                                        * 返回：value.id 与当前循环实体 id 相同时为 true。
+                                        * 失败：无显式失败路径，只执行值比较。
+                                        * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                                        * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+                                        */
                                        [&](const auto& value) { return value.id == id; });
         require(event != events.value->end() && event->name == candidate.name
                     && event->truth_status == truths[index] && event->revision == 1
@@ -3950,6 +4804,14 @@ void testAcceptedEventTimelineProjection() {
                 "claim and hypothesis entities must remain non-facts");
         auto evidence = EvidenceService(database).listForSource(source.value->id);
         require(evidence.ok() && std::any_of(evidence.value->begin(), evidence.value->end(),
+            /*
+             * 功能：核对事件证据的逐字内容、码点区间及来源性质。
+             * 参数：value：输入，证据引用只读值。
+             * 返回：实体、引文、起止 Unicode 码点、摘要及 provenance[index] 均匹配时为 true。
+             * 失败：无显式失败路径，只执行值比较。
+             * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+             * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+             */
             [&](const auto& value) { return value.entity_id == id && value.quote == candidate.quote
                 && value.start_codepoint == candidate.start_codepoint && value.end_codepoint == candidate.end_codepoint
                 && value.quote_hash == candidate.quote_hash && value.provenance_type == provenance[index]; }),
@@ -4063,7 +4925,14 @@ void testAcceptedEventTimelineProjection() {
             "accepted event projections must survive a new repository connection");
 }
 
-/** @brief 验证主干预览的可逆句段覆盖、密度档位和唯一引文原文映射。 */
+/*
+ * 功能：验证主干预览的可逆句段覆盖、密度档位和唯一引文原文映射。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：独占目录导入合成原文，检查主干分段覆盖、密度和唯一引文映射，退出清理。
+ * 线程与生命周期：同步执行，区分字节和 Unicode 码点，保留不可变原文。
+ */
 void testNarrativeBackbonePreviewAndEvidenceMapping() {
     const auto temporary_root = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
     const auto directory = temporary_root / ("xuyanforge-backbone-test-" + std::to_string(
@@ -4071,9 +4940,23 @@ void testNarrativeBackbonePreviewAndEvidenceMapping() {
     require(directory.is_absolute() && directory.parent_path() == temporary_root
                 && std::filesystem::create_directory(directory),
             "backbone test workspace must be a new directory under system temp");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path root;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (root.parent_path() == parent) {
                 std::error_code ignored;
@@ -4121,8 +5004,24 @@ void testNarrativeBackbonePreviewAndEvidenceMapping() {
                 && preview.value->preview_text.find("微风吹过树影") == std::string::npos
                 && preview.value->preview_text.find("阳光照在窗沿") == std::string::npos,
             "preview must retain synthetic plot facts while folding explicit scenic descriptions");
+    /*
+     * 功能：统计主干分段中指定保留/淘汰原因。
+     * 参数：reason：输入，原因枚举，按原值比较。
+     * 返回：匹配段数，单位段。
+     * 失败：无显式失败路径。
+     * 副作用：只读 preview 分段，不修改原文或统计对象。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     const auto count_reason = [&](xuyan::application::NarrativeSelectionReason reason) {
         return std::count_if(preview.value->segments.begin(), preview.value->segments.end(),
+            /*
+             * 功能：识别主干分段原因。
+             * 参数：segment：输入，分段只读引用。
+             * 返回：segment.reason 等于按值捕获的 reason 时为 true。
+             * 失败：无显式失败路径，只执行值比较。
+             * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+             * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+             */
             [reason](const auto& segment) { return segment.reason == reason; });
     };
     require(count_reason(xuyan::application::NarrativeSelectionReason::description) >= 2
@@ -4177,7 +5076,14 @@ void testNarrativeBackbonePreviewAndEvidenceMapping() {
             "ambiguous quotes, omitted text, damaged mappings and invalid ranges must not produce evidence anchors");
 }
 
-/** @brief 检查可移植人物卡的版本、修订冲突和导入往返。 */
+/*
+ * 功能：检查可移植人物卡的版本、修订冲突和导入往返。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库显式安装人物卡，检查版本、修订冲突和人物包导入导出。
+ * 线程与生命周期：同步操作自有卡片与文件，不访问模型。
+ */
 void testCharacterBlueprintVersioning() {
     const auto path = temporaryDatabase().parent_path() / "characters.sqlite";
     const auto imported_path = temporaryDatabase().parent_path() / "characters-imported.sqlite";
@@ -4252,7 +5158,14 @@ void testCharacterBlueprintVersioning() {
     std::filesystem::remove(package_path, ignored);
 }
 
-/** @brief 验证世界包往返及恶意包导入失败时的原子性。 */
+/*
+ * 功能：验证世界包往返及恶意包导入失败时的原子性。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时工作区写世界包、导入，并用恶意包验证不留下部分资料。
+ * 线程与生命周期：同步执行，固定测试目录需独占。
+ */
 void testWorldPackageRoundTripAndAtomicImport() {
     const auto directory = std::filesystem::temp_directory_path() / "xuyanforge-package-tests";
     const auto source_database = directory / "source.sqlite";
@@ -4319,7 +5232,14 @@ void testWorldPackageRoundTripAndAtomicImport() {
     std::filesystem::remove_all(directory, ignored);
 }
 
-/** @brief 检查提供商元数据修订与系统凭据边界。 */
+/*
+ * 功能：检查提供商元数据修订与系统凭据边界。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库保存更新连接，用内存替身检查凭据边界、删除和修订冲突。
+ * 线程与生命周期：同步执行，伪凭据随内存设施销毁，不调用模型。
+ */
 void testProviderConnectionCredentialBoundary() {
     const auto path = temporaryDatabase().parent_path() / "providers.sqlite";
     removeDatabase(path);
@@ -4372,7 +5292,14 @@ void testProviderConnectionCredentialBoundary() {
     removeDatabase(path);
 }
 
-/** @brief 验证操作系统原生凭据存储的创建、读取和删除往返。 */
+/*
+ * 功能：验证操作系统原生凭据存储的创建、读取和删除往返。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：用测试专用标识在系统凭据设施写、读、删，数据不写入源码或数据库。
+ * 线程与生命周期：同步执行原生适配，不承诺未实现平台可用。
+ */
 void testNativeCredentialStoreRoundTrip() {
 #ifdef _WIN32
     xuyan::platform::SystemCredentialStore credentials;
@@ -4388,12 +5315,27 @@ void testNativeCredentialStoreRoundTrip() {
 #endif
 }
 
-/** @brief 验证中文召回先执行时间和可见性过滤。 */
+/*
+ * 功能：验证中文召回先执行时间和可见性过滤。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库创建当前/未来条目，核对中文召回的时间及角色权限过滤。
+ * 线程与生命周期：同步执行，查找闭包只在本调用期间借用目标标识。
+ */
 void testTimeAndPermissionFilteredChineseRetrieval() {
     const auto path = temporaryDatabase().parent_path() / "retrieval.sqlite";
     removeDatabase(path);
     xuyan::application::WorkspaceService workspace(path);
     require(workspace.openAndList().ok(), "retrieval workspace must initialize");
+    /*
+     * 功能：创建中文检索的测试事件。
+     * 参数：id：输入，稳定标识值，可移动；name：输入，显示名称值，可移动。
+     * 返回：创建后的实体稳定标识字符串。
+     * 失败：创建失败断言抛异常，仓储/分配异常传播。
+     * 副作用：写 world-retrieval-test 中的事件和自有说明。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     auto create = [&](std::string id, std::string name) {
         xuyan::domain::WorldEntity entity; entity.id = std::move(id); entity.world_id = "world-retrieval-test"; entity.kind = "event";
         entity.name = std::move(name); entity.description = "雾铃相关的封门线索";
@@ -4436,14 +5378,37 @@ void testTimeAndPermissionFilteredChineseRetrieval() {
     author_request.story_time = 35;
     auto later_hits = retrieval.retrieve(author_request);
     require(later_hits.ok() && std::any_of(later_hits.value->begin(), later_hits.value->end(),
+                /*
+                 * 功能：识别未来条目的召回结果。
+                 * 参数：hit：输入，检索命中只读引用。
+                 * 返回：hit.entity.id 等于 future 时为 true。
+                 * 失败：无显式失败路径，只执行值比较。
+                 * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                 * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+                 */
                 [&](const auto& hit) { return hit.entity.id == future; })
                 && std::none_of(later_hits.value->begin(), later_hits.value->end(),
+                /*
+                 * 功能：识别当前可见条目的召回结果。
+                 * 参数：hit：输入，检索命中只读引用。
+                 * 返回：hit.entity.id 等于 present 时为 true。
+                 * 失败：无显式失败路径，只执行值比较。
+                 * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                 * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+                 */
                 [&](const auto& hit) { return hit.entity.id == present; }),
             "later retrieval must include newly effective facts and exclude expired facts");
     removeDatabase(path);
 }
 
-/** @brief 检查世界版本不可变性及历史时间点快照的成员选择。 */
+/*
+ * 功能：检查世界版本不可变性及历史时间点快照的成员选择。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库发布不可变世界版本并创建历史快照，核对未来成员与修订冻结。
+ * 线程与生命周期：同步执行，仓储持有版本记录，查找闭包不逃逸。
+ */
 void testImmutableWorldVersionsAndHistoricalSnapshots() {
     const auto path = temporaryDatabase().parent_path() / "world-versions.sqlite";
     removeDatabase(path);
@@ -4478,6 +5443,14 @@ void testImmutableWorldVersionsAndHistoricalSnapshots() {
     auto reloaded_one = versions.load(version_one.value->id);
     require(reloaded_one.ok(), "published v1 must remain loadable");
     const auto old_xucheng = std::find_if(reloaded_one.value->members.begin(), reloaded_one.value->members.end(),
+        /*
+         * 功能：定位版本中的合成目标人物成员。
+         * 参数：member：输入，版本成员只读引用。
+         * 返回：entity_id 为 entity-xucheng 时为 true。
+         * 失败：无显式失败路径，只执行值比较。
+         * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+         * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+         */
         [](const auto& member) { return member.entity_id == "entity-xucheng"; });
     require(old_xucheng != reloaded_one.value->members.end() && old_xucheng->entity_revision == 1,
             "loading v1 after edits must still reference the original entity revision");
@@ -4488,6 +5461,14 @@ void testImmutableWorldVersionsAndHistoricalSnapshots() {
     auto snapshot = versions.prepareSnapshot("snapshot-at-50", version_two.value->id, 50);
     require(snapshot.ok()
                 && std::none_of(snapshot.value->included_members.begin(), snapshot.value->included_members.end(),
+                    /*
+                     * 功能：检查未来实体是否误入历史快照。
+                     * 参数：member：输入，历史快照成员只读引用。
+                     * 返回：entity_id 等于 future.id 时为 true。
+                     * 失败：无显式失败路径，只执行值比较。
+                     * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+                     */
                     [&](const auto& member) { return member.entity_id == future.id; })
                 && std::find(snapshot.value->unresolved_entity_ids.begin(), snapshot.value->unresolved_entity_ids.end(), unknown.id)
                     != snapshot.value->unresolved_entity_ids.end(),
@@ -4499,7 +5480,14 @@ void testImmutableWorldVersionsAndHistoricalSnapshots() {
     removeDatabase(path);
 }
 
-/** @brief 验证事件顺序、关系可见性和地点拓扑互不混淆。 */
+/*
+ * 功能：验证事件顺序、关系可见性和地点拓扑互不混淆。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库写时间事件、定向关系和地点拓扑，检查顺序、权限、未知位置和循环拒绝。
+ * 线程与生命周期：同步执行，图资料由测试显式创建。
+ */
 void testTimelineRelationsAndMapSemantics() {
     const auto path = temporaryDatabase().parent_path() / "world-graph.sqlite";
     removeDatabase(path);
@@ -4532,6 +5520,14 @@ void testTimelineRelationsAndMapSemantics() {
             "narrative order must remain distinct from story chronology for flashbacks");
     auto at_fifty = graph.listTimeline("world-synthetic-test", false, 50);
     require(at_fifty.ok() && at_fifty.value->size() == 2
+                /*
+                 * 功能：定位谈判事件的时间线位置。
+                 * 参数：e：输入，时间事件只读引用。
+                 * 返回：e.id 等于 negotiation.id 时为 true。
+                 * 失败：无显式失败路径，只执行值比较。
+                 * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                 * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+                 */
                 && std::none_of(at_fifty.value->begin(), at_fifty.value->end(), [&](const auto& e) { return e.id == negotiation.id; }),
             "time-filtered event view must exclude future candidates while retaining unknowns visibly");
 
@@ -4553,6 +5549,14 @@ void testTimelineRelationsAndMapSemantics() {
     require(shen_view.ok() && shen_view.value->size() == 2,
             "authorized relation view must retain different A-to-B and B-to-A dimensions");
 
+    /*
+     * 功能：创建地点拓扑的测试节点。
+     * 参数：id：输入，地点稳定标识值；name：输入，名称值，移动保存。
+     * 返回：workspace.create 的结果，成功含实体，失败含仓储错误。
+     * 失败：仓储错误按 Result 传播，分配异常继续抛出。
+     * 副作用：向当前临时世界写地点条目和命令。
+     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+     */
     auto create_location = [&](std::string id, std::string name) {
         xuyan::domain::WorldEntity entity; entity.id = id; entity.world_id = "world-synthetic-test";
         entity.kind = "location"; entity.name = std::move(name);
@@ -4580,7 +5584,14 @@ void testTimelineRelationsAndMapSemantics() {
     removeDatabase(path);
 }
 
-/** @brief 验证人物实例跨世界隔离及不同分支根模式的绑定约束。 */
+/*
+ * 功能：验证人物实例跨世界隔离及不同分支根模式的绑定约束。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库创建卡片版本、跨世界实例，验证分支根绑定与不同模式约束。
+ * 线程与生命周期：同步执行，固定测试数据库需独占。
+ */
 void testCharacterInstancesAndBranchRootModes() {
     const auto path = temporaryDatabase().parent_path() / "character-instances.sqlite";
     removeDatabase(path);
@@ -4646,7 +5657,14 @@ void testCharacterInstancesAndBranchRootModes() {
     removeDatabase(path);
 }
 
-/** @brief 检查生产推演会话的启动、推进、暂停和恢复生命周期。 */
+/*
+ * 功能：检查生产推演会话的启动、推进、暂停和恢复生命周期。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：生产会话存储配合测试合成引擎，检查启动/推进/暂停/恢复、预算与未决回合。
+ * 线程与生命周期：同步执行，不代表通用生产回合或真实模型验收。
+ */
 void testProductionSimulationSessionLifecycle() {
     const auto path = temporaryDatabase().parent_path() / "production-simulation.sqlite";
     removeDatabase(path);
@@ -4785,7 +5803,14 @@ void testProductionSimulationSessionLifecycle() {
     removeDatabase(path);
 }
 
-/** @brief 验证分支比较、导出诊断脱敏与结果采纳。 */
+/*
+ * 功能：验证分支比较、导出诊断脱敏与结果采纳。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：临时库分叉合成会话、比较、导出 Markdown/JSON/脱敏诊断并显式采纳。
+ * 线程与生命周期：同步执行，导出仅在测试目录，不含真实模型响应或私有小说。
+ */
 void testBranchComparisonExportDiagnosticsAndAdoption() {
     const auto path = temporaryDatabase().parent_path() / "branch-outcomes.sqlite";
     removeDatabase(path);
@@ -4813,6 +5838,14 @@ void testBranchComparisonExportDiagnosticsAndAdoption() {
     require(compared.ok() && compared.value->common_commit_id == root.value->commit_id
                 && compared.value->left_calls == 2 && compared.value->right_calls == 0
                 && std::any_of(compared.value->differences.begin(), compared.value->differences.end(),
+                    /*
+                     * 功能：检查分支比较是否包括印章观察差异。
+                     * 参数：difference：输入，差异条目的只读引用。
+                     * 返回：field 为 seal_inspected 时为 true。
+                     * 失败：无显式失败路径，只执行值比较。
+                     * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+                     */
                     [](const auto& difference) { return difference.field == "seal_inspected"; }),
             "branch comparison must expose common ancestor, state/relationship differences and separate cost totals");
 
@@ -4826,6 +5859,14 @@ void testBranchComparisonExportDiagnosticsAndAdoption() {
     auto diagnostic_export = outcomes.exportDiagnostics(diagnostics);
     require(markdown_export.ok() && json_export.ok() && diagnostic_export.ok(),
             "committed branch must export as Markdown, structured JSON and sanitized diagnostics");
+    /*
+     * 功能：读取本用例生成的导出文件供断言。
+     * 参数：file：输入，自有导出路径的只读引用，不接管文件所有权。
+     * 返回：全部二进制文件字节；打开失败时流可能产生空字符串。
+     * 失败：不额外检查流状态，分配异常传播；内容缺失由随后断言发现。
+     * 副作用：只读导出文件并关闭局部输入流。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     auto read = [](const auto& file) { std::ifstream input(file, std::ios::binary); return std::string(
         std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()); };
     const auto markdown_text = read(markdown);
@@ -4854,7 +5895,14 @@ void testBranchComparisonExportDiagnosticsAndAdoption() {
     removeDatabase(path);
 }
 
-/** @brief 通过并发写入回归验证工作区单写入协调。 */
+/*
+ * 功能：通过并发写入回归验证工作区单写入协调。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：多线程各建服务向同一测试库写入，锁保护失败数组，全部 join 后核对数量。
+ * 线程与生命周期：主线程持有线程数组与捕获对象，寿命覆盖所有 join，无分离线程。
+ */
 void testConcurrentWorkspaceWritersAreSerialized() {
     const auto path = temporaryDatabase().parent_path() / "concurrent-writers.sqlite";
     removeDatabase(path);
@@ -4866,6 +5914,14 @@ void testConcurrentWorkspaceWritersAreSerialized() {
     std::vector<std::string> failures;
     std::vector<std::thread> writers;
     for (int index = 0; index < 12; ++index) {
+        /*
+         * 功能：在一个测试工作线程创建事件并收集失败。
+         * 参数：无；index 按值捕获为线程编号。
+         * 返回：无。
+         * 失败：服务构造或分配异常未在线程入口捕获，可导致 std::terminate；Result 失败另存列表。
+         * 副作用：打开线程自己的仓储并写事件；失败数组在 result_mutex 保护下追加。
+         * 线程与生命周期：由 std::thread 执行；path/锁/失败数组借用到主线程全部 join 后才释放，index 为值
+         */
         writers.emplace_back([&, index] {
             xuyan::application::WorkspaceService service(path);
             xuyan::domain::WorldEntity entity;
@@ -4882,7 +5938,14 @@ void testConcurrentWorkspaceWritersAreSerialized() {
     removeDatabase(path);
 }
 
-/** @brief 用运行时合成千万汉字校验章节、切片、末章证据和离线抽样。 */
+/*
+ * 功能：用运行时合成千万汉字校验章节、切片、末章证据和离线抽样。
+ * 参数：无。
+ * 返回：无；所有断言满足时正常返回。
+ * 失败：断言不满足由 require 抛出 runtime_error；未由用例预期捕获的文件、仓储及分配异常向入口传播。
+ * 副作用：显式可选路径在独占目录生成千万汉字，检查章节、切片、末章证据及离线两步，记录耗时。
+ * 线程与生命周期：同步执行、退出清理；不测真实小说质量或资源峰值。
+ */
 void testSyntheticTenMillionCodepointPipeline() {
     const auto temporary_root = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
     const auto directory = temporary_root / ("xuyanforge-stress-10m-" + std::to_string(
@@ -4890,9 +5953,23 @@ void testSyntheticTenMillionCodepointPipeline() {
     require(directory.is_absolute() && directory.parent_path() == temporary_root
                 && std::filesystem::create_directory(directory),
             "synthetic stress workspace must be a new directory below the system temp directory");
+    /*
+     * 职责：作用域管理本用例显式创建的合成资料的精确临时目录，拥有清理责任而非活动连接。
+     * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+     */
     struct Cleanup {
+        /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
         std::filesystem::path root;
+        /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
         std::filesystem::path parent;
+        /*
+         * 功能：退出时清理本用例显式创建的合成资料。
+         * 参数：无。
+         * 返回：完成目录清理尝试及守卫销毁。
+         * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+         * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+         * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+         */
         ~Cleanup() {
             if (root.parent_path() == parent) {
                 std::error_code ignored;
@@ -4969,6 +6046,14 @@ void testSyntheticTenMillionCodepointPipeline() {
     }
     xuyan::application::MockExtractionProcessor offline(database);
     xuyan::application::OfflineBatchOptions pause;
+    /*
+     * 功能：在千万字回归首片提交后暂停。
+     * 参数：progress：输入，离线已处理片数的只读进度。
+     * 返回：processed_steps 为 1 返回 pause，否则 proceed。
+     * 失败：无显式失败路径。
+     * 副作用：只返回调度动作，不直接更新数据库。
+     * 线程与生命周期：无捕获，同步调用；输入引用只在本次比较或进度回调有效，不保存。
+     */
     pause.on_progress = [](const xuyan::application::OfflineBatchProgress& progress) {
         return progress.processed_steps == 1 ? xuyan::application::OfflineBatchAction::pause
                                             : xuyan::application::OfflineBatchAction::proceed;
@@ -4985,15 +6070,22 @@ void testSyntheticTenMillionCodepointPipeline() {
                 && resumed.value->job.steps.front().attempt == 1,
             "long-form checkpoint must resume at the next step without replaying the first one");
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    std::cout << "Synthetic long-form validation: " << expected_han_characters << " Han characters, "
-              << expected_codepoints << " codepoints, "
-              << source.value->chapters.size() << " chapters, " << job.value->total_steps
-              << " chunks, two offline steps with pause/resume in " << seconds << " seconds.\n";
+    std::cout << "合成长篇回归： " << expected_han_characters << " 汉字， "
+              << expected_codepoints << " 码点， "
+              << source.value->chapters.size() << " 章， " << job.value->total_steps
+              << " 片，离线两步及暂停续跑耗时 " << seconds << " 秒。\n";
 }
 
 } // namespace
 
-/** @brief 运行可选长篇语料回归和全部无界面核心测试，失败时返回非零状态。 */
+/*
+ * 功能：运行可选长篇语料回归和全部无界面核心测试，失败时返回非零状态。
+ * 参数：无；读取显式千万字开关及 Windows 外部素材/全量离线环境开关。
+ * 返回：所执行断言全通过返回 0，捕获 std::exception 后报告并返回 1。
+ * 失败：断言、文件及仓储异常进入入口 catch；非 std::exception 不在此捕获。
+ * 副作用：默认执行本地回归；可选外部小说的标准化副本仅写独占临时目录并由守卫清理，不发送模型；打印统计。
+ * 线程与生命周期：主线程顺序调度，并发用例自行 join；抽样不代表全书质量或千万字峰值验收。
+ */
 int main() {
     try {
         if (const auto* stress = std::getenv("XUYANFORGE_STRESS_10M"); stress != nullptr
@@ -5010,10 +6102,23 @@ int main() {
                         && std::filesystem::create_directory(directory),
                     "local novel test workspace must be a new system temp directory");
             // 用户小说的标准化副本只保存在本轮临时工作区；异常退出路径也由作用域守卫清理。
+            /*
+             * 职责：作用域管理外部小说回归的标准化副本的精确临时目录，拥有清理责任而非活动连接。
+             * 生命周期与线程：在调用线程创建并最后销毁；仅当前用例使用，不可复制用于多份清理责任。
+             */
             struct LocalNovelCleanup {
+                /* 本用例创建的独占目录路径，无默认值；初始化后只由析构读取，不接管用户素材目录。 */
                 std::filesystem::path root;
+                /* 创建时确认的临时父目录，无默认值，析构比较父路径以约束删除范围，寿命随守卫。 */
                 std::filesystem::path parent;
-                /** @brief 仅清理本次创建的系统临时子目录，不触碰原小说或其他测试。 */
+                /*
+                 * 功能：退出时清理外部小说回归的标准化副本。
+                 * 参数：无。
+                 * 返回：完成目录清理尝试及守卫销毁。
+                 * 失败：删除错误由 error_code 忽略；路径运算异常不捕获，隐式 noexcept 析构下可导致终止。
+                 * 副作用：仅在父路径匹配时递归删除精确自有目录，不删除父目录。
+                 * 线程与生命周期：调用线程同步析构，须先释放目录内文件和数据库；该局部类型不应用于其他素材。
+                 */
                 ~LocalNovelCleanup() {
                     if (root.parent_path() == parent) {
                         std::error_code ignored;
@@ -5093,6 +6198,14 @@ int main() {
             }
             for (const auto& step : job.value->steps) {
                 auto chapter = std::find_if(source.value->chapters.begin(), source.value->chapters.end(),
+                    /*
+                     * 功能：检查某个片段完全处于一章码点范围内。
+                     * 参数：item：输入，章节只读引用。
+                     * 返回：item.start_codepoint ≤ step.start_codepoint 且 step.end_codepoint ≤ item.end_codepoint 时为 true。
+                     * 失败：无显式失败路径，只执行值比较。
+                     * 副作用：只读输入及所需捕获，不改库、原文或共享状态。
+                     * 线程与生命周期：同步调用；按引用捕获当前用例所需对象，闭包不逃逸所属测试/批次调用，输入引用不保存。
+                     */
                     [&](const auto& item) { return item.start_codepoint <= step.start_codepoint
                         && step.end_codepoint <= item.end_codepoint; });
                 require(chapter != source.value->chapters.end(), "a chunk must not cross chapter boundary");
@@ -5116,17 +6229,17 @@ int main() {
                         "full offline extraction must preserve sampled review candidates");
                 const auto full_seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - full_started).count();
-                std::cout << "Full local novel offline validation: " << completed.value->completed_steps
-                          << " chunks, " << full_candidates.value->size() << " review candidates in "
-                          << full_seconds << " seconds after the initial 10 chunks.\n";
+                std::cout << "本地小说全量离线回归： " << completed.value->completed_steps
+                          << " 片， " << full_candidates.value->size() << " 个待校对候选，耗时 "
+                          << full_seconds << " 秒（首批 10 片之后）。\n";
             }
             const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-            std::cout << "Local novel validation: " << source.value->chapters.size() << " chapters, "
-                      << job.value->total_steps << " chunks, " << candidates.value->size()
-                      << " review candidates in 10 sampled chunks, " << seconds << " seconds. "
-                      << "Read-only outline retained " << preview_retained_codepoints << '/'
-                      << preview_source_codepoints << " source codepoints in those chunks. "
-                      << "Reason codepoints (heading/dialogue/action/context/reduced/description/duplicate/blank): ";
+            std::cout << "本地小说回归： " << source.value->chapters.size() << " 章， "
+                      << job.value->total_steps << " 片， " << candidates.value->size()
+                      << " 个候选（抽样 10 片）， " << seconds << " 秒。 "
+                      << "只读主干保留 " << preview_retained_codepoints << '/'
+                      << preview_source_codepoints << " 个抽样原文码点。 "
+                      << "各分段原因码点数（标题／对话／行动／上下文／压缩／描写／重复／空白）： ";
             for (const auto count : preview_reason_codepoints) std::cout << count << ' ';
             std::cout << "\n";
         }
@@ -5171,10 +6284,10 @@ int main() {
         testBranchComparisonExportDiagnosticsAndAdoption();
         testNativeCredentialStoreRoundTrip();
         testConcurrentWorkspaceWritersAreSerialized();
-        std::cout << "All XuyanForge core tests passed.\n";
+        std::cout << "叙演工坊核心测试全部通过。\n";
         return 0;
     } catch (const std::exception& exception) {
-        std::cerr << "Test failure: " << exception.what() << '\n';
+        std::cerr << "测试失败： " << exception.what() << '\n';
         return 1;
     }
 }

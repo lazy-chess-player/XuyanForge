@@ -1,5 +1,7 @@
 #include "xuyan/application/provider_connection_service.h"
 
+#include "credential_scope.h"
+
 #include "xuyan/domain/hash.h"
 #include "xuyan/storage/workspace_repository.h"
 
@@ -12,6 +14,15 @@ using xuyan::domain::Result;
 ProviderConnectionService::ProviderConnectionService(std::filesystem::path database_path, ICredentialStore& credentials)
     : database_path_(std::move(database_path)), credentials_(credentials) {}
 
+Result<ProviderConnection> ProviderConnectionService::load(const std::string& connection_id) {
+    try {
+        return xuyan::storage::WorkspaceRepository(database_path_).loadProviderConnection(connection_id);
+    } catch (...) {
+        return Result<ProviderConnection>::failure({ErrorCode::storage_error,
+            "无法读取模型连接，详情已隐藏", true, "检查工作区后刷新连接"});
+    }
+}
+
 Result<std::vector<ProviderConnection>> ProviderConnectionService::list() {
     try { return xuyan::storage::WorkspaceRepository(database_path_).listProviderConnections(); }
     catch (const std::exception& exception) { return Result<std::vector<ProviderConnection>>::failure(
@@ -21,6 +32,7 @@ Result<std::vector<ProviderConnection>> ProviderConnectionService::list() {
 Result<ProviderConnection> ProviderConnectionService::save(
     const std::string& command_id, ProviderConnection connection, int expected_revision,
     std::optional<std::string> new_secret) {
+    const detail::CredentialScope wipe_new_secret(new_secret);
     if (command_id.empty()) return Result<ProviderConnection>::failure(
         {ErrorCode::validation_failed, "命令标识不能为空", false, "重新提交"});
     if (connection.id.empty()) connection.id = "provider-" + xuyan::domain::sha256(command_id).substr(0, 16);
@@ -28,30 +40,50 @@ Result<ProviderConnection> ProviderConnectionService::save(
     auto validated = xuyan::domain::validateProviderConnection(std::move(connection));
     if (!validated.ok()) return validated;
     if (new_secret && (new_secret->empty() || new_secret->size() > 65536)) return Result<ProviderConnection>::failure(
-        {ErrorCode::validation_failed, "API Key 不能为空且不能超过 64 KiB", false, "重新输入凭据"});
+        {ErrorCode::validation_failed, "接口密钥不能为空且不能超过 64 KiB", false, "重新输入凭据"});
 
     // 数据库提交失败时恢复旧凭据，使系统凭据与连接元数据尽量保持一致。
     std::optional<std::string> previous_secret;
+    const detail::CredentialScope wipe_previous_secret(previous_secret);
     if (new_secret) {
         auto previous = credentials_.get(validated.value->credential_ref);
-        if (previous.ok()) previous_secret = *previous.value;
+        if (previous.ok()) previous_secret = std::move(*previous.value);
+        else if (previous.error->code != ErrorCode::missing_context) {
+            // 设施读取失败不能当作旧秘密不存在，否则数据库失败时会误删原有凭据。
+            return Result<ProviderConnection>::failure(*previous.error);
+        }
         auto stored = credentials_.put(validated.value->credential_ref, *new_secret);
         if (!stored.ok()) return Result<ProviderConnection>::failure(*stored.error);
     }
+    /*
+     * 功能：元数据失败时补偿本次凭据变更。参数：无，借用本调用的旧秘密/连接及凭据端口。
+     * 返回：成功 true，或隐藏详情的补偿错误。失败：端口返回失败或抛异常均报告补偿失败。
+     * 副作用：恢复旧值或删除本次新增值；线程：同调用线程同步，不逃逸引用，不跨两种存储保证原子性。
+     */
+    const auto compensate = [&]() -> Result<bool> {
+        if (!new_secret) return Result<bool>::success(true);
+        try {
+            auto restored = previous_secret
+                ? credentials_.put(validated.value->credential_ref, *previous_secret)
+                : credentials_.remove(validated.value->credential_ref);
+            if (restored.ok()) return Result<bool>::success(true);
+        } catch (...) {}
+        return Result<bool>::failure({ErrorCode::credential_consistency_failed,
+            "连接保存失败且凭据恢复未完成，详情已隐藏", false, "人工检查系统凭据与连接状态后再操作"});
+    };
     try {
         xuyan::storage::WorkspaceRepository repository(database_path_);
         auto saved = repository.saveProviderConnection(command_id, *validated.value, expected_revision);
-        if (!saved.ok() && new_secret) {
-            if (previous_secret) credentials_.put(validated.value->credential_ref, *previous_secret);
-            else credentials_.remove(validated.value->credential_ref);
+        if (!saved.ok()) {
+            const auto restored = compensate();
+            if (!restored.ok()) return Result<ProviderConnection>::failure(*restored.error);
         }
         return saved;
-    } catch (const std::exception& exception) {
-        if (new_secret) {
-            if (previous_secret) credentials_.put(validated.value->credential_ref, *previous_secret);
-            else credentials_.remove(validated.value->credential_ref);
-        }
-        return Result<ProviderConnection>::failure({ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"});
+    } catch (...) {
+        const auto restored = compensate();
+        if (!restored.ok()) return Result<ProviderConnection>::failure(*restored.error);
+        return Result<ProviderConnection>::failure({ErrorCode::storage_error,
+            "模型连接保存失败，详情已隐藏", true, "检查工作区后重试"});
     }
 }
 
@@ -60,11 +92,15 @@ Result<bool> ProviderConnectionService::hasCredential(const std::string& connect
         auto loaded = xuyan::storage::WorkspaceRepository(database_path_).loadProviderConnection(connection_id);
         if (!loaded.ok()) return Result<bool>::failure(*loaded.error);
         auto secret = credentials_.get(loaded.value->credential_ref);
+        if (secret.ok()) {
+            const detail::CredentialScope wipe_secret(*secret.value);
+            return Result<bool>::success(!secret.value->empty());
+        }
         if (!secret.ok()) {
             if (secret.error->code == ErrorCode::missing_context) return Result<bool>::success(false);
             return Result<bool>::failure(*secret.error);
         }
-        return Result<bool>::success(!secret.value->empty());
+        return Result<bool>::success(false);
     } catch (const std::exception& exception) { return Result<bool>::failure(
         {ErrorCode::storage_error, exception.what(), true, "检查工作区后重试"}); }
 }

@@ -17,12 +17,22 @@ using xuyan::domain::ErrorCode;
 using xuyan::domain::Result;
 using xuyan::package::JsonValue;
 
-/** @brief 从候选 JSON 对象读取必需字段；非对象时返回空指针。 */
+/*
+ * 功能：读取候选 JSON 对象的指定字段，仅用于后续逐项协议校验。
+ * 参数：object 为借用的 JSON 值；key 为借用的字段名，均须在调用期间有效。
+ * 返回：字段的观察指针；非对象或缺字段返回空指针，指针寿命不超过 object。
+ * 失败：不抛业务错误；副作用：只读；线程：同步，不保存指针。
+ */
 const JsonValue* required(const JsonValue& object, std::string_view key) {
     return object.isObject() ? object.find(key) : nullptr;
 }
 
-/** @brief 将模型输出的协议错误转为拒绝提交的可报告结果。 */
+/*
+ * 功能：把候选协议失败封装成指定任务结果类型，阻止后续提交。
+ * 参数：模板 JobResult 为调用方期望的任务或检查点类型；message 为按值取得的中文错误原因。
+ * 返回：失败的 Result<JobResult>，不包含任务值。失败：构造结果时分配异常可传播。
+ * 副作用：仅构造内存结果；线程：同步，不保留 message 引用。
+ */
 template<class JobResult>
 Result<JobResult> protocolError(std::string message) {
     return Result<JobResult>::failure(
@@ -32,6 +42,15 @@ Result<JobResult> protocolError(std::string message) {
 } // namespace
 
 CandidateService::CandidateService(std::filesystem::path database_path) : database_path_(std::move(database_path)) {}
+
+Result<xuyan::domain::ExtractionCandidate> CandidateService::load(const std::string& candidate_id) {
+    try {
+        return xuyan::storage::WorkspaceRepository(database_path_).loadExtractionCandidate(candidate_id);
+    } catch (...) {
+        return Result<xuyan::domain::ExtractionCandidate>::failure({ErrorCode::storage_error,
+            "无法读取当前候选，详情已隐藏", true, "检查工作区后刷新候选"});
+    }
+}
 
 Result<xuyan::domain::ExtractionJob> CandidateService::ingestStepOutput(
     const std::string& command_id, const std::string& job_id, int step_ordinal,
@@ -45,7 +64,16 @@ Result<xuyan::domain::ExtractionJobState> CandidateService::ingestStepOutputStat
     return ingestStepOutputImpl<xuyan::domain::ExtractionJobState>(command_id, job_id, step_ordinal, expected_attempt, output_json);
 }
 
-/** @brief 共用协议和原文证据校验，仅根据结果类型选择完整或检查点提交接口。 */
+/*
+ * 功能：校验一次候选输出的冻结协议、原文哈希、逐字引文和主干保留范围后原子提交。
+ * 参数：模板 JobResult 指定完整任务或轻量检查点；command_id 为幂等提交 ID；
+ * job_id 为任务 ID；step_ordinal 为从 1 开始的步骤序号；expected_attempt 为预期尝试次数；
+ * output_json 为最多 8 MiB 的候选 JSON 字节，调用期间只读。
+ * 返回：成功时为已提交任务/检查点；任一校验、修订或存储失败时返回错误，不伪造候选。
+ * 失败：协议、范围、原文变化或仓储错误返回 Result；异常转为存储错误。
+ * 副作用：读取来源与任务，成功时在仓储提交候选和步骤；不发送模型请求。
+ * 线程：调用线程同步完成，不保留输入引用或跨网络持有事务。
+ */
 template<class JobResult>
 Result<JobResult> CandidateService::ingestStepOutputImpl(
     const std::string& command_id, const std::string& job_id, int step_ordinal,
@@ -173,7 +201,6 @@ Result<xuyan::domain::ExtractionCandidatePage> CandidateService::listPage(
     }
 }
 
-/** @brief 查询逐字名称或别名的端点建议，只读取作者已确认的当前世界条目。 */
 Result<xuyan::domain::RelationEndpointMatchPage> CandidateService::matchRelationEndpoints(
     const std::string& world_id, const std::string& mention, int limit, std::int64_t offset) {
     try {
@@ -184,7 +211,6 @@ Result<xuyan::domain::RelationEndpointMatchPage> CandidateService::matchRelation
     }
 }
 
-/** @brief 查询候选完整逐字身份对应的已有实体，只返回可供作者明确选择的轻量结果。 */
 Result<xuyan::domain::CandidateEntityMatchPage> CandidateService::matchCandidateEntities(
     const std::string& candidate_id, int expected_candidate_revision, int limit, std::int64_t offset) {
     try {
@@ -196,7 +222,6 @@ Result<xuyan::domain::CandidateEntityMatchPage> CandidateService::matchCandidate
     }
 }
 
-/** @brief 转交明确的跨章实体关联，不根据同名结果替作者选择目标，不进行网络请求。 */
 Result<xuyan::domain::ExtractionCandidate> CandidateService::acceptIntoEntity(
     const std::string& command_id, const std::string& candidate_id, int expected_candidate_revision,
     const xuyan::domain::CandidateEntitySelection& selection, const std::string& provenance_type) {
@@ -210,7 +235,6 @@ Result<xuyan::domain::ExtractionCandidate> CandidateService::acceptIntoEntity(
     }
 }
 
-/** @brief 按作者明确的端点选择和来源性质生成条目/事件/关系/地点投影，统一由仓储原子提交。 */
 Result<xuyan::domain::ExtractionCandidate> CandidateService::review(
     const std::string& command_id, const std::string& candidate_id, int expected_revision,
     const std::string& review_status, const std::string& name,

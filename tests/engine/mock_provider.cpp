@@ -17,6 +17,7 @@ xuyan::domain::Result<MockStepResult> MockProvider::next(const xuyan::domain::Sc
             Error{ErrorCode::validation_failed, "测试场景样例的三个回合已完成", false, "从检查点创建新分支"});
     }
 
+    /* 公共契约在头文件维护；只对合法回合同步阻塞，随后复制状态，任何规则失败都不修改输入。 */
     std::this_thread::sleep_for(latency_);
     ScenarioState output = input;
     MockStepResult result;
@@ -38,6 +39,7 @@ xuyan::domain::Result<MockStepResult> MockProvider::next(const xuyan::domain::Sc
         result.public_explanation = "检查发生后，伪造迹象只进入沈棠的私密知识。";
         output.narration = "沈棠在灯下检查印章，发现伪造迹象；这项观察尚未公开。";
     } else {
+        /* 观察 output.characters 中的接收者；不拥有对象，查找后不改变容器容量，指针只用到本回合结束。 */
         CharacterState* xu = nullptr;
         for (auto& character : output.characters) {
             if (character.id == "actor-xucheng") xu = &character;
@@ -47,6 +49,7 @@ xuyan::domain::Result<MockStepResult> MockProvider::next(const xuyan::domain::Sc
             return Result<MockStepResult>::failure(
                 Error{ErrorCode::missing_context, "沈棠尚未获得可传播的印章观察", false, "回到上一检查点"});
         }
+        /* 只有观察者已掌握的印章信息才能私下传播，北门知识字段保持原值以验证权限隔离。 */
         xu->knows_seal_forgery = true;
         xu->trust += 1;
         result.actor_id = "actor-shentang";

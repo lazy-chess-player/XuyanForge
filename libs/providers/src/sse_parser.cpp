@@ -1,6 +1,7 @@
 #include "xuyan/providers/sse_parser.h"
 
 #include <algorithm>
+#include <cstdint>
 
 namespace xuyan::providers {
 namespace {
@@ -8,12 +9,22 @@ namespace {
 using xuyan::domain::Error;
 using xuyan::domain::ErrorCode;
 
-/** @brief 构造事件流不完整或越界时的非重试错误。 */
+/*
+ * 功能：将事件流边界或编码错误包装为不可自动重试的校验错误。
+ * 参数：message 为中文原因，按值接收并移入错误，不包含响应正文。
+ * 返回：含恢复建议的领域错误。失败：字符串分配异常向调用方传播。
+ * 副作用：无文件或网络操作；在解析调用线程同步执行。
+ */
 Error incomplete(std::string message) {
     return Error{ErrorCode::validation_failed, std::move(message), false, "保留原始响应并将请求标记为输出不完整"};
 }
 
-/** @brief 严格检查事件数据的 UTF-8 编码，包括过长编码与代理项。 */
+/*
+ * 功能：严格检查完整字段的 UTF-8，拒绝截断、过长编码及代理项。
+ * 参数：text 为调用期间有效的只读字节视图，可为空。
+ * 返回：全部字节组成合法 Unicode 标量时为真；非法编码为假。
+ * 失败：不抛出业务异常。副作用：只读输入，无缓存或线程切换。
+ */
 bool validUtf8(std::string_view text) {
     std::size_t index = 0;
     while (index < text.size()) {
@@ -59,7 +70,9 @@ xuyan::domain::Result<std::vector<SseEvent>> SseParser::feed(std::string_view by
     if (terminated_) {
         return xuyan::domain::Result<std::vector<SseEvent>>::failure(incomplete("终结事件之后收到了额外数据"));
     }
-    if (buffer_.size() + bytes.size() > maximum_buffer_bytes_) {
+    // 用减法核对剩余额度，避免长度相加回绕后绕过资源边界。
+    if (buffer_.size() > maximum_buffer_bytes_
+        || bytes.size() > maximum_buffer_bytes_ - buffer_.size()) {
         return xuyan::domain::Result<std::vector<SseEvent>>::failure(incomplete("SSE 增量缓冲超过配置上限"));
     }
     buffer_.append(bytes);
@@ -74,6 +87,11 @@ xuyan::domain::Result<std::vector<SseEvent>> SseParser::parseAvailable(bool end_
     std::vector<SseEvent> events;
     // 仅消费完整的空行分隔帧，半帧继续保存在缓冲区。
     for (;;) {
+        // 终结帧可能与后续字节在同一次 feed 到达，不能只在 feed 入口检查。
+        if (terminated_ && !buffer_.empty()) {
+            return xuyan::domain::Result<std::vector<SseEvent>>::failure(
+                incomplete("终结事件之后收到了额外数据"));
+        }
         const auto lf = buffer_.find("\n\n");
         const auto crlf = buffer_.find("\r\n\r\n");
         std::size_t boundary = std::string::npos;

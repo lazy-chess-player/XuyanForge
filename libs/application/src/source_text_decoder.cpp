@@ -13,7 +13,12 @@ namespace {
 using xuyan::domain::ErrorCode;
 using xuyan::domain::Result;
 
-/** @brief 将一个已验证的 Unicode 码点附加为 UTF-8 字节序列。 */
+/*
+ * 功能：将已由调用方验证的 Unicode 码点编码并追加到 UTF-8 输出。
+ * 参数：output 为可写字符串；codepoint 为合法 Unicode 标量值，不得为代理项或超出 U+10FFFF。
+ * 返回：无。失败：容量分配异常可传播；不在此处重新校验码点。
+ * 副作用：向 output 追加 1—4 字节；线程：同步，不保存字符串引用。
+ */
 void appendUtf8(std::string& output, char32_t codepoint) {
     if (codepoint <= 0x7f) output.push_back(static_cast<char>(codepoint));
     else if (codepoint <= 0x7ff) {
@@ -31,7 +36,13 @@ void appendUtf8(std::string& output, char32_t codepoint) {
     }
 }
 
-/** @brief 按 BOM 指定的字节序解码 UTF-16，并拒绝不完整或孤立代理项。 */
+/*
+ * 功能：跳过 UTF-16 BOM，按指定字节序解码并标准化文本。
+ * 参数：bytes 为含 2 字节 BOM 的完整输入视图，调用期间有效；little_endian 为真时按小端解码。
+ * 返回：成功时为独立拥有的标准化 UTF-8 及编码标签；空正文可成功。
+ * 失败：长度无效、代理项不成对或标准化失败返回 Result；分配异常可传播。
+ * 副作用：只在内存生成文本，不读写文件；线程：同步，不保存输入视图。
+ */
 Result<DecodedSourceText> decodeUtf16(std::string_view bytes, bool little_endian) {
     if (bytes.size() < 2 || (bytes.size() - 2) % 2 != 0) return Result<DecodedSourceText>::failure(
         {ErrorCode::validation_failed, "UTF-16 来源字节数无效", false, "检查文件是否完整"});
@@ -64,7 +75,13 @@ Result<DecodedSourceText> decodeUtf16(std::string_view bytes, bool little_endian
 }
 
 #ifdef _WIN32
-/** @brief 使用 Windows 编码转换接口把 GB18030 字节转成标准化 UTF-8。 */
+/*
+ * 功能：在 Windows 上调用系统编码转换接口，将 GB18030 字节转为标准化 UTF-8。
+ * 参数：bytes 为调用期间有效的待解码字节视图，长度需可表示为 Windows API 的 int。
+ * 返回：成功时为拥有正文及 gb18030 标签的结果。
+ * 失败：系统转换或标准化失败返回 Result；当前实现未单独检查第二次系统转换返回值。
+ * 副作用：仅调用编码 API 和分配内存，不读写文件；线程：当前线程同步执行，不保存视图。
+ */
 Result<DecodedSourceText> decodeGb18030(std::string_view bytes) {
     const auto wide_count = MultiByteToWideChar(54936, MB_ERR_INVALID_CHARS, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
     if (wide_count <= 0) return Result<DecodedSourceText>::failure(
