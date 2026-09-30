@@ -1,5 +1,8 @@
 #include "xuyan/application/world_catalog_service.h"
 #include "xuyan/application/provider_connection_service.h"
+#include "xuyan/application/package_service.h"
+#include "xuyan/package/json.h"
+#include "xuyan/package/zip_archive.h"
 #include "sqlite_support.h"
 
 #include <filesystem>
@@ -153,6 +156,42 @@ void testCatalogUseCases() {
     require(!service.create("over-limit-world", name).ok(), "超过120个码点的名称须拒绝");
 }
 
+/* 功能：验证未指定包标题/作者时保留用户世界名且不填入虚构作者，显式元数据仍原样保留。
+ * 参数：无。返回：无；每种元数据契约成立才正常结束。
+ * 失败：创建、导出、归档/清单读取或值不符时抛中文断言异常。
+ * 副作用：仅在独占临时目录生成世界与两个包并读取；守卫最终清理，无用户资料或网络访问。
+ */
+void testPackageMetadataHasNoPresetValues() {
+    TemporaryWorkspace temporary;
+    xuyan::application::WorldCatalogService catalog(temporary.database());
+    require(catalog.create("owned-package-world", "用户实际命名").ok(), "测试世界须由用例显式创建");
+    xuyan::application::PackageService service(temporary.database());
+    for (const bool explicit_metadata : {false, true}) {
+        /* 本轮输出路径位于当前测试独占目录，循环开始前不存在，不覆盖外部文件。 */
+        const auto target = temporary.root() / (explicit_metadata ? "explicit.zip" : "inferred.zip");
+        const auto exported = service.exportWorld(target, explicit_metadata ? "作者填写的标题" : "",
+                                                  explicit_metadata ? "作者填写的署名" : "");
+        require(exported.ok(), "两类元数据输入都须导出成功");
+        const auto archive = xuyan::package::readZip(target);
+        require(archive.ok(), "测试导出包须可读取");
+        /* 清单发现标记初始false，读取manifest后置真；缺清单不能伪装通过字段检查。 */
+        bool manifest_found = false;
+        for (const auto& entry : *archive.value) {
+            if (entry.path != "manifest.json") continue;
+            manifest_found = true;
+            const auto manifest = xuyan::package::parseJson(entry.data);
+            require(manifest.ok(), "清单须是有效结构");
+            const auto* title = manifest.value->find("title");
+            const auto* author = manifest.value->find("author");
+            require(title && title->isString() && title->string() ==
+                    (explicit_metadata ? "作者填写的标题" : "用户实际命名"), "未填标题只能来自真实世界名称");
+            require(author && author->isString() && author->string() ==
+                    (explicit_metadata ? "作者填写的署名" : ""), "未知作者必须留空，不得预填身份");
+        }
+        require(manifest_found, "导出包必须存在清单");
+    }
+}
+
 /* 功能：验证数据库打开失败以中文错误传播，不导致后台异常脱离结果边界。
  * 参数：无。返回：无。失败：错误被当成成功或空列表时断言失败。
  * 副作用：仅把当前测试自有目录用作非法文件目标，不创建用户数据。
@@ -252,6 +291,7 @@ void testEmptySchemaMigrationRollsBack() {
 int main() {
     try {
         testCatalogUseCases();
+        testPackageMetadataHasNoPresetValues();
         testOpenFailure();
         testIncompleteCurrentSchemaRefused();
         testCredentialCompensationFailureIsDistinct();

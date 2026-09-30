@@ -112,6 +112,7 @@ Item {
                     /* 服务类型选项，label/value 分离；未知类型不自动替换为第一项。 */
                     AppComboBox {
                         id: kindChoice
+                        objectName: "kindChoice"
                         uiTheme: page.uiTheme
                         Layout.fillWidth: true
                         model: [ {"label": qsTr("深度求索"), "value": "deepseek"},

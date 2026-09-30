@@ -70,7 +70,7 @@ xuyan::domain::Result<std::vector<SseEvent>> SseParser::feed(std::string_view by
     if (terminated_) {
         return xuyan::domain::Result<std::vector<SseEvent>>::failure(incomplete("终结事件之后收到了额外数据"));
     }
-    // 用减法核对剩余额度，避免长度相加回绕后绕过资源边界。
+    /* 用减法核对缓存与本批输入的剩余额度，避免长度相加回绕；超限在 append 前返回，不改变已有缓存。 */
     if (buffer_.size() > maximum_buffer_bytes_
         || bytes.size() > maximum_buffer_bytes_ - buffer_.size()) {
         return xuyan::domain::Result<std::vector<SseEvent>>::failure(incomplete("SSE 增量缓冲超过配置上限"));
@@ -105,6 +105,8 @@ xuyan::domain::Result<std::vector<SseEvent>> SseParser::parseAvailable(bool end_
         }
         if (boundary == std::string::npos) break;
 
+        /* 帧视图只在 parseFrame 内借用；先完成字段复制，再删除缓存前缀。
+         * 非法帧也会被删除，且本次此前已解析事件不会返回，错误不具备回滚或重放语义。 */
         auto parsed = parseFrame(std::string_view(buffer_).substr(0, boundary));
         buffer_.erase(0, boundary + delimiter);
         if (!parsed.ok()) return xuyan::domain::Result<std::vector<SseEvent>>::failure(*parsed.error);
@@ -122,7 +124,9 @@ xuyan::domain::Result<std::vector<SseEvent>> SseParser::parseAvailable(bool end_
 
 xuyan::domain::Result<SseEvent> SseParser::parseFrame(std::string_view frame) {
     SseEvent result;
+    /* 下一行的零基字节偏移，初始 0；越过末行后取 frame.size()+1，只在本次帧解析中使用。 */
     std::size_t cursor = 0;
+    /* 是否尚未看到 data 行，初始真；首个 data 行后置否，包括空行值，决定后续连接换行。 */
     bool first_data = true;
     while (cursor <= frame.size()) {
         const auto newline = frame.find('\n', cursor);

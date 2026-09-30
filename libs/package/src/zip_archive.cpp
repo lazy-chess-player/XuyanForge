@@ -41,7 +41,7 @@ void put16(std::string& output, std::uint16_t value) {
 }
 
 /* 功能：追加 32 位 ZIP 字段。参数：output 为输出引用；value 为大小/CRC/签名/偏移值。
- * 返回：无。失败：分配异常传播。副作用：追加四个小端字节，不执行 I/O。 */
+ * 返回：无。失败：分配异常传播。副作用：追加四个小端字节，可能使 output 旧视图失效，不保存引用、不执行 I/O。 */
 void put32(std::string& output, std::uint32_t value) {
     put16(output, static_cast<std::uint16_t>(value & 0xffff));
     put16(output, static_cast<std::uint16_t>((value >> 16) & 0xffff));
@@ -86,7 +86,7 @@ std::string readBounded(const std::filesystem::path& source, std::size_t maximum
 /* 本次独占创建的临时文件清理守卫，只在 writeStaged 内使用，不复制、不跨线程。
  * 未创建或已经替换目标时不清理，避免删除其他调用预先存在的临时文件。 */
 struct TemporaryArchive {
-    /* 临时文件的原生路径；先于创建取得，生命周期覆盖全部 I/O。 */
+    /* 临时文件的原生路径，构造时从实参移入，无默认路径；writeStaged 和析构读取，覆盖全部 I/O 至守卫销毁。 */
     std::filesystem::path path;
     /* 是否由本次成功创建且尚未提交；默认否，写入函数设置，析构读取。 */
     bool owned{false};
@@ -114,7 +114,8 @@ struct TemporaryArchive {
     }
 };
 
-/* 独占暂存文件的原生句柄，局部作用域使用，不复制；异常时先关闭句柄，再由路径守卫清理文件。 */
+/* 独占暂存文件的原生句柄，在 writeStaged 调用线程局部使用、不复制；
+ * 创建后持有到局部析构，异常时先关闭句柄，再由路径守卫清理文件，不承担路径替换。 */
 struct ArchiveFile {
     /* 功能：建立空句柄守卫。参数：无。返回：完成初始化，未打开文件。
      * 失败：无。副作用：无 I/O，调用线程中持有资源直到析构。 */
@@ -126,14 +127,14 @@ struct ArchiveFile {
      * 返回/失败：无运行期返回，编译期拒绝。副作用：不丢失或重复释放资源。 */
     ArchiveFile& operator=(const ArchiveFile&) = delete;
 #ifdef _WIN32
-    /* CREATE_NEW 成功返回的拥有型句柄，初始 INVALID_HANDLE_VALUE；只在本次写入期间有效。 */
+    /* CREATE_NEW 成功返回的拥有型句柄，初始 INVALID_HANDLE_VALUE；writeStaged 设置/写入/刷新，析构关闭，只在本次写入有效。 */
     HANDLE handle{INVALID_HANDLE_VALUE};
 #else
-    /* O_EXCL 成功返回的拥有型文件描述符，初始 -1；只在本次写入期间有效。 */
+    /* O_EXCL 成功返回的拥有型文件描述符，初始 -1；writeStaged 设置/写入/刷新，析构关闭，只在本次写入有效。 */
     int handle{-1};
 #endif
     /* 功能：关闭本次暂存句柄。参数：无。返回：释放资源，无返回值。
-     * 失败：析构不抛异常；写入/刷新错误已由 writeStaged 报告。
+     * 失败：析构不抛异常，关闭操作的返回错误被忽略；写入/刷新错误由 writeStaged 报告。
      * 副作用：关闭句柄，不删除路径，调用线程执行，不允许复制拥有者。 */
     ~ArchiveFile() noexcept {
 #ifdef _WIN32
@@ -145,9 +146,9 @@ struct ArchiveFile {
 };
 
 /* 功能：独占创建相邻暂存文件，完整落盘后原子替换目标，避免先删除原包。
- * 参数：destination 为准确输出路径；bytes 为调用期间有效的完整包字节视图。
- * 返回：无。失败：已存在暂存文件、创建/写入/刷新/替换失败抛中文 runtime_error。
- * 副作用：创建 destination+.tmp，仅删除本次创建的临时文件；失败不删除旧目标，父目录由外层创建。
+ * 参数：destination 为调用内借用的准确非空输出路径，父目录须已存在；bytes 为调用期间有效的完整包字节视图，可空。
+ * 返回：无。失败：已存在暂存文件、创建/写入/刷新/替换失败抛中文 runtime_error，路径/分配异常可传播。
+ * 副作用：创建 destination+.tmp 并替换目标，失败仅尝试删除本次创建的临时文件，清理失败可残留；不删除旧目标。
  * 线程：同步 I/O，同一目标须串行；独占创建阻止覆盖其他调用的临时文件或预植链接。 */
 void writeStaged(const std::filesystem::path& destination, std::string_view bytes) {
     auto temporary = destination;
@@ -233,13 +234,13 @@ xuyan::domain::Result<std::string> writeZip(const std::filesystem::path& destina
         if (destination.empty()) throw std::runtime_error("ZIP 输出路径不能为空");
         /* 本次写入的中央目录快照，独立拥有名称；仅在内存组包期间存在，所有数字均按经典 ZIP 表示。 */
         struct Central {
-            /* 已校验词法安全的包内相对路径，UTF-8 由条目调用方保证；创建时复制，中央目录输出读取。 */
+            /* 已校验词法安全的包内相对路径，UTF-8 由条目调用方保证；初值为聚合创建时复制的条目路径，两个文件头读取，随快照释放。 */
             std::string name;
-            /* 原始正文的 IEEE CRC-32，创建时计算，两个文件头读取。 */
+            /* 原始正文的 IEEE CRC-32，无业务单位；聚合创建时计算，无类内初值，两个文件头读取，组包期间不变。 */
             std::uint32_t crc;
-            /* 未压缩正文大小，单位字节，创建时固定，两个文件头共用。 */
+            /* 未压缩正文大小，单位字节；聚合创建时从条目长度初始化，无类内初值，两个文件头共用，组包期间不变。 */
             std::uint32_t size;
-            /* 本地文件头相对包起点的字节偏移，组包时固定。 */
+            /* 本地文件头相对包起点的零基字节偏移；聚合创建时取 output 长度，无类内初值，中央目录读取，组包期间不变。 */
             std::uint32_t offset;
         };
         std::vector<Central> central;

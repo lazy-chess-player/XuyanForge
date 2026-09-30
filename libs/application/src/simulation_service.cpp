@@ -52,6 +52,9 @@ xuyan::domain::Result<std::string> SimulationService::backupTo(const std::filesy
 xuyan::domain::Result<xuyan::domain::SimulationSession> SimulationService::createSession(
     const std::string& command_id, const std::string& branch_id, int max_turns,
     bool continuous, int max_calls, std::vector<xuyan::domain::ActorModelBinding> actors) {
+    /* 本调用独占的会话草稿；ID 绑定命令和分支，其他未指定字段沿用领域默认值，
+     * 仓储成功创建时强制就绪/修订 1、零调用计数及无停止请求，绑定顺序原样保留。
+     */
     xuyan::domain::SimulationSession value;
     value.id = "session-" + xuyan::domain::sha256(command_id + '|' + branch_id).substr(0, 20);
     value.branch_id = branch_id;
@@ -89,12 +92,18 @@ xuyan::domain::Result<xuyan::domain::SimulationSession> SimulationService::direc
     if (!loaded.ok()) return loaded;
     auto head = repository.loadHead(loaded.value->branch_id);
     if (!head.ok()) return xuyan::domain::Result<xuyan::domain::SimulationSession>::failure(*head.error);
+    /* 本调用独占的意图，绑定刚读取的分支头用于事务内拒绝迟到介入；
+     * 模型意图与导演意图走同一领域校验，仓储还会核对会话人物、在途调用及头提交。
+     */
     xuyan::domain::ActorIntent intent;
     intent.actor_id = actor_id; intent.input_commit_id = head.value->commit_id; intent.speech = speech;
     intent.operation = operation; intent.target_id = target_id; intent.holder_consented = holder_consented;
     intent.public_reason = "导演显式介入";
     auto valid = xuyan::domain::validateActorIntent(std::move(intent));
     if (!valid.ok()) return xuyan::domain::Result<xuyan::domain::SimulationSession>::failure(*valid.error);
+    /* 仅在内存副本构造下一状态；纯发言不执行领域操作，其他操作先校验人物知识/持有权限。
+     * 验证成功后统一推进一回合/一时间刻，仓储提交时仍需校验会话修订和分支头。
+     */
     xuyan::domain::ScenarioState next;
     if (valid.value->operation == "speak") { next = head.value->state; ++next.revision; }
     else {

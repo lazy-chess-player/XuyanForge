@@ -20,9 +20,14 @@ xuyan::domain::Result<xuyan::domain::EvidenceReference> EvidenceService::create(
         auto source = repository.loadSource(source_id);
         if (!source.ok()) return xuyan::domain::Result<xuyan::domain::EvidenceReference>::failure(*source.error);
         SourceImportService sources(database_path_);
-        // 引文总从标准化原文重新取得，不接受调用方提交的任意字符串。
+        /* 位置针对标准化原文而非导入文件字节；来源服务从章节锚点扫描并换算码点。
+         * 即使命令可能重放，也先重新读原文并校验；缺失资产不能绕过这一步直接返回历史证据。
+         */
         auto quote = sources.evidenceText(source_id, start_codepoint, end_codepoint);
         if (!quote.ok()) return xuyan::domain::Result<xuyan::domain::EvidenceReference>::failure(*quote.error);
+        /* 本调用独占的待保存值；ID 由命令派生，引文及摘要必须来自刚读取的同一段原文，
+         * 修订由仓储创建时设为 1，不能用调用方任意字符串代替原文。
+         */
         xuyan::domain::EvidenceReference evidence;
         evidence.id = "evidence-" + xuyan::domain::sha256(command_id).substr(0, 20);
         evidence.entity_id = entity_id; evidence.field_path = field_path; evidence.source_id = source_id;

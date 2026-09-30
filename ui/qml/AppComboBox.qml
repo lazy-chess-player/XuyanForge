@@ -39,6 +39,9 @@ ComboBox {
     }
     /* 每个模型选项的点击代理：仅随弹出列表存活，选项选择由 ComboBox 管理。 */
     delegate: ItemDelegate {
+        /* 当前行的零基索引，由列表注入；稳定定位本次弹出选项，供点击及中文文案回归使用。 */
+        required property int index
+        objectName: "option_" + index
         /* 当前模型行的观察值，由委托模型注入，无默认值；textRole 指定的字段作为显示名称。 */
         required property var modelData
         width: control.width

@@ -13,11 +13,16 @@
 #include <QDateTime>
 #include <QStandardPaths>
 #include <QDir>
+#include <QFileInfo>
 
 #include <exception>
 
 PackageViewModel::PackageViewModel(std::filesystem::path database_path, QObject* parent)
     : QObject(parent), database_path_(std::move(database_path)) { refreshBranches(); }
+
+bool PackageViewModel::destinationExists(const QUrl& destination) const {
+    return destination.isLocalFile() && QFileInfo::exists(destination.toLocalFile());
+}
 
 void PackageViewModel::refreshBranches() {
     const auto database = database_path_; QPointer<PackageViewModel> self(this);
@@ -63,9 +68,15 @@ void PackageViewModel::run(Work work, bool world_import, bool character_import) 
 void PackageViewModel::exportWorld(const QUrl& destination) {
     if (!destination.isLocalFile()) return;
     const auto target = destination.toLocalFile().toStdWString();
+    /* 功能：后台读取实际世界并导出不含凭据的包，未填元数据不伪造标题/作者。
+     * 参数：database为run提供的数据库路径借用；status/error为输出引用，写成功说明或失败提示。
+     * 返回：无。失败：服务Result错误映射中文；构造/标准及其他异常由外层run捕获。
+     * 副作用：读取数据库并写target包，成功更新status、失败更新error；不发送网络。
+     * 线程与生命周期：线程池同步执行，target按值持有；参数仅本次回调有效，GUI回填由run负责。 */
     run([target](const auto& database, QString& status, QString& error) {
         xuyan::application::PackageService service(database);
-        auto result = service.exportWorld(std::filesystem::path(target), "我的世界", "本地作者");
+        // 标题由服务读取实际世界名称；未填写作者保持未知，不预置任何名称或署名。
+        auto result = service.exportWorld(std::filesystem::path(target), {}, {});
         if (!result.ok()) error = view_model_text::errorText(*result.error);
         else status = tr("世界包已导出：%1 个条目").arg(result.value->entity_count);
     });
@@ -87,9 +98,14 @@ void PackageViewModel::exportCharacter(QString blueprint_id, const QUrl& destina
     if (!destination.isLocalFile() || blueprint_id.isEmpty()) return;
     const auto target = destination.toLocalFile().toStdWString();
     const auto id = blueprint_id.toStdString();
+    /* 功能：后台导出明确人物卡版本，保留隐私选项且未知作者留空。
+     * 参数：database为run提供的路径借用；status/error为本次输出引用，成功写版本数或失败写中文提示。
+     * 返回：无。失败：服务Result映射中文，异常由外层run捕获，不把部分失败报告成成功。
+     * 副作用：读取卡片并写target包，是否含私人备注由include_private_notes控制，不读取系统密钥。
+     * 线程与生命周期：线程池同步执行；target/id/隐私标志按值持有，参数仅回调有效，GUI回填由run负责。 */
     run([target, id, include_private_notes](const auto& database, QString& status, QString& error) {
         xuyan::application::PackageService service(database);
-        auto result = service.exportCharacter(id, std::filesystem::path(target), "本地作者", include_private_notes);
+        auto result = service.exportCharacter(id, std::filesystem::path(target), {}, include_private_notes);
         if (!result.ok()) error = view_model_text::errorText(*result.error);
         else status = tr("人物包已导出：%1 个版本").arg(result.value->entity_count);
     });

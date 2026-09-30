@@ -25,7 +25,7 @@ qt_add_executable(xuyanforge_app
     viewmodels/world_views_view_model.cpp
     viewmodels/world_views_view_model.h
 )
-target_include_directories(xuyanforge_app PRIVATE viewmodels)
+target_include_directories(xuyanforge_app PRIVATE viewmodels i18n)
 target_compile_definitions(xuyanforge_app PRIVATE XUYANFORGE_VERSION="${XUYANFORGE_ARTIFACT_VERSION}")
 target_link_libraries(xuyanforge_app PRIVATE
     xuyan_application xuyan_platform_credentials xuyan_providers_qt Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2

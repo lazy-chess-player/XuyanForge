@@ -32,6 +32,7 @@ Flickable {
         // 使用 Qt 中文翻译的文件框，避免系统语言改变内置选项。
         options: FileDialog.DontUseNativeDialog
         id: novelDialog
+        objectName: "novelDialog"
         title: qsTr("选择要解析的小说")
         acceptLabel: qsTr("选择")
         rejectLabel: qsTr("取消")

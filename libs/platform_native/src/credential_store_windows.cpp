@@ -60,7 +60,8 @@ xuyan::domain::Result<bool> SystemCredentialStore::put(const std::string& refere
     // 保留既有接口预检边界；工具链头文件的旧宏可能小于当前系统限制，实际容量由 CredWriteW 判定。
     if (target.empty() || secret.empty() || secret.size() > 65536) return xuyan::domain::Result<bool>::failure(
         {xuyan::domain::ErrorCode::validation_failed, "凭据引用或内容无效", false, "重新输入凭据"});
-    // ABI 要求可写指针，但 CredWriteW 仅同步读取；所有借用在返回前结束，不转移输入所有权。
+    /* 本次写入描述，零初始化后绑定类型/路径/正文/持久化策略；本身不拥有字段指针。
+     * ABI 要求可写指针，但 CredWriteW 仅同步读取；目标名借用 target、正文借用 secret，所有借用在返回前结束。 */
     CREDENTIALW value{};
     value.Type = CRED_TYPE_GENERIC; value.TargetName = const_cast<wchar_t*>(target.c_str());
     value.CredentialBlobSize = static_cast<DWORD>(secret.size());
@@ -74,6 +75,7 @@ xuyan::domain::Result<std::string> SystemCredentialStore::get(const std::string&
     const auto target = wide(reference);
     if (target.empty()) return xuyan::domain::Result<std::string>::failure(
         {xuyan::domain::ErrorCode::validation_failed, "凭据引用无效", false, "刷新连接后重试"});
+    /* 系统读取的输出指针，初始空；读取成功立即交给 owned 管理，后续只在本调用中观察。 */
     PCREDENTIALW value = nullptr;
     if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &value)) {
         const auto code = GetLastError();
@@ -81,7 +83,8 @@ xuyan::domain::Result<std::string> SystemCredentialStore::get(const std::string&
             {xuyan::domain::ErrorCode::missing_context, "凭据不存在", false, "重新输入凭据"});
         return xuyan::domain::Result<std::string>::failure(systemError("无法读取系统凭据", code));
     }
-    // 先收归 RAII 再分配返回字符串，保证 bad_alloc 等异常也释放并擦除系统明文。
+    /* 先收归 RAII 再分配返回字符串，保证 bad_alloc 等异常也释放并擦除系统明文；
+     * secret 返回副本不依赖系统缓冲，副本清理由调用方负责，不能宣称全部明文都已擦除。 */
     std::unique_ptr<CREDENTIALW, CredentialReleaser> owned(value);
     if (value == nullptr || (value->CredentialBlobSize != 0 && value->CredentialBlob == nullptr))
         return xuyan::domain::Result<std::string>::failure(

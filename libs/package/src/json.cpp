@@ -141,7 +141,8 @@ private:
 
     /* 功能：解码紧随反斜杠 u 的四位十六进制单元。参数：无，游标已越过 u。
      * 返回：0—65535 的 UTF-16 单元，代理项合法性由 string 处理。
-     * 失败：不足四字节或非十六进制返回校验错误。副作用：消耗字节，失败不回滚。 */
+     * 失败：不足四字节或非十六进制返回校验错误，错误值分配异常可传播。
+     * 副作用：消耗字节，失败不回滚，结果不借用输入，调用线程同步执行。 */
     xuyan::domain::Result<std::uint32_t> hexCodepoint() {
         if (input_.size() - position_ < 4) return xuyan::domain::Result<std::uint32_t>::failure(jsonError("Unicode 转义被截断"));
         std::uint32_t result = 0;
@@ -259,7 +260,8 @@ private:
 };
 
 /* 功能：递归追加单个节点的紧凑 JSON 表示。
- * 参数：value 为调用期间只读树；output 为输出引用，保留已有前缀，不能别名 value 中的字符串。
+ * 参数：value 为调用期间只读树，字符串/键编码由调用方保证，不在此校验；
+ *       output 为输出引用，保留已有前缀，不能别名 value 中的字符串，扩容可能使其旧视图失效。
  * 返回：无。失败：非有限数、格式化失败抛中文 runtime_error，分配异常传播；异常后 output 可能仅有前缀。
  * 副作用：追加字节并递归访问树，无独立深度上限，由调用方保证树有界；不执行 I/O。 */
 void writeValue(const JsonValue& value, std::string& output) {
@@ -304,6 +306,7 @@ const JsonValue* JsonValue::find(std::string_view key) const {
 
 xuyan::domain::Result<JsonValue> parseJson(std::string_view input, std::size_t maximum_depth,
                                            std::size_t maximum_nodes) {
+    /* 规范化副本只用于编码预检；语法游标仍借用原字节，不能将字符串内的原始控制字节悄悄改写。 */
     auto utf8 = xuyan::domain::normalizeUtf8Text(input);
     if (!utf8.ok()) return xuyan::domain::Result<JsonValue>::failure(*utf8.error);
     Parser parser(input, maximum_depth, maximum_nodes);

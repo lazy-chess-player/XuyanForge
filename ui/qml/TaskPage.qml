@@ -93,13 +93,14 @@ Flickable {
                     /* 来源下拉框，读取 sourceItems，身份 id 与名称分离，初始选择跟随来源模型。 */
                     AppComboBox {
                         id: sourceChoice
+                        objectName: "sourceChoice"
                         uiTheme: page.uiTheme
                         Layout.fillWidth: true
                         model: page.sourceModel.sourceItems
                         textRole: "name"
                         valueRole: "id"
                         currentIndex: page.sourceModel.selectedIndex >= 0 ? page.sourceModel.selectedIndex : 0
-                        displayText: currentIndex < 0 ? qsTr("先导入小说") : currentText
+                        displayText: count === 0 || currentIndex < 0 ? qsTr("先导入小说") : currentText
                     }
                     /* 章节页导航入口，点击不创建或启动任务。 */
                     AppButton { uiTheme: page.uiTheme; text: qsTr("查看章节");
@@ -120,6 +121,7 @@ Flickable {
                     /* 连接下拉框，初始 -1 表示离线；读取连接名称和稳定身份，不提供默认远程连接。 */
                     AppComboBox {
                         id: providerChoice
+                        objectName: "providerChoice"
                         uiTheme: page.uiTheme
                         Layout.fillWidth: true
                         model: page.providerModel.connections

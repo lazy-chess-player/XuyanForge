@@ -13,6 +13,7 @@ Item {
         // 使用 Qt 中文翻译的文件框，避免系统语言改变内置选项。
         options: FileDialog.DontUseNativeDialog
         id: openDialog
+        objectName: "openDialog"
         title: qsTr("打开工作区")
         acceptLabel: qsTr("打开")
         rejectLabel: qsTr("取消")
@@ -103,6 +104,7 @@ Item {
     /* 新建工作区命名弹窗，由页面拥有，只有确认动作才交给模型创建。 */
     Dialog {
         id: createDialog
+        objectName: "createDialog"
         title: qsTr("新建工作区")
         anchors.centerIn: parent
         modal: true

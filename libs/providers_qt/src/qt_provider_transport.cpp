@@ -39,6 +39,7 @@ xuyan::domain::Result<xuyan::application::ProviderTransportResponse> QtProviderT
              QCoreApplication::translate("QtProviderTransport", "模型请求头、方法或超时时间无效").toStdString(), false,
              QCoreApplication::translate("QtProviderTransport", "检查请求配置后重试").toStdString()});
 
+    /* 本次网络管理器，在调用线程构造并于 send 退出时销毁；不跨调用缓存连接对象或借用参数。 */
     QNetworkAccessManager manager;
     QNetworkRequest network_request(url);
     // 同源限制同时保护 Authorization 与厂商自定义密钥头，避免跳转到另一主机泄露凭据。
@@ -58,21 +59,25 @@ xuyan::domain::Result<xuyan::application::ProviderTransportResponse> QtProviderT
     // 回复也由局部 RAII 管理：异常展开时先销毁回复，再销毁其父管理器，不留下在途任务。
     std::unique_ptr<QNetworkReply> reply(manager.sendCustomRequest(
         network_request, QByteArray::fromStdString(request.method), QByteArray::fromStdString(request.body)));
+    /* 本次等待循环，也是全部连接的接收上下文；栈对象在返回/异常展开时销毁并断开回调。 */
     QEventLoop loop;
+    /* 本次毫秒超时源，默认未启动；设为单次后由本地事件循环派发，返回前停止，退出时销毁。 */
     QTimer timer;
     timer.setSingleShot(true);
+    /* 本次正文的拥有缓冲，初始空；receive 追加，上限核对后复制进返回值，不写磁盘，退出时释放。 */
     QByteArray response_body;
     bool timed_out = false;
     bool too_large = false;
-    // Qt 不支持异常穿过事件派发栈；接收分配失败先标记并中止，返回事件循环后再包装错误。
+    /* Qt 不支持异常穿过事件派发栈；接收标准异常先标记并中止，返回事件循环后再包装错误。 */
     bool receive_failed = false;
     constexpr qsizetype maximum_response_bytes = 2 * 1024 * 1024;
     reply->setReadBufferSize(maximum_response_bytes + 1);
     /* 功能：消费本次已到达字节，在分配前限制正文，超限立即中止。
      * 参数：无；借用 reply、response_body、too_large、receive_failed，均只在 send 栈帧内有效。
-     * 返回：无。失败：超限设置 too_large；接收异常设置 receive_failed，不抛过 Qt 事件派发栈。
+     * 返回：无。失败：超限设置 too_large；接收标准异常设置 receive_failed，不将这些异常抛过 Qt 事件派发栈。
      * 副作用：读取回复并可能 abort；在调用线程同步/由 readyRead 调用，loop 为连接上下文。
-     * 生命周期：不逃逸 send；函数退出时上下文断开连接，完成后的尾部读取复用同一边界。 */
+     * 生命周期：maximum_response_bytes 按值捕获，其他捕获均观察局部对象、不转移所有权；
+     *       不逃逸 send，函数退出时上下文断开连接，完成后的尾部读取复用同一边界。 */
     const auto receive = [&reply, &response_body, &too_large, &receive_failed, maximum_response_bytes] {
         if (too_large || receive_failed) return;
         try {
@@ -90,7 +95,8 @@ xuyan::domain::Result<xuyan::application::ProviderTransportResponse> QtProviderT
     QObject::connect(reply.get(), &QNetworkReply::readyRead, &loop, receive);
     QObject::connect(reply.get(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
     /* 功能：将超时结算为可能已发送的未知结果并中止等待。
-     * 参数/返回：无；借用局部超时标志和回复。失败：不保证厂商撤销或退款。
+     * 参数：无；timed_out、reply 按引用观察本次局部对象，不转移回复所有权。
+     * 返回：无。失败：不保证厂商撤销或退款。
      * 副作用：更新 timed_out 并 abort；调用线程执行，连接随 loop 销毁，不触发重发。 */
     QObject::connect(&timer, &QTimer::timeout, &loop, [&timed_out, &reply] {
         timed_out = true;

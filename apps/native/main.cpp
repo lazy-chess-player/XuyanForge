@@ -7,6 +7,7 @@
 #include "extraction_job_view_model.h"
 #include "candidate_review_view_model.h"
 #include "world_views_view_model.h"
+#include "framework_chinese_translator.h"
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -119,6 +120,9 @@ int main(int argc, char* argv[]) {
             || translator.load(translationNames.at(index), QLibraryInfo::path(QLibraryInfo::TranslationsPath)))
             application.installTranslator(&translator);
     }
+    // Qt词库不保证包含Quick新增动作；精确补齐已核对的文件框和右键菜单上下文。
+    FrameworkChineseTranslator frameworkChineseSupplement;
+    application.installTranslator(&frameworkChineseSupplement);
     const auto databaseText = workspaceArgument >= 0 && workspaceArgument + 1 < arguments.size()
         ? QFileInfo(arguments.at(workspaceArgument + 1)).absoluteFilePath()
         : (previewDirectory ? previewDirectory->path() : dataRoot) + QStringLiteral("/workspace.sqlite");

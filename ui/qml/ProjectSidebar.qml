@@ -24,6 +24,7 @@ Rectangle {
         // 使用 Qt 中文翻译的文件框，避免系统语言改变内置选项。
         options: FileDialog.DontUseNativeDialog
         id: workspaceDialog
+        objectName: "workspaceDialog"
         title: qsTr("打开工作区")
         acceptLabel: qsTr("打开")
         rejectLabel: qsTr("取消")
@@ -196,6 +197,7 @@ Rectangle {
         /* 辅助工具菜单，由侧栏拥有，页面导航经 navigate 信号传递。 */
         Menu {
             id: toolsMenu
+            objectName: "toolsMenu"
             palette.window: sidebar.uiTheme.surface
             palette.text: sidebar.uiTheme.text
             /* 工具菜单主题背景。 */

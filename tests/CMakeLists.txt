@@ -7,6 +7,7 @@ target_include_directories(xuyan_test_engine PUBLIC include)
 target_link_libraries(xuyan_test_engine PUBLIC xuyan_domain)
 if(XUYANFORGE_BUILD_UI)
     qt_add_executable(tst_qmltests main.cpp)
+    target_include_directories(tst_qmltests PRIVATE ${PROJECT_SOURCE_DIR}/ui/i18n)
 
     target_compile_definitions(tst_qmltests PRIVATE
         QUICK_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml"

@@ -20,12 +20,18 @@ xuyan::domain::Result<xuyan::domain::CharacterInstance> CharacterInstanceService
         {xuyan::domain::ErrorCode::validation_failed, "能力适配必须是 JSON 对象", false, "修正适配方案"});
     CharacterService cards(database_path_); auto blueprint = cards.load(blueprint_id, blueprint_version);
     if (!blueprint.ok()) return xuyan::domain::Result<xuyan::domain::CharacterInstance>::failure(*blueprint.error);
+    /* 本调用独占的实例草稿；标识/基线由输入填充，记忆默认 {}、冲突默认空、修订默认 0。
+     * 以下扫描确定就绪状态，仓储成功创建后设修订 1；生命周期不超过本次调用，结果拥有转移后的字段。
+     */
     xuyan::domain::CharacterInstance instance;
     instance.id = "character-instance-" + xuyan::domain::sha256(command_id).substr(0, 24);
     instance.blueprint_id = blueprint_id; instance.blueprint_version = blueprint_version;
     instance.world_version_id = world_version_id; instance.snapshot_id = snapshot_id;
     instance.name = blueprint.value->name; instance.adaptation_json = xuyan::package::writeJson(*adaptation.value);
     instance.knowledge_policy = knowledge_policy;
+    /* 卡片能力读取采用相同有界解析；解析失败/非数组或非字符串 key 不登记能力冲突。
+     * 仅以适配键存在性判断已映射，不把映射值解释为已验证的世界规则。
+     */
     auto abilities = xuyan::package::parseJson(blueprint.value->abilities_json, 16, 2000);
     if (abilities.ok() && abilities.value->isArray()) {
         for (const auto& ability : abilities.value->array()) {
@@ -69,10 +75,16 @@ xuyan::domain::Result<xuyan::domain::BranchRootBinding> CharacterInstanceService
     const std::string& command_id, std::string branch_id, std::string world_version_id,
     std::string snapshot_id, std::string history_mode, std::vector<std::string> character_instance_ids) {
     std::sort(character_instance_ids.begin(), character_instance_ids.end());
+    /* 本调用独占的根绑定草稿，接收已排序的实例集合；默认字符串/集合为空，历史模式随下方输入覆盖。
+     * 不保留传入值的外部引用，成功时由仓储返回带实例修订摘要的独立绑定。
+     */
     xuyan::domain::BranchRootBinding binding;
     binding.branch_id = std::move(branch_id); binding.world_version_id = std::move(world_version_id);
     binding.snapshot_id = std::move(snapshot_id); binding.history_mode = std::move(history_mode);
     binding.character_instance_ids = std::move(character_instance_ids);
+    /* 此处摘要仅覆盖排序后的入场配置，供仓储初步校验及命令身份使用；
+     * 仓储成功绑定时还加入实例当前修订及源卡版本，返回的 root_hash 以该最终值为准。
+     */
     std::string payload = binding.branch_id + '|' + binding.world_version_id + '|' + binding.snapshot_id + '|' + binding.history_mode;
     for (const auto& id : binding.character_instance_ids) payload += '|' + id;
     binding.root_hash = xuyan::domain::sha256(payload);

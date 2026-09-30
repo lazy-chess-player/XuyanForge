@@ -271,6 +271,8 @@ Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& d
                         : !entities.empty() ? entities.front().world_id : std::string{};
     if (world_id.empty()) return Result<PackageReport>::failure(
         {xuyan::domain::ErrorCode::validation_failed, "还没有可导出的世界", false, "先创建世界并校对资料"});
+    // 未填写的标题只取实际导出世界的用户名称；旧数据库没有目录时保持未知，不编造世界资料。
+    const auto package_title = title.empty() && !worlds.value->empty() ? worlds.value->front().name : title;
     /*
      * 功能：仅保留目标世界的条目，避免把其他项目资料导入同一包。
      * 参数：entity 为当前借用条目；world_id 为本次导出的只读世界 ID，调用期间有效。
@@ -281,7 +283,7 @@ Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& d
     // 清单记录每个载荷的长度与摘要，导入端据此校验完整性。
     const auto entity_data = entitiesJsonl(entities);
     const auto world_data = xuyan::package::writeJson(JsonValue::Object{
-        {"schema_version", "0.1.0"}, {"title", title}, {"world_id", world_id},
+        {"schema_version", "0.1.0"}, {"title", package_title}, {"world_id", world_id},
     });
     const auto package_id = "package-" + xuyan::domain::sha256(world_data + entity_data).substr(0, 24);
     JsonValue::Array files;
@@ -295,7 +297,7 @@ Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& d
         {"content_version", "1.0.0"}, {"extensions", JsonValue::Object{}},
         {"files", std::move(files)}, {"format", "xuyanforge-package"}, {"format_version", "0.1.0"},
         {"kind", "world"}, {"optional_features", JsonValue::Array{}}, {"package_id", package_id},
-        {"required_features", JsonValue::Array{JsonValue("world-v1")}}, {"title", title},
+        {"required_features", JsonValue::Array{JsonValue("world-v1")}}, {"title", package_title},
     });
     auto written = xuyan::package::writeZip(destination,
         {{"manifest.json", manifest}, {"world.json", world_data}, {"entities.jsonl", entity_data}});

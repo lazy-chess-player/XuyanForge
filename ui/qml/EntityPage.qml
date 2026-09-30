@@ -134,6 +134,7 @@ Item {
                     /* 中文类型选择，label/value 分离，初始索引 8 为其他，模型通知同步当前类型。 */
                     AppComboBox {
                         id: kindChoice
+                        objectName: "kindChoice"
                         uiTheme: page.uiTheme
                         Layout.fillWidth: true
                         model: [

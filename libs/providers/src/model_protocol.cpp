@@ -19,7 +19,7 @@ xuyan::domain::Error protocolError(std::string message) {
     return {ErrorCode::validation_failed, std::move(message), false, "检查提供商配置和响应格式，暂停当前模型任务"};
 }
 
-/* 功能：借用可选对象中的成员。参数：value 为观察指针，可空；name 为键名视图。
+/* 功能：借用可选对象中的成员。参数：value 为调用内有效的观察指针，可空；name 为调用内借用的键名视图，可空。
  * 返回：成员观察指针，缺失或非对象为 nullptr；有效期随 value，修改对象后需重新查找。
  * 失败：无业务异常。副作用：只读，在调用线程执行。 */
 const JsonValue* member(const JsonValue* value, std::string_view name) {
@@ -33,7 +33,7 @@ std::string stringValue(const JsonValue* value) {
     return value != nullptr && value->isString() ? value->string() : std::string{};
 }
 
-/* 功能：归一厂商词元计数。参数：value 为观察指针，可空，整数单位为词元。
+/* 功能：归一厂商词元计数。参数：value 为调用内有效的观察指针，可空，整数单位为词元。
  * 返回：整数截断到 0—20 亿；缺失或类型不符为 0。
  * 失败：无。副作用：只读，不估算缺失账单，在调用线程执行。 */
 int integerValue(const JsonValue* value) {
@@ -110,7 +110,8 @@ JsonValue requestBody(ProviderProtocol protocol, const StructuredGenerationReque
 
 /* 功能：归一 Responses 的文本块、状态和用量。
  * 参数：root 为已解析对象，调用内借用；缺失字段按空值处理。
- * 返回：独立结果；拒绝优先于正常完成，截断/失败不强行作为完整正文。
+ * 返回：独立结果；incomplete/failed/cancelled 根状态先返回，不读取正文；其他根状态下，
+ *       拒绝块优先于正常完成，文本块直接拼接；仅 completed 且非空正文判为完成。
  * 失败：分配异常传播，厂商失败保留内部状态。副作用：只读，无日志或事实写入。 */
 ProviderGenerationResult parseOpenAiResponses(const JsonValue& root) {
     ProviderGenerationResult result;
@@ -139,7 +140,8 @@ ProviderGenerationResult parseOpenAiResponses(const JsonValue& root) {
 
 /* 功能：归一 Chat Completions 的首个候选，不合并多个选择。
  * 参数：root 为调用内借用的响应对象。返回：文本、停止原因及用量的独立结果。
- * 失败：缺失候选/正文返回 error；分配异常传播。
+ * 失败：缺失候选返回 error；有首个候选时 length/content_filter 优先于正文是否为空，
+ *       其余结束原因只有非空正文才判为 completed，空正文为 error；分配异常传播。
  * 副作用：只读；截断和内容过滤分别保留 incomplete/refusal，调用线程同步执行。 */
 ProviderGenerationResult parseCompatible(const JsonValue& root) {
     ProviderGenerationResult result;
@@ -184,7 +186,7 @@ ProviderGenerationResult parseAnthropic(const JsonValue& root) {
 
 /* 功能：归一 generateContent 首个候选与安全拦截。
  * 参数：root 为调用内借用对象，提示词拦截优先于候选解析。
- * 返回：独立结果，保留截断/拒绝分类和厂商用量。
+ * 返回：独立结果，保留截断/拒绝分类和厂商用量；STOP 或缺失结束原因配合非空正文均判为 completed。
  * 失败：空输出或非正常结束为 error，分配异常传播。
  * 副作用：只读，不将候选提升为事实，在调用线程执行。 */
 ProviderGenerationResult parseGemini(const JsonValue& root) {

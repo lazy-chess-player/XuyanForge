@@ -27,6 +27,12 @@ class PackageViewModel final : public QObject {
     Q_PROPERTY(QString comparisonText READ comparisonText NOTIFY changed)
 
 public:
+    /* 功能：只读检查本地导出目标是否存在，为中文覆盖确认提供依据。
+     * 参数：destination为调用期间借用的完整URL，仅接受本地文件地址；不保存引用。
+     * 返回：本地路径已存在为true（目录也算存在）；非本地或不存在为false。
+     * 失败：Qt路径分配异常传播；不证明文件可写或消除确认后的外部竞态，导出仍校验写入。
+     * 副作用：只读文件元数据，不写文件、不打开数据库；仅GUI线程调用。 */
+    Q_INVOKABLE bool destinationExists(const QUrl& destination) const;
     /*
      * 功能：绑定本地工作区并异步读取分支目录
      * 参数：database_path：输入，实例持有的本机数据库路径；parent：输入，可空 Qt 所有者，默认空。
@@ -84,11 +90,11 @@ public:
     QString comparisonText() const { return comparison_text_; }
 
     /*
-     * 功能：导出当前工作区世界资料包
+     * 功能：导出当前工作区首个世界资料包，现有服务尚未接入当前世界选择参数。
      * 参数：destination：输入，必须为本机文件 URL；非本机地址忽略。
      * 返回：无。
      * 失败：busy 时 run 忽略；包验证或写出失败经 errorText 通知。
-     * 副作用：后台显式写目标包；默认不包含密钥；GUI 显示条目数量。
+     * 副作用：后台显式写目标包；标题读取实际世界名称，未知作者留空；不包含密钥，GUI显示条目数量。
      * 线程与生命周期：GUI 捕获目标路径，线程池独立 PackageService 写出，GUI 回填；销毁不撤销文件写入。
      */
     Q_INVOKABLE void exportWorld(const QUrl& destination);
@@ -106,7 +112,7 @@ public:
      * 参数：blueprint_id：输入，非空卡 ID；destination：输入，本机目标文件 URL；include_private_notes：输入，true 才导出私密笔记，false 排除。
      * 返回：无。
      * 失败：非本机目标、空 ID 或 busy 忽略；加载/包写出失败显示提示。
-     * 副作用：后台导出人物包，不包含系统密钥；GUI 显示版本数量。
+     * 副作用：后台导出人物包，未知作者留空，不包含系统密钥；GUI显示版本数量。
      * 线程与生命周期：按值捕获路径、ID及隐私选项，线程池写出，GUI 回填；销毁不撤销导出。
      */
     Q_INVOKABLE void exportCharacter(QString blueprint_id, const QUrl& destination, bool include_private_notes);
