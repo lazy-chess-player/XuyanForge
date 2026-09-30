@@ -5187,7 +5187,9 @@ void testWorldPackageRoundTripAndAtomicImport() {
                 "extension field update must save before export");
 
         xuyan::application::PackageService packages(source_database);
-        auto exported = packages.exportWorld(package_path, "测试场景议和", "测试作者");
+        require(xuyan::storage::WorkspaceRepository(source_database).createWorldTemplate(
+                    "world-synthetic-test", "测试用例创建的世界").ok(), "package test must explicitly create its world directory");
+        auto exported = packages.exportWorld("world-synthetic-test", package_path, "测试场景议和", "测试作者");
         require(exported.ok() && exported.value->entity_count == 5 && std::filesystem::exists(package_path),
                 "world package must export as a ZIP with all visible entries");
     }

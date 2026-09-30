@@ -3,6 +3,7 @@
 #include "xuyan/application/package_service.h"
 #include "xuyan/package/json.h"
 #include "xuyan/package/zip_archive.h"
+#include "xuyan/storage/workspace_repository.h"
 #include "sqlite_support.h"
 
 #include <filesystem>
@@ -169,7 +170,7 @@ void testPackageMetadataHasNoPresetValues() {
     for (const bool explicit_metadata : {false, true}) {
         /* 本轮输出路径位于当前测试独占目录，循环开始前不存在，不覆盖外部文件。 */
         const auto target = temporary.root() / (explicit_metadata ? "explicit.zip" : "inferred.zip");
-        const auto exported = service.exportWorld(target, explicit_metadata ? "作者填写的标题" : "",
+        const auto exported = service.exportWorld("owned-package-world", target, explicit_metadata ? "作者填写的标题" : "",
                                                   explicit_metadata ? "作者填写的署名" : "");
         require(exported.ok(), "两类元数据输入都须导出成功");
         const auto archive = xuyan::package::readZip(target);
@@ -190,6 +191,147 @@ void testPackageMetadataHasNoPresetValues() {
         }
         require(manifest_found, "导出包必须存在清单");
     }
+}
+
+/* 功能：验证明确选择的世界不是目录首项时仍导出该世界，并核对超过旧分页大小的资料隔离。
+ * 参数：无。返回：无；清单身份、标题及所有载荷均属于明确选定世界时正常结束。
+ * 失败：临时创建、写入、导出、读取或断言失败抛中文异常。
+ * 副作用：仅在独占临时目录创建两个世界和205条同名测试资料，写一个测试包；无网络或用户资料访问。
+ */
+void testWorldExportSelection() {
+    TemporaryWorkspace temporary;
+    xuyan::storage::WorkspaceRepository repository(temporary.database());
+    require(repository.createWorldTemplate("a-first-world", "同名世界").ok(), "先创建目录首项");
+    require(repository.createWorldTemplate("z-selected-world", "同名世界").ok(), "后创建明确选定世界");
+    xuyan::domain::WorldEntity excluded;
+    excluded.id = "other-world-item"; excluded.world_id = "a-first-world";
+    excluded.kind = "rule"; excluded.name = "其他世界不得导出的资料";
+    require(repository.createEntity("create-other-world", excluded).ok(), "其他世界测试条目须显式创建");
+    for (int index = 0; index < 205; ++index) {
+        xuyan::domain::WorldEntity entity;
+        entity.id = "selection-entity-" + std::to_string(index);
+        entity.world_id = "z-selected-world";
+        entity.kind = "rule";
+        entity.name = "当前世界的用户资料";
+        require(repository.createEntity("selection-create-" + entity.id, entity).ok(), "测试条目须显式创建");
+    }
+    const auto target = temporary.root() / "selected.zip";
+    xuyan::domain::WorldEntity deleted;
+    deleted.id = "selected-deleted"; deleted.world_id = "z-selected-world";
+    deleted.kind = "rule"; deleted.name = "已删除条目";
+    const auto created = repository.createEntity("create-deleted", deleted);
+    require(created.ok() && repository.deleteEntity("delete-selected", deleted.id, created.value->revision).ok(),
+            "测试须显式软删除一条资料");
+    xuyan::application::PackageService service(temporary.database());
+    const auto exported = service.exportWorld("z-selected-world", target, {}, {});
+    require(exported.ok() && exported.value->entity_count == 205, "导出不能回退目录首个世界，须保留选定世界跨页资料");
+    const auto archive = xuyan::package::readZip(target);
+    require(archive.ok(), "选定世界包须可读取");
+    bool world_found = false, entities_found = false;
+    for (const auto& entry : *archive.value) {
+        if (entry.path == "entities.jsonl") {
+            entities_found = true;
+            require(entry.data.find("other-world-item") == std::string::npos
+                    && entry.data.find("selected-deleted") == std::string::npos, "其他世界及软删除条目不得泄漏入包");
+        }
+        if (entry.path != "world.json") continue;
+        world_found = true;
+        const auto world = xuyan::package::parseJson(entry.data);
+        require(world.ok() && world.value->find("world_id")
+                && world.value->find("world_id")->string() == "z-selected-world", "同名世界必须按稳定标识隔离");
+    }
+    require(world_found && entities_found, "选定世界包须包含完整必需载荷");
+    const auto protected_target = temporary.root() / "protected.zip";
+    require(xuyan::package::writeZip(protected_target, {{"keep.txt", "调用者已有的文件内容"}}).ok(), "测试须显式创建受保护输出");
+    for (const std::string& id : {std::string{}, std::string{"missing"}, std::string{"' OR 1=1 --"}}) {
+        const auto failed = service.exportWorld(id, protected_target, {}, {});
+        require(!failed.ok() && failed.error->code == xuyan::domain::ErrorCode::validation_failed,
+                "未选择、缺失及伪造世界标识均须明确拒绝");
+        const auto preserved = xuyan::package::readZip(protected_target);
+        require(preserved.ok() && preserved.value->size() == 1
+                && preserved.value->front().data == "调用者已有的文件内容", "校验失败不得覆盖原目标文件");
+    }
+    require(!service.exportWorld("z-selected-world", {}, {}, {}).ok(), "空输出路径须拒绝");
+    require(repository.createWorldTemplate("empty-world", "用户空白世界").ok(), "空世界须显式创建");
+    const auto empty = service.exportWorld("empty-world", temporary.root() / "empty.zip", {}, {});
+    require(empty.ok() && empty.value->entity_count == 0, "空世界须成功导出零条而非借用其他世界条目");
+    {
+        TestConnection connection(temporary.database());
+        require(sqlite3_exec(connection.get(), "DELETE FROM entity_revision WHERE entity_id='selection-entity-0'",
+                             nullptr, nullptr, nullptr) == SQLITE_OK, "测试须显式制造当前修订缺失");
+    }
+    require(!service.exportWorld("z-selected-world", protected_target, {}, {}).ok(), "当前修订损坏不能静默漏项后成功导出");
+    const auto preserved = xuyan::package::readZip(protected_target);
+    require(preserved.ok() && preserved.value->size() == 1, "修订损坏须保留既有输出");
+}
+
+/* 功能：分别验证原始字段与JSON转义后的32MiB限额，失败必须保留既有输出。
+ * 参数：无。返回：无；两种超限与目标保护均满足时正常结束。
+ * 失败：测试显式建库、写载荷、导出或保护断言失败抛中文异常。
+ * 副作用：仅两个独占临时数据库生成重复字符规模素材；不读取用户小说、不联网，结束清理。
+ */
+void testWorldExportPayloadLimits() {
+    for (const bool escaped : {false, true}) {
+        TemporaryWorkspace temporary;
+        xuyan::storage::WorkspaceRepository repository(temporary.database());
+        require(repository.createWorldTemplate("sized-world", "载荷规模测试").ok(), "规模世界须显式创建");
+        const auto destination = temporary.root() / "protected.zip";
+        require(xuyan::package::writeZip(destination, {{"keep.txt", "保持原文件"}}).ok(), "保护目标须测试显式创建");
+        const int count = escaped ? 22 : 32;
+        for (int index = 0; index < count; ++index) {
+            xuyan::domain::WorldEntity entity;
+            entity.id = "sized-" + std::to_string(index); entity.world_id = "sized-world";
+            entity.kind = "rule"; entity.name = "规模资料";
+            entity.description = std::string(escaped ? 800000 : 1024 * 1024, escaped ? '\t' : 'a');
+            require(repository.createEntity("create-" + entity.id, entity).ok(), "规模载荷须在测试中显式写入");
+        }
+        const auto snapshot = repository.readWorldExportSnapshot("sized-world");
+        require(snapshot.ok() == escaped, "原始字段与转义载荷限额须分别检验，不能事后截断条目");
+        const auto exported = xuyan::application::PackageService(temporary.database()).exportWorld("sized-world", destination, {}, {});
+        require(!exported.ok() && exported.error->code == xuyan::domain::ErrorCode::validation_failed, "超限导出须返回明确校验错误");
+        const auto preserved = xuyan::package::readZip(destination);
+        require(preserved.ok() && preserved.value->size() == 1 && preserved.value->front().data == "保持原文件",
+                "编码或原始字段超限不得更新既有输出");
+    }
+}
+
+/* 功能：核对世界条目包100000条数量边界，超限不得静默截断或改目标。
+ * 参数：无。返回：无；100001条拒绝、删一条后100000条成功才正常结束。
+ * 失败：临时库批量生成、导出、输出保护或边界断言失败抛中文异常。
+ * 副作用：仅测试独占临时库用固定SQL显式生成规模条目和包，不进入正式目标或用户工作区，不联网。
+ */
+void testWorldExportCountLimit() {
+    TemporaryWorkspace temporary;
+    xuyan::storage::WorkspaceRepository repository(temporary.database());
+    require(repository.createWorldTemplate("count-world", "数量边界测试").ok(), "数量世界须显式创建");
+    {
+        TestConnection connection(temporary.database());
+        /* 批量SQL仅为测试生成数量边界，不经过产品初始化，也不读私有素材。 */
+        const char* sql =
+            "BEGIN; WITH RECURSIVE numbers(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM numbers WHERE n<100000) "
+            "INSERT INTO world_entity(id,world_id,head_revision,deleted,created_at) "
+            "SELECT 'bulk-'||n,'count-world',1,0,strftime('%Y-%m-%dT%H:%M:%SZ','now') FROM numbers;"
+            "INSERT INTO entity_revision(entity_id,revision,kind,name,aliases,tags,description,attributes_json,review_status,deleted,updated_at) "
+            "SELECT id,1,'rule','规模资料','','','','{}','accepted',0,created_at FROM world_entity; COMMIT;";
+        require(sqlite3_exec(connection.get(), sql, nullptr, nullptr, nullptr) == SQLITE_OK, "规模条目须在测试独占事务显式生成");
+    }
+    const auto destination = temporary.root() / "count.zip";
+    require(xuyan::package::writeZip(destination, {{"keep.txt", "数量超限仍保留"}}).ok(), "数量保护目标须显式创建");
+    xuyan::application::PackageService service(temporary.database());
+    const auto refused = service.exportWorld("count-world", destination, {}, {});
+    require(!refused.ok() && refused.error->code == xuyan::domain::ErrorCode::validation_failed, "100001条不得静默截断导出");
+    const auto preserved = xuyan::package::readZip(destination);
+    require(preserved.ok() && preserved.value->size() == 1 && preserved.value->front().data == "数量超限仍保留",
+            "数量超限须保留既有输出");
+    {
+        TestConnection connection(temporary.database());
+        require(sqlite3_exec(connection.get(),
+            "BEGIN; DELETE FROM entity_revision WHERE entity_id='bulk-100000'; DELETE FROM world_entity WHERE id='bulk-100000'; COMMIT;",
+            nullptr, nullptr, nullptr) == SQLITE_OK, "测试须显式移除自身生成的超限一项");
+    }
+    const auto accepted = service.exportWorld("count-world", destination, {}, {});
+    require(accepted.ok() && accepted.value->entity_count == 100000, "100000条且载荷合法须完整导出成功");
+    require(xuyan::package::readZip(destination).ok(), "数量边界成功包须满足默认读包限额");
 }
 
 /* 功能：验证数据库打开失败以中文错误传播，不导致后台异常脱离结果边界。
@@ -292,6 +434,9 @@ int main() {
     try {
         testCatalogUseCases();
         testPackageMetadataHasNoPresetValues();
+        testWorldExportSelection();
+        testWorldExportPayloadLimits();
+        testWorldExportCountLimit();
         testOpenFailure();
         testIncompleteCurrentSchemaRefused();
         testCredentialCompensationFailureIsDistinct();

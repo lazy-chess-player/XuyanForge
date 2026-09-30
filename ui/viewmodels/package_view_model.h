@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <optional>
 
 /*
  * 职责：提供世界/人物包、备份恢复及分支成果操作；凭据不进入包，用户资料只在显式操作时写出。
@@ -25,6 +26,8 @@ class PackageViewModel final : public QObject {
     Q_PROPERTY(QStringList branchNames READ branchNames NOTIFY changed)
     /* 属性：读取两分支比较说明；changed 通知重读；默认值及空值见对应访问器和成员。 */
     Q_PROPERTY(QString comparisonText READ comparisonText NOTIFY changed)
+    /* 当前世界稳定标识，不用作显示标签；目录选择负责写入，默认空表示未选择。 */
+    Q_PROPERTY(QString worldId READ worldId NOTIFY changed)
 
 public:
     /* 功能：只读检查本地导出目标是否存在，为中文覆盖确认提供依据。
@@ -42,6 +45,17 @@ public:
      * 线程与生命周期：仅 GUI 线程同步调用；返回值独立持有，不保存调用方引用。
      */
     explicit PackageViewModel(std::filesystem::path database_path, QObject* parent = nullptr);
+
+    /* 功能：绑定项目列表明确选择的世界，使导出不回退为目录首项。
+     * 参数：world_id为按值持有的稳定标识，空值清除选择；实际存在性由导出服务重新验证。
+     * 返回：无。失败：字符串分配异常传播；重复标识不推进代次。
+     * 副作用：变更世界和代次，清空旧操作说明/错误并发changed；不打开数据库或自动导出。
+     * 线程与生命周期：GUI线程调用；在途文件操作不撤销、busy不提前释放，旧世界结果不覆盖新选择。 */
+    void setWorldId(QString world_id);
+    /* 功能：读取当前导出世界的稳定标识。
+     * 参数：无。返回：拥有型QString，空表示未选择。
+     * 失败：分配异常传播。副作用：只读GUI快照，不查询数据库、不导出文件。 */
+    QString worldId() const { return world_id_; }
 
     /*
      * 功能：查询包或分支操作是否在途
@@ -90,12 +104,13 @@ public:
     QString comparisonText() const { return comparison_text_; }
 
     /*
-     * 功能：导出当前工作区首个世界资料包，现有服务尚未接入当前世界选择参数。
-     * 参数：destination：输入，必须为本机文件 URL；非本机地址忽略。
+     * 功能：显式导出调用时选定世界的条目包，不取工作区首项。
+     * 参数：destination：输入，非空本机文件URL，借用至同步入口返回。
      * 返回：无。
-     * 失败：busy 时 run 忽略；包验证或写出失败经 errorText 通知。
+     * 失败：busy时忽略；未选择世界/无效URL显示中文错误且零文件写入；服务校验/写出错误经errorText通知。
      * 副作用：后台显式写目标包；标题读取实际世界名称，未知作者留空；不包含密钥，GUI显示条目数量。
-     * 线程与生命周期：GUI 捕获目标路径，线程池独立 PackageService 写出，GUI 回填；销毁不撤销文件写入。
+     * 线程与生命周期：GUI按值捕获世界/路径/代次，线程池独立服务写出；切世界不改变在途目标，
+     *   旧代次结果只释放busy，不覆盖新世界提示；销毁不撤销文件写入。
      */
     Q_INVOKABLE void exportWorld(const QUrl& destination);
     /*
@@ -235,13 +250,15 @@ private:
     using Work = std::function<void(const std::filesystem::path&, QString&, QString&)>;
     /*
      * 功能：串行入口投递一次包或分支工作
-     * 参数：work：输入，按值拥有的同步工作回调；接收数据库路径及状态/错误输出引用，须只在调用期间使用；world_import：成功是否发世界通知，默认false；character_import：成功是否发人物通知，默认false。
+     * 参数：work：输入，按值拥有的同步工作回调；接收数据库路径及状态/错误输出引用，须只在调用期间使用；world_import：成功是否发世界通知，默认false；character_import：成功是否发人物通知，默认false；
+     *   world_generation：可空的调用世界代次，默认空用于工作区级操作；有值时迟到结果不覆盖新世界。
      * 返回：无。
      * 失败：busy 时忽略；回调异常转换安全中文错误。
      * 副作用：设置 busy，线程池执行 work；GUI 应用输出和条件通知。
      * 线程与生命周期：回调在线程池同步执行，不借用 GUI 对象；QPointer 失效不回填，后台写入不自动取消。
      */
-    void run(Work work, bool world_import = false, bool character_import = false);
+    void run(Work work, bool world_import = false, bool character_import = false,
+             std::optional<quint64> world_generation = std::nullopt);
     /*
      * 功能：后台读取分支显示目录
      * 参数：无。
@@ -254,6 +271,10 @@ private:
 
     /* 本机数据库路径，构造确定，实例持有；后台按值复制。 */
     std::filesystem::path database_path_;
+    /* 当前明确选定的世界标识，默认空；GUI选择更新，导出入口按值冻结，后台不直接读取本成员。 */
+    QString world_id_;
+    /* 世界选择代次，初始0、每次有效变更加1；GUI比较回调快照，防止旧世界结果污染新世界。 */
+    quint64 world_generation_{0};
     /* 包/比较/恢复操作在途标志，默认false；GUI 设置与完成回调复位。 */
     bool busy_{false};
     /* 包处理中文状态；初始说明包不含模型密钥，GUI 更新。 */

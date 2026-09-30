@@ -309,6 +309,14 @@ public:
      * 副作用：只读取当前连接的数据，不改资料、不联网；返回值独立拥有内容。
      */
     xuyan::domain::Result<std::vector<WorldTemplate>> listWorldTemplates();
+    /* 功能：读取明确选定世界的目录和全部当前条目，保持同一SQLite只读快照。
+     * 参数：world_id为调用期间借用的非空世界稳定标识；须存在于目录，不按名称或首项回退。
+     * 返回：拥有型WorldExportSnapshot；存在但没有条目的世界返回成功空集合。
+     * 失败：空标识、目录缺失、超过100000条或文本字段累计超过32MiB返回校验错误；
+     *   SQLite查询、损坏的修订头或分配失败转换为存储错误，不返回部分载荷。
+     * 副作用：参数绑定只查询该世界、释放只读快照；不读小说/凭据、不写资料或输出文件。
+     * 线程与生命周期：所属线程同步执行，仓储须无其他活动事务；结果独立持有，写包时不继续占用快照。 */
+    xuyan::domain::Result<xuyan::domain::WorldExportSnapshot> readWorldExportSnapshot(const std::string& world_id);
     /*
      * 功能：将已导入的小说来源关联到指定世界。
      * 参数：

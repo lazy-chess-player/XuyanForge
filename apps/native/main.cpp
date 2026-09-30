@@ -140,12 +140,13 @@ int main(int argc, char* argv[]) {
     ExtractionJobViewModel extractionJobs(databasePath);
     CandidateReviewViewModel candidateReview(databasePath);
     WorldViewsViewModel worldViews(databasePath);
-    // 五个页面共享明确世界边界；通用绑定避免新增页面时遗漏首次同步或切换同步。
+    // 六个页面共享明确世界边界；通用绑定避免新增页面时遗漏首次同步或切换同步。
     bindWorldSelection(workspaceCatalog, workspace);
     bindWorldSelection(workspaceCatalog, worldViews);
     bindWorldSelection(workspaceCatalog, sources);
     bindWorldSelection(workspaceCatalog, extractionJobs);
     bindWorldSelection(workspaceCatalog, candidateReview);
+    bindWorldSelection(workspaceCatalog, packages);
 
     // refresh声明可能有默认参数，通过统一零参数调用绑定，不改变原筛选语义。
     bindRefresh(packages, &PackageViewModel::worldImported, workspace);

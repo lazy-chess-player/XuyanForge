@@ -184,13 +184,21 @@ Result<xuyan::domain::CharacterBlueprint> decodeBlueprint(const JsonValue& value
 /*
  * 功能：把世界条目按一行一对象编码为 JSONL 载荷。
  * 参数：entities 为借用的有序条目列表，允许为空。
- * 返回：独立拥有的 UTF-8 字符串，空列表返回空串。
- * 失败：编码或分配异常可传播；副作用：只读条目，不写包；线程：同步。
+ * 返回：成功为独立UTF-8字符串，空列表返回空串；编码后含换行最多32MiB。
+ * 失败：超过读包默认单项32MiB限额返回校验错误；编码或分配异常可传播。
+ * 副作用：只读条目，不写包、不返回部分载荷；线程：同步。
  */
-std::string entitiesJsonl(const std::vector<WorldEntity>& entities) {
+Result<std::string> entitiesJsonl(const std::vector<WorldEntity>& entities) {
     std::string output;
-    for (const auto& entity : entities) { output += xuyan::package::writeJson(encodeEntity(entity)); output.push_back('\n'); }
-    return output;
+    constexpr std::size_t maximum_bytes = 32 * 1024 * 1024;
+    for (const auto& entity : entities) {
+        const auto line = xuyan::package::writeJson(encodeEntity(entity));
+        // JSON转义会使编码后变大，原始字段限额不能证明生成的载荷可再次读入。
+        if (output.size() == maximum_bytes || line.size() >= maximum_bytes - output.size())
+            return Result<std::string>::failure(packageError("世界包编码载荷超过32兆字节上限"));
+        output += line; output.push_back('\n');
+    }
+    return Result<std::string>::success(std::move(output));
 }
 
 /*
@@ -253,35 +261,19 @@ Result<std::vector<xuyan::domain::CharacterBlueprint>> parseBlueprints(std::stri
 
 PackageService::PackageService(std::filesystem::path database_path) : database_path_(std::move(database_path)) {}
 
-Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& destination,
+Result<PackageReport> PackageService::exportWorld(const std::string& world_id, const std::filesystem::path& destination,
                                                   const std::string& title, const std::string& author) {
-    // 分页读取本地实体后只导出同一世界，避免把其他项目混入包内。
+    if (world_id.empty() || destination.empty()) return Result<PackageReport>::failure(
+        packageError("请明确选择世界和有效的导出路径"));
     xuyan::storage::WorkspaceRepository repository(database_path_);
-    std::vector<WorldEntity> entities;
-    for (int offset = 0;;) {
-        auto page = repository.searchEntities({}, {}, offset, 200);
-        if (!page.ok()) return Result<PackageReport>::failure(*page.error);
-        entities.insert(entities.end(), page.value->items.begin(), page.value->items.end());
-        if (!page.value->has_more) break;
-        offset += static_cast<int>(page.value->items.size());
-    }
-    auto worlds = repository.listWorldTemplates();
-    if (!worlds.ok()) return Result<PackageReport>::failure(*worlds.error);
-    const auto world_id = !worlds.value->empty() ? worlds.value->front().id
-                        : !entities.empty() ? entities.front().world_id : std::string{};
-    if (world_id.empty()) return Result<PackageReport>::failure(
-        {xuyan::domain::ErrorCode::validation_failed, "还没有可导出的世界", false, "先创建世界并校对资料"});
-    // 未填写的标题只取实际导出世界的用户名称；旧数据库没有目录时保持未知，不编造世界资料。
-    const auto package_title = title.empty() && !worlds.value->empty() ? worlds.value->front().name : title;
-    /*
-     * 功能：仅保留目标世界的条目，避免把其他项目资料导入同一包。
-     * 参数：entity 为当前借用条目；world_id 为本次导出的只读世界 ID，调用期间有效。
-     * 返回：不属于目标世界时为真。失败：比较无主动错误。
-     * 副作用：lambda 只读，外层 erase_if 原位删除非目标条目；线程：同步，捕获不逃逸。
-     */
-    std::erase_if(entities, [&](const auto& entity) { return entity.world_id != world_id; });
+    auto snapshot = repository.readWorldExportSnapshot(world_id);
+    if (!snapshot.ok()) return Result<PackageReport>::failure(*snapshot.error);
+    const auto& entities = snapshot.value->entities;
+    const auto package_title = title.empty() ? snapshot.value->world.name : title;
     // 清单记录每个载荷的长度与摘要，导入端据此校验完整性。
-    const auto entity_data = entitiesJsonl(entities);
+    auto encoded_entities = entitiesJsonl(entities);
+    if (!encoded_entities.ok()) return Result<PackageReport>::failure(*encoded_entities.error);
+    const auto& entity_data = *encoded_entities.value;
     const auto world_data = xuyan::package::writeJson(JsonValue::Object{
         {"schema_version", "0.1.0"}, {"title", package_title}, {"world_id", world_id},
     });
@@ -299,6 +291,8 @@ Result<PackageReport> PackageService::exportWorld(const std::filesystem::path& d
         {"kind", "world"}, {"optional_features", JsonValue::Array{}}, {"package_id", package_id},
         {"required_features", JsonValue::Array{JsonValue("world-v1")}}, {"title", package_title},
     });
+    if (world_data.size() > 32 * 1024 * 1024 || manifest.size() > 32 * 1024 * 1024)
+        return Result<PackageReport>::failure(packageError("世界包元数据超过32兆字节上限"));
     auto written = xuyan::package::writeZip(destination,
         {{"manifest.json", manifest}, {"world.json", world_data}, {"entities.jsonl", entity_data}});
     if (!written.ok()) return Result<PackageReport>::failure(*written.error);

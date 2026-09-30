@@ -37,6 +37,8 @@ if(XUYANFORGE_BUILD_UI)
         ${CMAKE_SOURCE_DIR}/ui/viewmodels/extraction_job_view_model.h
         ${CMAKE_SOURCE_DIR}/ui/viewmodels/world_views_view_model.cpp
         ${CMAKE_SOURCE_DIR}/ui/viewmodels/world_views_view_model.h
+        ${CMAKE_SOURCE_DIR}/ui/viewmodels/package_view_model.cpp
+        ${CMAKE_SOURCE_DIR}/ui/viewmodels/package_view_model.h
     )
     target_include_directories(tst_world_views_vm PRIVATE ${CMAKE_SOURCE_DIR}/ui/viewmodels)
     target_link_libraries(tst_world_views_vm PRIVATE

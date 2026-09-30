@@ -30,14 +30,17 @@ public:
     explicit PackageService(std::filesystem::path database_path);
 
     /*
-     * 功能：导出仓储首个世界模板的条目；无模板时使用首个条目的世界，当前 API 不接受世界选择参数。
-     * 参数：destination 为调用期间借用的ZIP输出路径；title为借用的包标题，非空原样保留，
-     *   空值取实际导出世界的目录名称，无世界目录时仍为空；author为借用的作者元数据，空值表示未知，原样保留。
-     * 返回：包标识、类型、路径及条目数。失败：无世界、数据库或 ZIP 写入错误返回 Result；仓储构造异常可传播。
-     * 副作用：分页读条目并写包，不单独打包来源资产/系统凭据，条目字段可能仍含作者资料。
-     * 线程：同步读取与写文件，调用方须独占输出路径；分页查询不构成全程同一快照。
+     * 功能：将明确选定世界的当前未删除条目导出为world-v1包，不回退首个世界。
+     * 参数：world_id为借用的非空世界稳定标识，必须存在于目录；destination为借用的非空ZIP路径；
+     *   title为借用的包标题，非空原样保留、空值取该世界实际名称；author为借用作者元数据，空值保持未知。
+     * 返回：包标识、类型、路径及条目数；空世界可成功导出0条，不夹带其他世界。
+     * 失败：空目标/标识、目录缺失、100000条/32MiB载荷上限、数据库或ZIP失败返回Result；仓储构造异常可传播。
+     * 副作用：同一只读快照读取该世界目录及条目，释放快照后编码并写包；校验失败不改目标。
+     *   不单独打包来源资产/证据/专用图谱/历史版本/系统凭据，条目字段可能含用户资料，不等同完整备份。
+     * 线程：调用线程同步执行；输入只借用至返回，调用方须独占输出路径；不跨写包持有数据库事务。
      */
-    xuyan::domain::Result<PackageReport> exportWorld(const std::filesystem::path& destination,
+    xuyan::domain::Result<PackageReport> exportWorld(const std::string& world_id,
+                                                      const std::filesystem::path& destination,
                                                       const std::string& title,
                                                       const std::string& author);
     /*

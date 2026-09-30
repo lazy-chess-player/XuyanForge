@@ -2438,6 +2438,56 @@ Result<std::vector<WorldTemplate>> WorkspaceRepository::listWorldTemplates() {
     } catch (const std::exception& exception) { return Result<std::vector<WorldTemplate>>::failure(storageError(exception)); }
 }
 
+Result<xuyan::domain::WorldExportSnapshot> WorkspaceRepository::readWorldExportSnapshot(const std::string& world_id) {
+    using ExportSnapshot = xuyan::domain::WorldExportSnapshot;
+    if (world_id.empty()) return Result<ExportSnapshot>::failure(
+        {ErrorCode::validation_failed, "尚未选择要导出的世界", false, "先在项目列表选择世界"});
+    try {
+        /* 目录名称和各条目修订必须来自同一时刻；释放快照后才允许服务编码、写文件。 */
+        ReadTransaction transaction(database_);
+        ExportSnapshot snapshot;
+        {
+            Statement world(database_, "SELECT id,name,source_id FROM world_template WHERE id=?");
+            bindText(world.get(), 1, world_id);
+            if (!stepRow(world.get())) return Result<ExportSnapshot>::failure(
+                {ErrorCode::validation_failed, "找不到选定的世界", false, "刷新项目列表后重新选择"});
+            snapshot.world = {columnText(world.get(), 0), columnText(world.get(), 1), columnText(world.get(), 2)};
+        }
+        /* LEFT JOIN不能把损坏的修订头静默隐藏；任何当前条目缺修订都应拒绝整个导出。
+         * 按主键给出稳定顺序，不先按名称排序携带大说明正文的所有行，载荷限额在逐行复制前执行。 */
+        Statement list(database_,
+            "SELECT e.id,e.world_id,r.kind,r.name,r.aliases,r.tags,r.description,r.attributes_json,"
+            "r.review_status,r.revision,r.deleted FROM world_entity e LEFT JOIN entity_revision r "
+            "ON r.entity_id=e.id AND r.revision=e.head_revision "
+            "WHERE e.world_id=? AND e.deleted=0 ORDER BY e.id LIMIT 100001");
+        bindText(list.get(), 1, world_id);
+        /* 原始文本累计字节数，初始0；复制列内容前检查，不作为编码后JSON的大小证明。 */
+        std::size_t text_bytes = 0;
+        constexpr std::size_t maximum_text_bytes = 32 * 1024 * 1024;
+        while (stepRow(list.get())) {
+            if (snapshot.entities.size() == 100000) return Result<ExportSnapshot>::failure(
+                {ErrorCode::validation_failed, "世界包条目数量超过上限", false, "每个条目包最多导出100000条"});
+            if (sqlite3_column_type(list.get(), 9) == SQLITE_NULL || sqlite3_column_int(list.get(), 10) != 0)
+                throw std::runtime_error("世界条目的当前修订缺失或删除状态不一致");
+            for (int column = 0; column <= 8; ++column) {
+                const auto bytes = static_cast<std::size_t>(sqlite3_column_bytes(list.get(), column));
+                if (bytes > maximum_text_bytes - text_bytes) return Result<ExportSnapshot>::failure(
+                    {ErrorCode::validation_failed, "世界包条目载荷超过上限", false, "每个条目包最多包含32兆字节文本字段"});
+                text_bytes += bytes;
+            }
+            WorldEntity entity;
+            entity.id = columnText(list.get(), 0); entity.world_id = columnText(list.get(), 1);
+            entity.kind = columnText(list.get(), 2); entity.name = columnText(list.get(), 3);
+            entity.aliases = splitValues(columnText(list.get(), 4)); entity.tags = splitValues(columnText(list.get(), 5));
+            entity.description = columnText(list.get(), 6); entity.attributes_json = columnText(list.get(), 7);
+            entity.review_status = columnText(list.get(), 8); entity.revision = sqlite3_column_int(list.get(), 9);
+            snapshot.entities.push_back(std::move(entity));
+        }
+        transaction.commit();
+        return Result<ExportSnapshot>::success(std::move(snapshot));
+    } catch (const std::exception& exception) { return Result<ExportSnapshot>::failure(storageError(exception)); }
+}
+
 Result<WorldTemplate> WorkspaceRepository::attachWorldSource(const std::string& world_id,
                                                               const std::string& source_id) {
     try {

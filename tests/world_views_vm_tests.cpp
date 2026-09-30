@@ -2,6 +2,7 @@
 #include "candidate_review_view_model.h"
 #include "source_view_model.h"
 #include "extraction_job_view_model.h"
+#include "package_view_model.h"
 #include "view_model_text.h"
 
 #include "xuyan/application/world_graph_service.h"
@@ -13,6 +14,8 @@
 #include "xuyan/application/evidence_service.h"
 #include "xuyan/domain/hash.h"
 #include "xuyan/storage/workspace_repository.h"
+#include "xuyan/package/json.h"
+#include "xuyan/package/zip_archive.h"
 
 #include <QCoreApplication>
 #include <QEventLoop>
@@ -29,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <atomic>
+#include <memory>
 
 /*
  * 职责：测试专用友元入口，只等待解析模型自有线程，不消费界面结束回调，以复现末尾竞态。
@@ -1472,6 +1476,147 @@ void testCredentialConsistencyDisplayText() {
             "compensation failure must show a distinct safe Chinese instruction");
 }
 
+/* 职责：用共享信号量占用全局线程池唯一线程，确定性检验排队期间切世界和销毁边界。
+ * 生命周期：主线程作用域守卫，失败路径仍放行并恢复线程数；信号量由worker与守卫共同持有，不借用栈。
+ * 边界：仅测试使用；析构等待最多10000毫秒，超时不销毁worker仍持有的信号量，不操作用户资料。
+ */
+class PackageWorkerGate final {
+public:
+    /* 功能：等待已有测试池操作后建立唯一线程门闩，不靠休眠制造竞态。
+     * 参数：无。返回：已确认占用池线程的守卫。
+     * 失败：已有工作或占用确认超过10000毫秒抛中文异常，建门闩失败先放行并恢复池设置。
+     * 副作用：临时限制全局池并排队一个只等信号量的任务；仅主线程构造。 */
+    PackageWorkerGate() : pool_(QThreadPool::globalInstance()), previous_limit_(pool_->maxThreadCount()),
+                          signals_(std::make_shared<Signals>()) {
+        require(pool_->waitForDone(10000), "包测试开始前线程池必须空闲");
+        pool_->setMaxThreadCount(1);
+        /* 功能：占用唯一工作线程并通知测试可以排队实际导出。
+         * 参数：无，gate_state按值共享持有两个信号量。返回：无。
+         * 失败：不设主动错误，守卫失败/析构也会放行。
+         * 副作用：仅释放started并等待release；信号量覆盖整个后台等待，不读写资料。 */
+        pool_->start([gate_state = signals_] { gate_state->started.release(); gate_state->release.acquire(); });
+        if (!signals_->started.tryAcquire(1, 10000)) {
+            signals_->release.release(); pool_->setMaxThreadCount(previous_limit_);
+            throw std::runtime_error("包测试线程门闩启动超时");
+        }
+    }
+    /* 功能：失败或正常离开时放行所有已排队工作并恢复池并发限制。
+     * 参数：无。返回：无。失败：等待超时不抛析构异常；共享信号量仍由worker持有。
+     * 副作用：放行门闩，最多等待10000毫秒后恢复全局池；测试目录应晚于后台工作释放。 */
+    ~PackageWorkerGate() { release(); pool_->waitForDone(10000); pool_->setMaxThreadCount(previous_limit_); }
+    /* 功能：禁止复制全局池设置恢复责任。参数：另一守卫。返回：无；编译期拒绝，无副作用。 */
+    PackageWorkerGate(const PackageWorkerGate&) = delete;
+    /* 功能：禁止覆盖恢复责任。参数：另一守卫。返回：无；编译期拒绝，无副作用。 */
+    PackageWorkerGate& operator=(const PackageWorkerGate&) = delete;
+    /* 功能：显式允许排队的导出执行，重复调用无额外许可。
+     * 参数：无。返回：无。失败：无主动业务错误。
+     * 副作用：首次调用释放一个许可并置released_，主线程同步执行。 */
+    void release() { if (!released_) { released_ = true; signals_->release.release(); } }
+private:
+    /* 职责：持有线程启动/放行两个计数信号量；默认0许可，仅门闩worker和守卫共享，不含业务数据。 */
+    struct Signals {
+        /* worker占用线程后释放，主线程消费，初始0许可，不用于业务进度。 */
+        QSemaphore started;
+        /* 主线程显式/析构释放，worker消费，初始0许可，保证失败路径也能退出。 */
+        QSemaphore release;
+    };
+    /* Qt持有的全局池观察指针，构造取得，守卫只临时改并发限制、不销毁池。 */
+    QThreadPool* pool_;
+    /* 构造前并发上限，单位线程，构造取得、析构恢复。 */
+    int previous_limit_;
+    /* worker共享拥有的门闩信号量，构造创建，最后一个持有者结束后释放。 */
+    std::shared_ptr<Signals> signals_;
+    /* 是否已发放一次放行许可，默认false，主线程release更新，析构据此避免重复释放。 */
+    bool released_{false};
+};
+
+/* 功能：读取测试导出包的世界身份，确认模型传递的是稳定标识而非同名目录首项。
+ * 参数：path为借用的测试自有包路径，必须已经完成写入。
+ * 返回：world.json中世界标识的拥有型字符串。
+ * 失败：包/JSON/字段缺失或不是字符串抛中文异常。
+ * 副作用：仅读取独占测试包，不读用户工作区或网络；调用线程同步执行。 */
+std::string exportedWorldIdentity(const std::filesystem::path& path) {
+    const auto archive = xuyan::package::readZip(path);
+    require(archive.ok(), "包视图模型输出必须可读取");
+    for (const auto& entry : *archive.value) {
+        if (entry.path != "world.json") continue;
+        const auto world = xuyan::package::parseJson(entry.data);
+        require(world.ok(), "包世界元数据必须可解析");
+        const auto* id = world.value->find("world_id");
+        require(id && id->isString(), "包世界身份必须存在");
+        return id->string();
+    }
+    throw std::runtime_error("包世界元数据缺失");
+}
+
+/* 功能：验证包模型的明确世界选择、排队切换隔离、未知世界错误隔离及销毁后的文件语义。
+ * 参数：无。返回：无；所有输入/身份/忙碌/迟到回调断言成立则正常结束。
+ * 失败：仓储、导出、事件循环、门闩超时或断言失败抛中文异常。
+ * 副作用：独占临时库显式创建两个同名世界，真实写测试ZIP；不启动窗口、读用户资料或联网。
+ * 线程与生命周期：测试主线程操作模型，门闩控制线程池；测试目录最后析构，销毁不撤销已排队写入。 */
+void testPackageWorldSelection() {
+    TemporaryWorkspace temporary;
+    xuyan::storage::WorkspaceRepository repository(temporary.database());
+    require(repository.createWorldTemplate("a-export-world", "同名世界").ok(), "包测试须创建首世界");
+    require(repository.createWorldTemplate("z-export-world", "同名世界").ok(), "包测试须创建选定世界");
+    PackageViewModel model(temporary.database());
+    require(QThreadPool::globalInstance()->waitForDone(10000), "分支目录构造查询须先结束");
+    QCoreApplication::processEvents();
+    const auto target = temporary.database().parent_path() / "selected.zip";
+    const auto target_url = QUrl::fromLocalFile(QString::fromStdWString(target.wstring()));
+    require(!model.destinationExists(target_url), "导出前本地目标不存在");
+    model.exportWorld(target_url);
+    require(!model.busy() && !model.errorText().isEmpty() && !std::filesystem::exists(target), "未选择世界必须显示中文错误且不写文件");
+    model.setWorldId(QStringLiteral("z-export-world"));
+    require(model.errorText().isEmpty(), "新世界选择必须清除旧错误");
+    model.exportWorld(QUrl(QStringLiteral("https://example.test/not-local.zip")));
+    require(!model.busy() && !model.errorText().isEmpty(), "远程输出URL须明确拒绝");
+    {
+        PackageWorkerGate gate;
+        model.exportWorld(target_url);
+        require(model.busy(), "明确点击导出必须排队操作");
+        model.setWorldId(QStringLiteral("a-export-world"));
+        model.exportWorld(QUrl::fromLocalFile(QString::fromStdWString((target.parent_path() / "duplicate.zip").wstring())));
+        require(model.busy(), "切世界不能提前释放忙碌状态并允许重复写入");
+        gate.release(); waitUntilIdle(model);
+        require(model.errorText().isEmpty() && !model.statusText().contains(QStringLiteral("已导出")), "旧世界完成回调不能覆盖新世界说明");
+    }
+    require(exportedWorldIdentity(target) == "z-export-world", "在途导出必须保留开始时的世界身份");
+    require(!std::filesystem::exists(target.parent_path() / "duplicate.zip"), "忙碌期间第二次导出不得排队");
+    require(model.destinationExists(target_url), "真实写入后覆盖查询必须识别目标");
+    model.exportWorld(target_url); waitUntilIdle(model);
+    require(model.errorText().isEmpty() && model.statusText().contains(QStringLiteral("已导出"))
+            && exportedWorldIdentity(target) == "a-export-world", "后续导出必须使用新的明确世界");
+    {
+        PackageWorkerGate gate;
+        model.setWorldId(QStringLiteral("missing-export-world")); model.exportWorld(target_url);
+        model.setWorldId(QStringLiteral("a-export-world"));
+        gate.release(); waitUntilIdle(model);
+        require(model.errorText().isEmpty() && exportedWorldIdentity(target) == "a-export-world", "迟到失败不能污染新选择且不得覆盖输出");
+    }
+    {
+        PackageWorkerGate gate;
+        model.exportWorld(target_url);
+        model.setWorldId(QStringLiteral("z-export-world")); model.setWorldId(QStringLiteral("a-export-world"));
+        gate.release(); waitUntilIdle(model);
+        require(!model.statusText().contains(QStringLiteral("已导出")), "同标识返回也须拒绝旧代次完成通知");
+    }
+    const auto destroyed_target = target.parent_path() / "destroyed.zip";
+    {
+        auto destroyed_model = std::make_unique<PackageViewModel>(temporary.database());
+        require(QThreadPool::globalInstance()->waitForDone(10000), "销毁回归前目录查询须结束");
+        QCoreApplication::processEvents();
+        PackageWorkerGate gate;
+        destroyed_model->setWorldId(QStringLiteral("z-export-world"));
+        destroyed_model->exportWorld(QUrl::fromLocalFile(QString::fromStdWString(destroyed_target.wstring())));
+        destroyed_model.reset();
+        gate.release();
+        require(QThreadPool::globalInstance()->waitForDone(10000), "销毁后的已排队文件用例须安全结束");
+        QCoreApplication::processEvents();
+    }
+    require(exportedWorldIdentity(destroyed_target) == "z-export-world", "模型销毁不撤销用户已经明确开始的文件写入");
+}
+
 } // namespace
 
 /*
@@ -1489,6 +1634,7 @@ int main(int argc, char* argv[]) {
         seedWorlds(workspace.database());
         seedCandidates(workspace.database());
         testCredentialConsistencyDisplayText();
+        testPackageWorldSelection();
         testGraphSemanticMapping();
         testSelectionAndIsolation(workspace.database());
         testLateCallbackIsolation(workspace.database());
