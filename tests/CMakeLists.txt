@@ -70,6 +70,16 @@ add_executable(application_catalog_tests application_catalog_tests.cpp)
 target_include_directories(application_catalog_tests PRIVATE ${PROJECT_SOURCE_DIR}/libs/storage_sqlite/src)
 target_link_libraries(application_catalog_tests PRIVATE xuyan_application)
 add_test(NAME application_catalog_tests COMMAND application_catalog_tests)
+# 备份安全回归独立拥有临时资料；正式目标不链接任何测试素材或注入接口。
+add_executable(backup_staging_tests backup_staging_tests.cpp)
+target_include_directories(backup_staging_tests PRIVATE ${PROJECT_SOURCE_DIR}/libs/application/src)
+add_test(NAME backup_staging_tests COMMAND backup_staging_tests)
+add_executable(backup_safety_tests backup_safety_tests.cpp)
+target_link_libraries(backup_safety_tests PRIVATE xuyan_application)
+add_test(NAME backup_safety_tests COMMAND backup_safety_tests)
+add_test(NAME backup_link_tests COMMAND backup_safety_tests --links-only)
+# 只允许独立链接分组报告权限/设施待条件；普通安全分组绝不因链接缺失而跳过。
+set_tests_properties(backup_link_tests PROPERTIES SKIP_RETURN_CODE 77)
 if(WIN32)
     set_tests_properties(core_tests PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
@@ -80,6 +90,10 @@ if(WIN32)
     set_tests_properties(domain_boundary_tests PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
     set_tests_properties(application_catalog_tests PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
+    set_tests_properties(backup_staging_tests PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
+    set_tests_properties(backup_safety_tests backup_link_tests PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
 endif()
 find_package(Python3 COMPONENTS Interpreter)

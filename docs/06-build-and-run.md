@@ -148,6 +148,19 @@ python tools/record_build_inputs.py --build-directory build/windows-dev --label 
 
 原文、抽样文件、候选和详细输出仅存放本机验证目录，不能提交或打包。控制台只打印区间序号、码点、候选/证据计数及已知用量；证据一致不等于语义正确或召回合格。工具限制官方端点、模型、请求字节和次数；按[官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)记录高峰全未命中缓存估算，不冒称实际账单，超时请求用量可能未知。用户授权本次小样本不意味着授权未来整书发送。
 
+## 备份安全定向回归
+
+在已配置的核心工具链环境中执行：
+
+```powershell
+cmake --build --preset core-dev --target backup_safety_tests backup_staging_tests
+ctest --preset core-dev -R '^backup_.*_tests$' -V
+```
+
+`backup_safety_tests`覆盖45项普通备份/恢复用例，`backup_staging_tests`验证暂存碰撞保留、失败清理与发布所有权；两者不允许跳过。`backup_link_tests`复用前者可执行文件的`--links-only`模式，另跑12项目录链链接用例。只有明确链接权限/设施不足返回77时，该链接分组允许CTest标记跳过，输出实际未执行数；其他失败仍阻断门禁。2026-09-30本机Windows原生创建链接返回权限错误1314，链接分组未执行，不能计为通过；不自动修改系统权限或开发者模式。
+
+备份目标必须为尚不存在、位于整个源工作区之外的新目录；恢复目标与备份根不得互相包含。源或目标路径链中的链接/Windows重解析点拒绝；清单校验实际大小、SHA及SQLite快速检查/核心表。此预检不保证消除外部进程并发替换，不提供断电持久性。数据库与资产仍需调用方保持稳定，文件摘要仍有界整文件读入，不是千万字资源验收。只读SQLite连接可能生成日志模式协调文件，不自动删除源日志；系统凭据不主动纳入，但用户自行保存在数据库/资产内的敏感内容不被过滤。
+
 ## Windows 部署目录
 
 先构建 release preset，再在相同 Qt 命令行环境执行：

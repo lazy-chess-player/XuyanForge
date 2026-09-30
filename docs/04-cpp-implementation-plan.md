@@ -150,7 +150,7 @@ G2 的真实质量/费用、G4 的双提供商、G5 的干净机环境不足时�
 | 外部素材 | `XUYANFORGE_NOVEL_FIXTURE`；全书离线另设 `XUYANFORGE_NOVEL_FULL_OFFLINE=1` |
 | 发行 | release 构建、打包脚本、产物清单和无 SDK 的干净 Windows 测试 |
 
-界面与测试同时启用时，现有 CTest 名称为 `core_tests`、`stress_tests`、`storage_support_tests`、`domain_boundary_tests`、`application_catalog_tests`、`tst_qmltests`、`tst_world_views_vm`，以及存在Python时的 `development_standards_tests`、`development_standards`、`contract_tests`，另有 `check-contracts` 构建目标；尚无完整 UI 端到端或通用 `integration-tests` 目标。无密钥持续集成已配置，实际远端结果见状态记录；检测器配置仍待实现。WSL 不复用 Windows 的 CMake 缓存目录。
+界面与测试同时启用时，现有 CTest 名称为 `core_tests`、`stress_tests`、`storage_support_tests`、`domain_boundary_tests`、`application_catalog_tests`、`backup_staging_tests`、`backup_safety_tests`、`backup_link_tests`、`tst_qmltests`、`tst_world_views_vm`，以及存在Python时的 `development_standards_tests`、`development_standards`、`contract_tests`，另有 `check-contracts` 构建目标。链接分组只在明确权限/设施不足时允许标记跳过，须单独记录未执行，不将CTest的零失败汇总当作全覆盖。尚无完整UI端到端或通用`integration-tests`目标。无密钥持续集成已配置，实际远端结果见状态记录；检测器配置仍待实现。WSL不复用Windows的CMake缓存目录。
 
 ## 9. 完成定义与阶段上传
 
