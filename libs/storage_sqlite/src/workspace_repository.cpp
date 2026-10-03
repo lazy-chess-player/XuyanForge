@@ -1257,13 +1257,64 @@ xuyan::domain::LocationPlacement readLocationPlacement(sqlite3* database, const 
 }
 
 /*
+ * 功能：在调用方的读/写事务内核对地点当前实体头，返回其真实世界身份。
+ * 参数：database 为本线程借用的有效连接；location_id 为借用的地点稳定标识；
+ *   require_placement 为 true 时还要求已存在地图标注，false 允许首次标注。
+ * 返回：成功为自有世界标识；缺失、删除、修订头损坏或当前分类不是地点为 missing_context。
+ * 失败：SQLite 错误抛异常交给外层转换；不以空世界或默认分类掩盖无效引用。
+ * 副作用：只读当前事务，不迁移、创建地点或修改作者字段；结果不借用语句资源。
+ */
+Result<std::string> mappedLocationWorld(sqlite3* database, const std::string& location_id,
+                                       bool require_placement) {
+    Statement query(database, "SELECT e.world_id,r.kind,e.deleted,r.deleted,p.location_id"
+        " FROM world_entity e LEFT JOIN entity_revision r ON r.entity_id=e.id AND r.revision=e.head_revision"
+        " LEFT JOIN location_placement p ON p.location_id=e.id WHERE e.id=?");
+    bindText(query.get(), 1, location_id);
+    if (!stepRow(query.get()) || columnText(query.get(), 0).empty() || columnText(query.get(), 1) != "location"
+        || sqlite3_column_int(query.get(), 2) || sqlite3_column_int(query.get(), 3)
+        || (require_placement && columnText(query.get(), 4).empty()))
+        return Result<std::string>::failure({ErrorCode::missing_context,
+            "地图引用必须是未删除的有效地点，父级与路线端点须已标注", false, "刷新地点并核对标注"});
+    return Result<std::string>::success(columnText(query.get(), 0));
+}
+
+/*
+ * 功能：核对拟保存或读取的父级链，拒绝跨世界、失效祖先、环和无法在有界深度内确认的层级。
+ * 参数：database 为调用方同线程事务连接，借用；location_id 为当前子地点；
+ *   parent_id 为空表示根地点；world_id 为已核实的子地点世界，三个字符串借用至返回。
+ * 返回：合法链为成功 true；失效节点为 missing_context，跨世界为 validation_failed，环或超限为 rule_conflict。
+ * 失败：查询/分配异常传播给外层；最多读取 128 个祖先，走完仍未到根时拒绝，不能把超限当安全。
+ * 副作用：只读事务快照，最多持有 128 个祖先身份，不清空历史父级、不自动改变世界。
+ */
+Result<bool> validateLocationAncestors(sqlite3* database, const std::string& location_id,
+    const std::string& parent_id, const std::string& world_id) {
+    std::string cursor = parent_id; // 待检查祖先，空值唯一表示已到根。
+    std::set<std::string> visited; // 当前链已读取身份，只用于检出自环及历史祖先之间的环。
+    for (int depth = 0; !cursor.empty(); ++depth) {
+        if (cursor == location_id || visited.contains(cursor))
+            return Result<bool>::failure({ErrorCode::rule_conflict, "地点层级不能形成环", false, "校对父地点链"});
+        if (depth >= 128)
+            return Result<bool>::failure({ErrorCode::rule_conflict, "地点父级链超过128层，无法安全确认", false, "缩短并校对地点层级"});
+        visited.insert(cursor);
+        auto ancestor_world = mappedLocationWorld(database, cursor, true);
+        if (!ancestor_world.ok()) return Result<bool>::failure(*ancestor_world.error);
+        if (*ancestor_world.value != world_id)
+            return Result<bool>::failure({ErrorCode::validation_failed, "地点父级链不能跨越世界", false, "选择同世界父地点"});
+        Statement ancestor(database, "SELECT parent_location_id FROM location_placement WHERE location_id=?");
+        bindText(ancestor.get(), 1, cursor);
+        if (!stepRow(ancestor.get()))
+            return Result<bool>::failure({ErrorCode::missing_context, "地点祖先标注不存在", false, "核对地点层级"});
+        cursor = columnText(ancestor.get(), 0);
+    }
+    return Result<bool>::success(true);
+}
+
+/*
  * 功能：读取地点之间的路线及方向、可选旅行分钟数。
- * 参数：
- *   database：本线程有效的数据库连接；借用，生命周期由外层仓储保证。
- *   route_id：地点路线稳定标识。
- * 返回：路线值；不存在或读取失败抛异常。
- * 副作用：只读，不将未知耗时当成0。
- * 失败：底层存储/解析异常由外层仓储转换为Result错误；返回Result的校验辅助直接传播校验错误。
+ * 参数：database 为本线程借用的连接，生命周期由仓储保证；route_id 为路线稳定标识。
+ * 返回：独立拥有的当前路线；不存在或读取失败抛异常，未知耗时保持空值。
+ * 失败：查询/分配异常由外层仓储转换，不检查端点当前有效性，允许已提交命令只读重放。
+ * 副作用：只读当前事务，不新增路线或修改方向。
  */
 xuyan::domain::TravelRoute readTravelRoute(sqlite3* database, const std::string& route_id) {
     Statement query(database, "SELECT id,from_location_id,to_location_id,has_travel_minutes,travel_minutes,bidirectional,evidence_status,revision FROM travel_route WHERE id=?");
@@ -4744,6 +4795,10 @@ Result<std::vector<xuyan::domain::DirectedRelation>> WorkspaceRepository::listDi
 /* 按修订保存地点本体及真实性；未知坐标与旧命令只读重放语义均保留。 */
 Result<xuyan::domain::LocationPlacement> WorkspaceRepository::saveLocationPlacement(
     const std::string& command_id, xuyan::domain::LocationPlacement placement, int expected_revision) {
+    if (command_id.empty() || command_id.size() > 512 || expected_revision < 0
+        || expected_revision >= std::numeric_limits<int>::max())
+        return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::validation_failed,
+            "地点写入需要有效命令与可递增的非负修订", false, "核对命令标识和当前修订"});
     auto valid = xuyan::domain::validateLocationPlacement(std::move(placement)); if (!valid.ok()) return valid; placement = std::move(*valid.value);
     const auto legacy_payload = placement.location_id + '|' + placement.parent_location_id + '|' + (placement.image_x ? std::to_string(*placement.image_x) : "null") + '|' + (placement.image_y ? std::to_string(*placement.image_y) : "null") + '|' + placement.background_asset_ref + '|' + placement.evidence_status;
     using xuyan::package::JsonValue;
@@ -4758,41 +4813,188 @@ Result<xuyan::domain::LocationPlacement> WorkspaceRepository::saveLocationPlacem
         if (stepRow(replay.get())) {
             const bool legacy_replay = columnText(replay.get(), 0) == legacy_payload
                 && placement.truth_status == (placement.evidence_status == "evidence" ? "fact" : "hypothesis");
-            if ((columnText(replay.get(), 0) != payload && !legacy_replay) || columnText(replay.get(), 1) != "location")
+            if ((columnText(replay.get(), 0) != payload && !legacy_replay)
+                || columnText(replay.get(), 1) != "location" || columnText(replay.get(), 2) != placement.location_id)
                 return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::command_conflict,
                     "命令标识已用于其他世界视图记录", false, "生成新的命令标识"});
             auto result = readLocationPlacement(database_, columnText(replay.get(), 2)); transaction.commit();
             return Result<xuyan::domain::LocationPlacement>::success(std::move(result));
         }
-        Statement entity(database_, "SELECT r.kind FROM world_entity e JOIN entity_revision r ON r.entity_id=e.id AND r.revision=e.head_revision WHERE e.id=? AND e.deleted=0"); bindText(entity.get(), 1, placement.location_id);
-        if (!stepRow(entity.get()) || columnText(entity.get(), 0) != "location") return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::missing_context, "地图标注必须引用有效地点条目", false, "选择地点条目"});
-        if (!placement.parent_location_id.empty()) { Statement parent(database_, "SELECT 1 FROM location_placement WHERE location_id=?"); bindText(parent.get(), 1, placement.parent_location_id); if (!stepRow(parent.get())) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::missing_context, "父地点尚未加入地图", false, "先保存父地点"}); std::string cursor = placement.parent_location_id; for (int depth = 0; depth < 128 && !cursor.empty(); ++depth) { if (cursor == placement.location_id) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::rule_conflict, "地点层级不能形成环", false, "选择其他父地点"}); Statement ancestor(database_, "SELECT parent_location_id FROM location_placement WHERE location_id=?"); bindText(ancestor.get(), 1, cursor); cursor = stepRow(ancestor.get()) ? columnText(ancestor.get(), 0) : std::string{}; } }
-        int revision = 0; { Statement current(database_, "SELECT revision FROM location_placement WHERE location_id=?"); bindText(current.get(), 1, placement.location_id); if (stepRow(current.get())) revision = sqlite3_column_int(current.get(), 0); } if (revision != expected_revision) return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::revision_conflict, "地点标注修订已变化", false, "刷新后重试"}); placement.revision = expected_revision + 1;
-        Statement upsert(database_, "INSERT INTO location_placement(location_id,parent_location_id,has_image_point,image_x,image_y,background_asset_ref,evidence_status,revision) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(location_id) DO UPDATE SET parent_location_id=excluded.parent_location_id,has_image_point=excluded.has_image_point,image_x=excluded.image_x,image_y=excluded.image_y,background_asset_ref=excluded.background_asset_ref,evidence_status=excluded.evidence_status,revision=excluded.revision"); bindText(upsert.get(), 1, placement.location_id); bindText(upsert.get(), 2, placement.parent_location_id); sqlite3_bind_int(upsert.get(), 3, placement.image_x.has_value() ? 1 : 0); sqlite3_bind_int(upsert.get(), 4, placement.image_x.value_or(0)); sqlite3_bind_int(upsert.get(), 5, placement.image_y.value_or(0)); bindText(upsert.get(), 6, placement.background_asset_ref); bindText(upsert.get(), 7, placement.evidence_status); sqlite3_bind_int(upsert.get(), 8, placement.revision); if (sqlite3_step(upsert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
+        // 重放只读历史，不再次写入；新命令必须在写锁内核对整条父链，不能只查直接父级。
+        auto world = mappedLocationWorld(database_, placement.location_id, false);
+        if (!world.ok()) return Result<xuyan::domain::LocationPlacement>::failure(*world.error);
+        auto hierarchy = validateLocationAncestors(database_, placement.location_id,
+                                                   placement.parent_location_id, *world.value);
+        if (!hierarchy.ok()) return Result<xuyan::domain::LocationPlacement>::failure(*hierarchy.error);
+        int revision = 0; // 标注自身当前修订，零表示首次创建。
+        {
+            Statement current(database_, "SELECT revision FROM location_placement WHERE location_id=?");
+            bindText(current.get(), 1, placement.location_id);
+            if (stepRow(current.get())) revision = sqlite3_column_int(current.get(), 0);
+        }
+        if (revision != expected_revision)
+            return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::revision_conflict,
+                "地点标注修订已变化", false, "刷新后重试"});
+        placement.revision = expected_revision + 1;
+        // 标注本体、专用语义和命令同事务提交，任何后续失败都不能留下半个新修订。
+        Statement upsert(database_, "INSERT INTO location_placement(location_id,parent_location_id,has_image_point,image_x,image_y,background_asset_ref,evidence_status,revision)"
+            " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(location_id) DO UPDATE SET parent_location_id=excluded.parent_location_id,"
+            "has_image_point=excluded.has_image_point,image_x=excluded.image_x,image_y=excluded.image_y,"
+            "background_asset_ref=excluded.background_asset_ref,evidence_status=excluded.evidence_status,revision=excluded.revision");
+        bindText(upsert.get(), 1, placement.location_id); bindText(upsert.get(), 2, placement.parent_location_id);
+        sqlite3_bind_int(upsert.get(), 3, placement.image_x.has_value() ? 1 : 0);
+        sqlite3_bind_int(upsert.get(), 4, placement.image_x.value_or(0));
+        sqlite3_bind_int(upsert.get(), 5, placement.image_y.value_or(0));
+        bindText(upsert.get(), 6, placement.background_asset_ref); bindText(upsert.get(), 7, placement.evidence_status);
+        sqlite3_bind_int(upsert.get(), 8, placement.revision);
+        if (sqlite3_step(upsert.get()) != SQLITE_DONE) throw std::runtime_error("地点标注写入失败");
         writeLocationSemantics(database_, placement);
-        Statement log(database_, "INSERT INTO world_graph_command_log(command_id,payload_hash,record_type,record_id,revision,created_at) VALUES(?,?,?,?,?,?)"); bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, "location"); bindText(log.get(), 4, placement.location_id); sqlite3_bind_int(log.get(), 5, placement.revision); bindText(log.get(), 6, utcNow()); if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_)); transaction.commit(); return Result<xuyan::domain::LocationPlacement>::success(std::move(placement));
-    } catch (const std::exception& exception) { return Result<xuyan::domain::LocationPlacement>::failure(storageError(exception)); }
+        Statement log(database_, "INSERT INTO world_graph_command_log(command_id,payload_hash,record_type,record_id,revision,created_at) VALUES(?,?,?,?,?,?)");
+        bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, "location");
+        bindText(log.get(), 4, placement.location_id); sqlite3_bind_int(log.get(), 5, placement.revision);
+        bindText(log.get(), 6, utcNow());
+        if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error("地点命令记录写入失败");
+        transaction.commit();
+        return Result<xuyan::domain::LocationPlacement>::success(std::move(placement));
+    } catch (...) {
+        return Result<xuyan::domain::LocationPlacement>::failure({ErrorCode::storage_error,
+            "地点标注存储失败，详情已隐藏", true, "检查工作区后以同一命令重试"});
+    }
 }
 
 Result<xuyan::domain::TravelRoute> WorkspaceRepository::saveTravelRoute(
     const std::string& command_id, xuyan::domain::TravelRoute route, int expected_revision) {
-    auto valid = xuyan::domain::validateTravelRoute(std::move(route)); if (!valid.ok()) return valid; route = std::move(*valid.value);
-    const auto payload = route.id + '|' + route.from_location_id + '|' + route.to_location_id + '|' + (route.travel_minutes ? std::to_string(*route.travel_minutes) : "null") + '|' + (route.bidirectional ? "1" : "0") + '|' + route.evidence_status;
+    using RouteResult = Result<xuyan::domain::TravelRoute>;
+    if (command_id.empty() || command_id.size() > 512 || expected_revision < 0
+        || expected_revision >= std::numeric_limits<int>::max())
+        return RouteResult::failure({ErrorCode::validation_failed,
+            "路线写入需要有效命令与可递增的非负修订", false, "核对命令标识和当前修订"});
+    auto valid = xuyan::domain::validateTravelRoute(std::move(route));
+    if (!valid.ok()) return valid;
+    route = std::move(*valid.value);
+    const auto legacy_payload = route.id + '|' + route.from_location_id + '|' + route.to_location_id + '|'
+        + (route.travel_minutes ? std::to_string(*route.travel_minutes) : "null") + '|'
+        + (route.bidirectional ? "1" : "0") + '|' + route.evidence_status;
+    using xuyan::package::JsonValue;
+    // 新命令绑定预期修订及结构化字段，端点或标识包含分隔符也不会变成另一条等价请求。
+    const auto payload = "route-write-v1:" + xuyan::domain::sha256(xuyan::package::writeJson(JsonValue::Object{
+        {"id", route.id}, {"from", route.from_location_id}, {"to", route.to_location_id},
+        {"minutes", route.travel_minutes ? JsonValue(*route.travel_minutes) : JsonValue()},
+        {"bidirectional", route.bidirectional}, {"evidence", route.evidence_status},
+        {"expected_revision", expected_revision}}));
     try {
-        Transaction transaction(database_); Statement replay(database_, "SELECT payload_hash,record_type,record_id FROM world_graph_command_log WHERE command_id=?"); bindText(replay.get(), 1, command_id); if (stepRow(replay.get())) { if (columnText(replay.get(), 0) != payload || columnText(replay.get(), 1) != "route") return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::command_conflict, "命令标识已用于其他世界视图记录", false, "生成新的命令标识"}); auto result = readTravelRoute(database_, columnText(replay.get(), 2)); transaction.commit(); return Result<xuyan::domain::TravelRoute>::success(std::move(result)); }
-        Statement endpoints(database_, "SELECT COUNT(*) FROM location_placement WHERE location_id IN (?,?)"); bindText(endpoints.get(), 1, route.from_location_id); bindText(endpoints.get(), 2, route.to_location_id); if (!stepRow(endpoints.get()) || sqlite3_column_int(endpoints.get(), 0) != 2) return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::missing_context, "路线端点尚未加入地图", false, "先保存地点标注"});
-        int revision = 0; { Statement current(database_, "SELECT revision FROM travel_route WHERE id=?"); bindText(current.get(), 1, route.id); if (stepRow(current.get())) revision = sqlite3_column_int(current.get(), 0); } if (revision != expected_revision) return Result<xuyan::domain::TravelRoute>::failure({ErrorCode::revision_conflict, "路线修订已变化", false, "刷新后重试"}); route.revision = expected_revision + 1;
-        Statement upsert(database_, "INSERT INTO travel_route(id,from_location_id,to_location_id,has_travel_minutes,travel_minutes,bidirectional,evidence_status,revision) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET from_location_id=excluded.from_location_id,to_location_id=excluded.to_location_id,has_travel_minutes=excluded.has_travel_minutes,travel_minutes=excluded.travel_minutes,bidirectional=excluded.bidirectional,evidence_status=excluded.evidence_status,revision=excluded.revision"); bindText(upsert.get(), 1, route.id); bindText(upsert.get(), 2, route.from_location_id); bindText(upsert.get(), 3, route.to_location_id); sqlite3_bind_int(upsert.get(), 4, route.travel_minutes.has_value() ? 1 : 0); sqlite3_bind_int(upsert.get(), 5, route.travel_minutes.value_or(0)); sqlite3_bind_int(upsert.get(), 6, route.bidirectional ? 1 : 0); bindText(upsert.get(), 7, route.evidence_status); sqlite3_bind_int(upsert.get(), 8, route.revision); if (sqlite3_step(upsert.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_));
-        Statement log(database_, "INSERT INTO world_graph_command_log(command_id,payload_hash,record_type,record_id,revision,created_at) VALUES(?,?,?,?,?,?)"); bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, "route"); bindText(log.get(), 4, route.id); sqlite3_bind_int(log.get(), 5, route.revision); bindText(log.get(), 6, utcNow()); if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database_)); transaction.commit(); return Result<xuyan::domain::TravelRoute>::success(std::move(route));
-    } catch (const std::exception& exception) { return Result<xuyan::domain::TravelRoute>::failure(storageError(exception)); }
+        Transaction transaction(database_);
+        Statement replay(database_, "SELECT payload_hash,record_type,record_id FROM world_graph_command_log WHERE command_id=?");
+        bindText(replay.get(), 1, command_id);
+        if (stepRow(replay.get())) {
+            if ((columnText(replay.get(), 0) != payload && columnText(replay.get(), 0) != legacy_payload)
+                || columnText(replay.get(), 1) != "route" || columnText(replay.get(), 2) != route.id)
+                return RouteResult::failure({ErrorCode::command_conflict,
+                    "命令标识已用于其他路线内容或修订", false, "使用与原命令一致的请求或新标识"});
+            // 历史兼容仅只读重放；端点后来删除或改类不触发重写、复活或重新校验旧写入。
+            auto result = readTravelRoute(database_, route.id);
+            transaction.commit();
+            return RouteResult::success(std::move(result));
+        }
+        auto from_world = mappedLocationWorld(database_, route.from_location_id, true);
+        if (!from_world.ok()) return RouteResult::failure(*from_world.error);
+        auto to_world = mappedLocationWorld(database_, route.to_location_id, true);
+        if (!to_world.ok()) return RouteResult::failure(*to_world.error);
+        if (*from_world.value != *to_world.value)
+            return RouteResult::failure({ErrorCode::validation_failed, "路线端点不能跨越世界", false, "选择同世界地点"});
+        int revision = 0; // 路线自身当前修订，零表示首次创建，不使用端点实体修订替代。
+        {
+            Statement current(database_, "SELECT r.revision,e.world_id FROM travel_route r"
+                " LEFT JOIN world_entity e ON e.id=r.from_location_id WHERE r.id=?");
+            bindText(current.get(), 1, route.id);
+            if (stepRow(current.get())) {
+                revision = sqlite3_column_int(current.get(), 0);
+                if (columnText(current.get(), 1) != *from_world.value)
+                    return RouteResult::failure({ErrorCode::validation_failed,
+                        "已有路线不能改绑到另一个世界", false, "在目标世界创建新的路线标识"});
+            }
+        }
+        if (revision != expected_revision)
+            return RouteResult::failure({ErrorCode::revision_conflict, "路线修订已变化", false, "刷新后重试"});
+        route.revision = expected_revision + 1;
+        // 路线与命令日志共用事务，最终日志失败必须撤销前面的新增或修改。
+        Statement upsert(database_, "INSERT INTO travel_route(id,from_location_id,to_location_id,has_travel_minutes,travel_minutes,bidirectional,evidence_status,revision)"
+            " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET from_location_id=excluded.from_location_id,"
+            "to_location_id=excluded.to_location_id,has_travel_minutes=excluded.has_travel_minutes,travel_minutes=excluded.travel_minutes,"
+            "bidirectional=excluded.bidirectional,evidence_status=excluded.evidence_status,revision=excluded.revision");
+        bindText(upsert.get(), 1, route.id); bindText(upsert.get(), 2, route.from_location_id);
+        bindText(upsert.get(), 3, route.to_location_id);
+        sqlite3_bind_int(upsert.get(), 4, route.travel_minutes.has_value() ? 1 : 0);
+        sqlite3_bind_int(upsert.get(), 5, route.travel_minutes.value_or(0));
+        sqlite3_bind_int(upsert.get(), 6, route.bidirectional ? 1 : 0);
+        bindText(upsert.get(), 7, route.evidence_status); sqlite3_bind_int(upsert.get(), 8, route.revision);
+        if (sqlite3_step(upsert.get()) != SQLITE_DONE) throw std::runtime_error("路线写入失败");
+        Statement log(database_, "INSERT INTO world_graph_command_log(command_id,payload_hash,record_type,record_id,revision,created_at) VALUES(?,?,?,?,?,?)");
+        bindText(log.get(), 1, command_id); bindText(log.get(), 2, payload); bindText(log.get(), 3, "route");
+        bindText(log.get(), 4, route.id); sqlite3_bind_int(log.get(), 5, route.revision); bindText(log.get(), 6, utcNow());
+        if (sqlite3_step(log.get()) != SQLITE_DONE) throw std::runtime_error("路线命令记录写入失败");
+        transaction.commit();
+        return RouteResult::success(std::move(route));
+    } catch (...) {
+        return RouteResult::failure({ErrorCode::storage_error, "路线存储失败，详情已隐藏", true, "检查工作区后以同一命令重试"});
+    }
 }
 
 Result<xuyan::domain::MapView> WorkspaceRepository::loadMapView(const std::string& world_id) {
     try {
-        xuyan::domain::MapView view; Statement locations(database_, "SELECT p.location_id FROM location_placement p JOIN world_entity e ON e.id=p.location_id WHERE e.world_id=? AND e.deleted=0 ORDER BY p.location_id"); bindText(locations.get(), 1, world_id); std::vector<std::string> ids; while (stepRow(locations.get())) ids.push_back(columnText(locations.get(), 0)); for (const auto& id : ids) view.locations.push_back(readLocationPlacement(database_, id));
-        Statement routes(database_, "SELECT r.id FROM travel_route r JOIN world_entity a ON a.id=r.from_location_id JOIN world_entity b ON b.id=r.to_location_id WHERE a.world_id=? AND b.world_id=? ORDER BY r.id"); bindText(routes.get(), 1, world_id); bindText(routes.get(), 2, world_id); std::vector<std::string> route_ids; while (stepRow(routes.get())) route_ids.push_back(columnText(routes.get(), 0)); for (const auto& id : route_ids) view.routes.push_back(readTravelRoute(database_, id));
+        ReadTransaction snapshot(database_); // 地点列表、父链及路线共享读取快照，不能拼接不同修订时刻。
+        xuyan::domain::MapView view;
+        Statement locations(database_, "SELECT p.location_id,r.kind,r.deleted,r.attributes_json,"
+            "EXISTS(SELECT 1 FROM candidate_acceptance ca JOIN extraction_candidate c ON c.id=ca.candidate_id"
+            " WHERE ca.entity_id=e.id AND c.candidate_type='entity' AND c.review_status='accepted'"
+            " AND ((c.schema_version='candidate-v2' AND c.prompt_version='extract-v2')"
+            " OR (c.schema_version='candidate-v3' AND c.prompt_version='extract-v3'))"
+            " AND c.provenance_type IN('in_text_claim','model_inference')) FROM location_placement p"
+            " JOIN world_entity e ON e.id=p.location_id"
+            " LEFT JOIN entity_revision r ON r.entity_id=e.id AND r.revision=e.head_revision"
+            " WHERE e.world_id=? AND e.deleted=0 ORDER BY p.location_id");
+        bindText(locations.get(), 1, world_id);
+        while (stepRow(locations.get())) {
+            if (sqlite3_column_type(locations.get(), 1) == SQLITE_NULL || sqlite3_column_int(locations.get(), 2))
+                return Result<xuyan::domain::MapView>::failure({ErrorCode::missing_context,
+                    "地图地点的当前修订头缺失或删除状态不一致", false, "保留数据库并核对地点修订"});
+            // 类型化说法/假设条目有意使用other，合法地点投影不能因事实隔离设计而被隐藏。
+            // 只保留有接受映射且当前声明仍为地点的未确认投影，不以一段可伪造的属性复活任意非地点。
+            const auto kind = columnText(locations.get(), 1);
+            if (kind != "location") {
+                if (kind != "other" || !sqlite3_column_int(locations.get(), 4)) continue;
+                auto attributes = xuyan::package::parseJson(columnText(locations.get(), 3), 16, 2000);
+                const auto* declared_kind = attributes.ok() ? attributes.value->find("kind") : nullptr;
+                const auto* truth = attributes.ok() ? attributes.value->find("xuyan_truth_status") : nullptr;
+                if (!declared_kind || !declared_kind->isString() || declared_kind->string() != "location"
+                    || !truth || !truth->isString() || (truth->string() != "claim" && truth->string() != "hypothesis"))
+                    continue;
+                auto projection = readLocationPlacement(database_, columnText(locations.get(), 0));
+                if (projection.truth_status != truth->string())
+                    return Result<xuyan::domain::MapView>::failure({ErrorCode::rule_conflict,
+                        "未确认地点投影与条目真实性不一致", false, "校对说法或假设的地点投影"});
+            }
+            auto location = readLocationPlacement(database_, columnText(locations.get(), 0));
+            auto hierarchy = validateLocationAncestors(database_, location.location_id, location.parent_location_id, world_id);
+            if (!hierarchy.ok()) return Result<xuyan::domain::MapView>::failure(*hierarchy.error);
+            view.locations.push_back(std::move(location));
+        }
+        Statement routes(database_, "SELECT r.id FROM travel_route r"
+            " JOIN location_placement pa ON pa.location_id=r.from_location_id"
+            " JOIN location_placement pb ON pb.location_id=r.to_location_id"
+            " JOIN world_entity a ON a.id=r.from_location_id JOIN world_entity b ON b.id=r.to_location_id"
+            " JOIN entity_revision ar ON ar.entity_id=a.id AND ar.revision=a.head_revision"
+            " JOIN entity_revision br ON br.entity_id=b.id AND br.revision=b.head_revision"
+            " WHERE a.world_id=? AND b.world_id=? AND a.deleted=0 AND b.deleted=0"
+            " AND ar.deleted=0 AND br.deleted=0 AND ar.kind='location' AND br.kind='location' ORDER BY r.id");
+        bindText(routes.get(), 1, world_id); bindText(routes.get(), 2, world_id);
+        while (stepRow(routes.get())) view.routes.push_back(readTravelRoute(database_, columnText(routes.get(), 0)));
+        snapshot.commit();
         return Result<xuyan::domain::MapView>::success(std::move(view));
-    } catch (const std::exception& exception) { return Result<xuyan::domain::MapView>::failure(storageError(exception)); }
+    } catch (...) {
+        return Result<xuyan::domain::MapView>::failure({ErrorCode::storage_error,
+            "地图读取失败，详情已隐藏", true, "检查工作区后重试"});
+    }
 }
 
 Result<xuyan::domain::CharacterInstance> WorkspaceRepository::createCharacterInstance(

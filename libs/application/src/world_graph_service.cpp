@@ -39,21 +39,21 @@ xuyan::domain::Result<std::vector<xuyan::domain::DirectedRelation>> WorldGraphSe
 xuyan::domain::Result<xuyan::domain::LocationPlacement> WorldGraphService::saveLocation(
     const std::string& command_id, xuyan::domain::LocationPlacement placement, int expected_revision) {
     try { return xuyan::storage::WorkspaceRepository(database_path_).saveLocationPlacement(command_id, std::move(placement), expected_revision); }
-    catch (const std::exception& e) { return xuyan::domain::Result<xuyan::domain::LocationPlacement>::failure(
-        {xuyan::domain::ErrorCode::storage_error, e.what(), true, "检查工作区后重试"}); }
+    catch (...) { return xuyan::domain::Result<xuyan::domain::LocationPlacement>::failure(
+        {xuyan::domain::ErrorCode::storage_error, "地点标注存储失败，详情已隐藏", true, "检查工作区后重试"}); }
 }
 
 xuyan::domain::Result<xuyan::domain::TravelRoute> WorldGraphService::saveRoute(
     const std::string& command_id, xuyan::domain::TravelRoute route, int expected_revision) {
     try { return xuyan::storage::WorkspaceRepository(database_path_).saveTravelRoute(command_id, std::move(route), expected_revision); }
-    catch (const std::exception& e) { return xuyan::domain::Result<xuyan::domain::TravelRoute>::failure(
-        {xuyan::domain::ErrorCode::storage_error, e.what(), true, "检查工作区后重试"}); }
+    catch (...) { return xuyan::domain::Result<xuyan::domain::TravelRoute>::failure(
+        {xuyan::domain::ErrorCode::storage_error, "路线存储失败，详情已隐藏", true, "检查工作区后重试"}); }
 }
 
 xuyan::domain::Result<xuyan::domain::MapView> WorldGraphService::loadMap(const std::string& world_id) {
     try { return xuyan::storage::WorkspaceRepository(database_path_).loadMapView(world_id); }
-    catch (const std::exception& e) { return xuyan::domain::Result<xuyan::domain::MapView>::failure(
-        {xuyan::domain::ErrorCode::storage_error, e.what(), true, "检查工作区后重试"}); }
+    catch (...) { return xuyan::domain::Result<xuyan::domain::MapView>::failure(
+        {xuyan::domain::ErrorCode::storage_error, "地图读取失败，详情已隐藏", true, "检查工作区后重试"}); }
 }
 
 } // namespace xuyan::application

@@ -914,36 +914,43 @@ public:
         const std::string& world_id, const std::string& entity_id, std::optional<std::int64_t> story_time,
         const std::string& actor_id, bool author_view);
     /*
-     * 功能：按预期修订保存地点层级与地图位置。
+     * 功能：在单一写事务内按预期修订保存地点、真实性及命令，拒绝跨世界或无法安全确认的父级链。
      * 参数：
-     *   command_id：本次写入的稳定命令标识；用于幂等重放，同一标识不得绑定不同请求。
-     *   placement：地点父子层级和可选图像坐标；未知位置保持空值。
-     *   expected_revision：调用者读取的当前修订；创建接口采用首版约定，更新必须与数据库一致。
-     * 返回：成功值为地点层级与坐标。
-     * 失败：输入、业务不变量或存储失败通过Result.error返回，未提交写入由事务回滚。预期修订/版本/尝试与当前值不符时拒绝覆盖。幂等命令身份冲突拒绝重放。
-     * 副作用：在当前数据库执行：按预期修订保存地点层级与地图位置；不执行网络调用。
+     *   command_id：1—512字节稳定命令标识，借用至返回；新摘要绑定全部规范化字段及预期修订。
+     *   placement：拥有的地点标注副本；当前实体须未删除且分类为地点；父级为空表示根，所有非空祖先须已标注、同世界且有效。
+     *     坐标成对非负或同时未知；底图引用最多1024字节，真实性与证据性质相容；不验证图像存在或坐标上界。
+     *   expected_revision：标注自身修订0—整型最大值减1；创建为0，更新必须等于当前值，返回对象原revision被重算。
+     * 返回：自有规范化标注、修订加1；同负载重放只读现存标注，可能反映后续编辑，兼容旧摘要但不重新写入。
+     * 失败：无效命令/字段/跨世界为validation_failed，失效节点为missing_context，环/未在128个祖先内到根为rule_conflict；
+     *   过期修订/不同命令负载分别为revision_conflict/command_conflict；事务内异常为中文storage_error，详情隐藏。
+     *   事务前值校验及摘要分配异常可传播。未提交的标注、语义及日志全部回滚。
+     * 副作用：仅本连接同线程同步事务写入，不联网、不改变作者实体、历史世界版本或底图文件。
      */
     xuyan::domain::Result<xuyan::domain::LocationPlacement> saveLocationPlacement(
         const std::string& command_id, xuyan::domain::LocationPlacement placement, int expected_revision);
     /*
-     * 功能：按预期修订保存地点之间的可通行路线。
+     * 功能：在单一写事务内按预期修订保存同世界有效地点之间的路线及幂等命令。
      * 参数：
-     *   command_id：本次写入的稳定命令标识；用于幂等重放，同一标识不得绑定不同请求。
-     *   route：地点之间的路线值；分钟耗时可以未知，方向及证据性质由对象传入。
-     *   expected_revision：调用者读取的当前修订；创建接口采用首版约定，更新必须与数据库一致。
-     * 返回：成功值为地点路线。
-     * 失败：输入、业务不变量或存储失败通过Result.error返回，未提交写入由事务回滚。预期修订/版本/尝试与当前值不符时拒绝覆盖。幂等命令身份冲突拒绝重放。
-     * 副作用：在当前数据库执行：按预期修订保存地点之间的可通行路线；不执行网络调用。
+     *   command_id：1—512字节稳定命令标识，借用；新摘要绑定全部字段与expected_revision，不采用分隔符拼接身份。
+     *   route：拥有的路线副本，id非空，两端不同且为同世界未删除的当前地点，并均已标注；旧路线ID不能移往另一世界。
+     *     travel_minutes为空表示未知，否则为正整数分钟；方向及evidence/assumption证据性质由调用方明确输入。
+     *   expected_revision：路线自身修订0—整型最大值减1，首次创建为0，更新必须与当前值一致，不是端点修订。
+     * 返回：自有规范化路线、修订加1；重放读取现存路线，不再写入或复活端点；旧摘要未绑定expected_revision，仅保留其只读语义。
+     * 失败：无效字段/命令或跨世界为validation_failed，失效/未标注端点为missing_context；过期修订/不同命令为对应冲突。
+     *   事务内异常为中文storage_error，详情隐藏，路线及日志一起回滚；事务前字段校验/摘要分配异常可传播。
+     * 副作用：仅本连接同线程同步写入，不联网、不修改端点实体、标注或已发布版本；双向标志不生成反向副本。
      */
     xuyan::domain::Result<xuyan::domain::TravelRoute> saveTravelRoute(
         const std::string& command_id, xuyan::domain::TravelRoute route, int expected_revision);
     /*
-     * 功能：读取指定世界的地点与路线地图视图。
+     * 功能：同一读快照内读取指定世界有效地点及其路线，校验历史父级链但不自动修补。
      * 参数：
-     *   world_id：世界稳定标识；用于限定查询或发布范围，避免跨世界串数据。
-     * 返回：成功值为地点和路线视图。
-     * 失败：数据库查询或记录格式失败通过Result.error返回；必须存在的记录缺失返回错误，正常空列表/空可选值与查询失败分别处理。
-     * 副作用：只读取当前连接的数据，不改资料、不联网；返回值独立拥有内容。
+     *   world_id：借用的世界稳定标识，精确匹配，空/未建世界通常返回空集合，不回退首世界。
+     * 返回：自有地点和路线，分别按身份升序；地点含未删除当前地点及有类型化接受映射、当前仍声明地点的other类说法/假设投影，保留真实性。
+     *   作者已改类的节点不显示；路线两端须为同世界有效当前location类型标注，未确认投影不自动成为端点；无匹配为成功空集合。
+     * 失败：父级失效/跨世界/环/超128层分别返回校验错误，修订头缺失/删除状态不一致为missing_context，禁止返回部分成功地图。
+     *   查询、专用语义读取及分配异常为中文storage_error，详情隐藏，不把失败当空列表。
+     * 副作用：同线程只读本连接快照，不删隐藏的历史路线、不修改父级或联网；未分页，最多每地点检查128个祖先，未做规模门禁。
      */
     xuyan::domain::Result<xuyan::domain::MapView> loadMapView(const std::string& world_id);
     /*

@@ -1,6 +1,6 @@
 # 叙演工坊：项目开发执行计划（6sol high）
 
-版本：0.4（开发计划） · 更新：2026-09-29
+版本：0.4（开发计划） · 更新：2026-10-03
 
 适用基线：当前 Git 主分支及本地工作树；每次领取任务前以实际状态重新核对。本文是续建计划，不是从零搭建指南，也不是已完成声明。
 
@@ -150,7 +150,7 @@ G2 的真实质量/费用、G4 的双提供商、G5 的干净机环境不足时�
 | 外部素材 | `XUYANFORGE_NOVEL_FIXTURE`；全书离线另设 `XUYANFORGE_NOVEL_FULL_OFFLINE=1` |
 | 发行 | release 构建、打包脚本、产物清单和无 SDK 的干净 Windows 测试 |
 
-界面与测试同时启用时，现有 CTest 名称为 `core_tests`、`stress_tests`、`storage_support_tests`、`domain_boundary_tests`、`application_catalog_tests`、`backup_staging_tests`、`backup_safety_tests`、`backup_link_tests`、`tst_qmltests`、`tst_world_views_vm`，以及存在Python时的 `development_standards_tests`、`development_standards`、`contract_tests`，另有 `check-contracts` 构建目标。链接分组只在明确权限/设施不足时允许标记跳过，须单独记录未执行，不将CTest的零失败汇总当作全覆盖。尚无完整UI端到端或通用`integration-tests`目标。无密钥持续集成已配置，实际远端结果见状态记录；检测器配置仍待实现。WSL不复用Windows的CMake缓存目录。
+界面与测试同时启用时，现有 CTest 名称为 `core_tests`、`stress_tests`、`storage_support_tests`、`domain_boundary_tests`、`application_catalog_tests`、`backup_staging_tests`、`backup_safety_tests`、`backup_link_tests`、`map_integrity_tests`、`tst_qmltests`、`tst_world_views_vm`，以及存在Python时的 `development_standards_tests`、`development_standards`、`contract_tests`，另有 `check-contracts` 构建目标。链接分组只在明确权限/设施不足时允许标记跳过，须单独记录未执行，不将CTest的零失败汇总当作全覆盖。尚无完整UI端到端或通用`integration-tests`目标。无密钥持续集成已配置，实际远端结果见状态记录；检测器配置仍待实现。WSL不复用Windows的CMake缓存目录。
 
 ## 9. 完成定义与阶段上传
 
@@ -166,4 +166,4 @@ XF-01—XF-03、XF-28、XF-09-A、XF-11-A及XF-12-A/A2已通过远端验证上�
 
 新开发任务直接复制看板中的执行模板，填入一个 XF 编号。遇到缺少凭据、付费发送授权、外部设备或新的 UI 决策时，停止相关动作并说明待条件；继续不依赖该条件的已授权工作。
 
-2026-09-30接口补核已修复世界条目包的首项回退，见XF-04-P及状态第29节；同时发现备份暂存所有权与路径验证风险。下一步优先执行不改界面的XF-27-A安全子卡，再继续上述C2和校对界面接入；本轮问题登记不代表已修复备份安全或完成全库验收。
+2026-09-30接口补核后已修复世界条目包的首项回退与备份暂存所有权/路径边界，分别见状态第29、30节；`819de25`已核对两平台门禁并普通快进主分支，本机链接分组仍未执行。当前推进不改界面的XF-14-C2-M地图世界范围及层级完整性（状态第31节），字段级冲突、完整本体消歧/解绑与界面接入继续待开发，不以安全子卡代替整库或软件验收。

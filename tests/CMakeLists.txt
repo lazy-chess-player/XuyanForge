@@ -78,6 +78,10 @@ add_executable(backup_safety_tests backup_safety_tests.cpp)
 target_link_libraries(backup_safety_tests PRIVATE xuyan_application)
 add_test(NAME backup_safety_tests COMMAND backup_safety_tests)
 add_test(NAME backup_link_tests COMMAND backup_safety_tests --links-only)
+add_executable(map_integrity_tests map_integrity_tests.cpp)
+
+target_link_libraries(map_integrity_tests PRIVATE xuyan_application)
+add_test(NAME map_integrity_tests COMMAND map_integrity_tests)
 # 只允许独立链接分组报告权限/设施待条件；普通安全分组绝不因链接缺失而跳过。
 set_tests_properties(backup_link_tests PROPERTIES SKIP_RETURN_CODE 77)
 if(WIN32)
@@ -94,6 +98,8 @@ if(WIN32)
     set_tests_properties(backup_staging_tests PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
     set_tests_properties(backup_safety_tests backup_link_tests PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
+    set_tests_properties(map_integrity_tests PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${XUYANFORGE_COMPILER_BIN}")
 endif()
 find_package(Python3 COMPONENTS Interpreter)

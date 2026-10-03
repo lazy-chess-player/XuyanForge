@@ -3759,16 +3759,22 @@ void testAcceptedRelationAndLocationProjection() {
     require(service.review("graph-location-0", locations[0].id, 1, "accepted", locations[0].name,
                 locations[0].fields_json, "author_setting").ok(), "historic location command must still replay read-only");
     auto historic_map = repository.loadMapView(world.value->id);
-    require(historic_map.ok() && historic_map.value->locations.size() == 2,
-            "historic replay must not fill in old map records implicitly");
+    // 三个旧投影中事实标注被测试移除、假设实体已由作者改为人物；仅说法投影仍是可见地点。
+    // 同时核对底层两条标注均保留，防止把过滤成功误当作历史重放没有补写/删除。
+    require(historic_map.ok() && historic_map.value->locations.size() == 1
+                && historic_map.value->locations.front().location_id == "entity-from-" + locations[1].id
+                && historic_map.value->locations.front().truth_status == "claim"
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM location_placement") == 2,
+            "历史重放不补写标注，保留说法且隐藏作者已改类的假设，底层历史不删除");
     require(repository.saveLocationPlacement("graph-explicit-historic-location", location_record, 0).ok(),
             "a separate explicit author operation may add an old confirmed location to the map");
     xuyan::storage::WorkspaceRepository reopened(database);
     const auto persisted_map = reopened.loadMapView(world.value->id);
     const auto persisted_relations = reopened.listDirectedRelations(world.value->id, {}, std::nullopt, {}, true);
-    require(persisted_map.ok() && persisted_map.value->locations.size() == 3
+    require(persisted_map.ok() && persisted_map.value->locations.size() == 2
+                && sqliteScalar(sql.get(), "SELECT COUNT(*) FROM location_placement") == 3
                 && persisted_relations.ok() && persisted_relations.value->size() == 2,
-            "location and relationship semantic records must survive reopening");
+            "重开后两条有效地点可见、三条历史标注保留且关系语义完整");
 }
 
 /*
