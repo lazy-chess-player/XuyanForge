@@ -19,6 +19,7 @@
 
 #include <QCoreApplication>
 #include <QEventLoop>
+#include <QRegularExpression>
 #include <QSemaphore>
 #include <QThreadPool>
 #include <QTimer>
@@ -1476,6 +1477,42 @@ void testCredentialConsistencyDisplayText() {
             "compensation failure must show a distinct safe Chinese instruction");
 }
 
+/*
+ * 功能：核对全部服务错误分类和任务/候选状态的显示边界，防止非首页状态回显英文协议或外部详情。
+ * 参数：无。
+ * 返回：无；所有已知分类及未知回退均产生非空中文且不泄露测试详情时正常结束。
+ * 失败：文案为空、含拉丁字母或状态误回显时由 require 抛异常；凭据专用警示另由相邻用例核对。
+ * 副作用：仅构造内存错误和状态值、调用生产纯映射，不访问凭据、数据库、文件或网络。
+ * 线程与生命周期：测试主线程同步调用，输入及输出均在本函数作用域拥有，不安排回调。
+ */
+void testAllDisplayMappings() {
+    using xuyan::domain::ErrorCode;
+    /* 稳定失败分类及一个未来分类探针，后者必须进入中文通用回退而非显示数字或内部名称。 */
+    const ErrorCode codes[]{ErrorCode::validation_failed, ErrorCode::revision_conflict,
+        ErrorCode::rule_conflict, ErrorCode::missing_context, ErrorCode::storage_error,
+        ErrorCode::command_conflict, ErrorCode::credential_consistency_failed, static_cast<ErrorCode>(999)};
+    /* 只识别产品自带标签中的拉丁文字；这里不处理、替换或禁止用户提供的名称与真实模型标识。 */
+    const QRegularExpression latin(QStringLiteral("[A-Za-z]"));
+    for (const auto code : codes) {
+        const xuyan::domain::Error input{code, "private-display-detail", false, "private-display-action"};
+        const auto text = view_model_text::errorText(input);
+        require(!text.isEmpty() && !text.contains(latin)
+                && !text.contains(QStringLiteral("private-display-detail"))
+                && !text.contains(QStringLiteral("private-display-action")),
+                "服务错误必须显示中文安全说明，不回显英文诊断或外部建议");
+    }
+    /* 所有当前映射状态以及空值/未来状态，只属于测试输入，不创建任何产品任务或候选。 */
+    const std::string states[]{"queued", "ready", "running", "completed", "failed", "unknown",
+        "cancelled", "cancelling", "candidate", "accepted", "rejected", "conflicted", "", "future-test-state"};
+    for (const auto& state : states) {
+        const auto text = view_model_text::stateLabel(state);
+        require(!text.isEmpty() && !text.contains(latin), "任务和候选状态必须显示中文，不回显内部协议");
+    }
+    require(view_model_text::stateLabel("") == QStringLiteral("未知状态")
+            && view_model_text::stateLabel("future-test-state") == QStringLiteral("未知状态"),
+            "空值和未来状态必须使用中文未知回退");
+}
+
 /* 职责：用共享信号量占用全局线程池唯一线程，确定性检验排队期间切世界和销毁边界。
  * 生命周期：主线程作用域守卫，失败路径仍放行并恢复线程数；信号量由worker与守卫共同持有，不借用栈。
  * 边界：仅测试使用；析构等待最多10000毫秒，超时不销毁worker仍持有的信号量，不操作用户资料。
@@ -1634,6 +1671,7 @@ int main(int argc, char* argv[]) {
         seedWorlds(workspace.database());
         seedCandidates(workspace.database());
         testCredentialConsistencyDisplayText();
+        testAllDisplayMappings();
         testPackageWorldSelection();
         testGraphSemanticMapping();
         testSelectionAndIsolation(workspace.database());

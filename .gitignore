@@ -1,9 +1,86 @@
+# 构建、部署和发行产物：只忽略约定输出目录，不隐藏源码目录中的合法资源。
 /build/
+/build-*/
+/cmake-build-*/
+/out/
 /releases/
 /.cache/
+/CMakeUserPresets.json
+
+# 误在源码目录中执行配置时产生的 CMake/Ninja 文件。
+/CMakeCache.txt
+/CMakeFiles/
+/Testing/
+/cmake_install.cmake
+/CTestTestfile.cmake
+/build.ninja
+/.ninja_deps
+/.ninja_log
+/compile_commands.json
+
+# C/C++ 编译与链接产物，避免非标准输出位置误入库。
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.so.*
+*.dylib
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.qmlc
+*.jsc
+
+# Qt Creator、Visual Studio 的本机状态；共享编辑器配置不作全目录忽略。
 *.user
+*.user.*
+/.vs/
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# 本地工作数据库及协调/回滚文件，含误放项目内的工作区；测试素材运行时显式创建。
 *.sqlite
+*.sqlite3
+*.db
 *.sqlite-shm
 *.sqlite-wal
+*.sqlite-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
+*.db-shm
+*.db-wal
+*.db-journal
+
+# 凭据及本机环境；公开的字段说明模板允许提交，不包含真实值。
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python 缓存与本机虚拟环境，不忽略脚本、测试报告模板或契约文件。
 __pycache__/
 *.py[cod]
+/.venv/
+/venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 编辑过程和操作系统临时文件；不全局忽略文本、图片、JSON、ZIP 或文档。
+*~
+*.swp
+*.swo
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+Desktop.ini

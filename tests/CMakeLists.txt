@@ -6,7 +6,11 @@ add_library(xuyan_test_engine STATIC
 target_include_directories(xuyan_test_engine PUBLIC include)
 target_link_libraries(xuyan_test_engine PUBLIC xuyan_domain)
 if(XUYANFORGE_BUILD_UI)
-    qt_add_executable(tst_qmltests main.cpp)
+    # 明确列出测试探针头，使 AUTOMOC 生成元对象；探针不参与正式程序链接。
+    qt_add_executable(tst_qmltests
+        main.cpp
+        framework_option_probe.h
+    )
     target_include_directories(tst_qmltests PRIVATE ${PROJECT_SOURCE_DIR}/ui/i18n)
 
     target_compile_definitions(tst_qmltests PRIVATE

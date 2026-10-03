@@ -1,5 +1,6 @@
 #include <QtQuickTest>
 #include "framework_chinese_translator.h"
+#include "framework_option_probe.h"
 
 #include <QCoreApplication>
 #include <QObject>
@@ -7,6 +8,7 @@
 #include <QQmlEngine>
 #include <QQmlPropertyMap>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QLibraryInfo>
 #include <QLocale>
 #include <QTranslator>
@@ -224,8 +226,12 @@ public slots:
      * 副作用：修改进程路径模式、身份及默认区域，读取SDK词库并安装翻译器；不创建工作区。
      *   可选Qt词库加载失败时不安装该词库；本地补充表仍安装，中文词条由回归验证。
      * 线程与生命周期：测试主线程初始化时调用，设置影响该测试进程后续生命周期。
+     * 补充失败条件：TestSetup拥有的独占空目录创建失败时立即以中文原因终止测试，不回退用户目录。
+     * 生命周期：临时目录随TestSetup构造取得，退出时清理自身目录；本方法只核对创建结果。
      */
     void applicationAvailable() {
+        // 每次测试进程独占空目录，文件框不展示用户目录或历史私有素材。
+        if (!option_directory_.isValid()) qFatal("无法创建选项测试的独占临时目录");
         QStandardPaths::setTestModeEnabled(true);
         QCoreApplication::setOrganizationName("XuyanForgeTests");
         QCoreApplication::setOrganizationDomain("tests.local");
@@ -248,6 +254,8 @@ public slots:
      * 返回：无。失败：不校验空指针；调用方必须满足框架前置条件。
      * 副作用：设置各页面模型及框架版本上下文属性，不访问用户文件或网络。
      * 线程与生命周期：主线程执行；两类替身必须覆盖QML使用期间，随TestSetup销毁。
+     * 测试专用上下文：同时注入只读框架探针及自有空目录URL；不创建、打开或发送小说。
+     * 生命周期：探针不缓存控件指针，临时目录和所有替身覆盖引擎使用期间，由TestSetup拥有。
      */
     void qmlEngineAvailable(QQmlEngine *engine) {
         engine->rootContext()->setContextProperty("workspaceCatalog", &empty_catalog_);
@@ -256,9 +264,15 @@ public slots:
         engine->rootContext()->setContextProperty("packages", &empty_form_);
         engine->rootContext()->setContextProperty("sources", &empty_form_);
         engine->rootContext()->setContextProperty("qtVersion", QString::fromLatin1(qVersion()));
+        engine->rootContext()->setContextProperty("frameworkOptions", &framework_options_);
+        engine->rootContext()->setContextProperty("optionTestFolder", QUrl::fromLocalFile(option_directory_.path()));
     }
 
 private:
+    /* 本进程拥有的空临时目录，构造时独占创建，文件框只读；退出时仅清理自身目录。 */
+    QTemporaryDir option_directory_;
+    /* 测试专用框架选项探针，无缓存和业务资源；GUI线程只读控件，寿命覆盖测试引擎。 */
+    FrameworkOptionProbe framework_options_;
     /* 拥有的空目录 QObject，默认空列表和深色主题；主线程读写，寿命覆盖测试引擎访问。 */
     EmptyWorkspaceCatalog empty_catalog_;
     /* 四类页面共享的空表单替身，GUI线程读取，TestSetup拥有且比引擎存活更久；仅有内存计数能力。 */
